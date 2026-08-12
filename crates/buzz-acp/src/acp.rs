@@ -211,6 +211,10 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Concatenated visible assistant message chunks for the current prompt.
+    /// Consumed by the ACP bridge only after a successful turn for memory
+    /// writeback; thoughts and tool payloads are deliberately excluded.
+    turn_agent_message: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -550,6 +554,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_agent_message: String::new(),
         })
     }
 
@@ -776,6 +781,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.turn_agent_message.clear();
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -879,6 +885,11 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Consume the visible assistant text accumulated during the latest turn.
+    pub fn take_turn_agent_message(&mut self) -> String {
+        std::mem::take(&mut self.turn_agent_message)
     }
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
@@ -1745,6 +1756,7 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    self.turn_agent_message.push_str(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
@@ -2269,6 +2281,22 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn visible_agent_chunks_are_accumulated_for_successful_turn_writeback() {
+        let mut client = spawn_inert_client().await;
+        for text in ["hello ", "world"] {
+            client.handle_session_update(&serde_json::json!({
+                "params": {"update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": text}
+                }}
+            }));
+        }
+        assert_eq!(client.take_turn_agent_message(), "hello world");
+        assert!(client.take_turn_agent_message().is_empty());
+        client.shutdown().await;
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {

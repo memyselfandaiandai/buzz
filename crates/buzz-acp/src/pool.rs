@@ -599,6 +599,9 @@ pub struct PromptContext {
     /// `[Agent Memory — core]` section. On by default; disabled via
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY`.
     pub memory_enabled: bool,
+    /// Turn-scoped semantic recall and successful-turn writeback for external
+    /// ACP adapters. Disabled unless `BUZZ_ACP_MEMORY_PROVIDER=mem0`.
+    pub semantic_memory: crate::memory::MemoryProvider,
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
@@ -1954,7 +1957,7 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let mut prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
@@ -2062,6 +2065,21 @@ pub async fn run_prompt_task(
         );
         return;
     };
+
+    // Recall is transient and turn-scoped. Query with the actual user-facing
+    // prompt, then add retrieved data as its own ACP content block. Provider
+    // failures never prevent the downstream agent from running.
+    let memory_user_text = prompt_sections.join("\n\n");
+    match ctx.semantic_memory.recall_block(&memory_user_text).await {
+        Ok(Some(block)) => prompt_sections.push(block),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            target: "memory::mem0",
+            operation = "recall",
+            error = %error,
+            "ACP semantic memory recall failed; continuing without memory"
+        ),
+    }
 
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
@@ -2271,6 +2289,14 @@ pub async fn run_prompt_task(
                             &control_signal,
                         );
                         let usage = agent.acp.take_turn_usage();
+                        write_semantic_memory(
+                            &ctx,
+                            &mut agent,
+                            &source,
+                            &session_id,
+                            &memory_user_text,
+                        )
+                        .await;
                         publish_agent_turn_metric(
                             &ctx,
                             usage,
@@ -2298,6 +2324,11 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            if !matches!(stop_reason, StopReason::Cancelled | StopReason::Refusal) {
+                write_semantic_memory(&ctx, &mut agent, &source, &session_id, &memory_user_text)
+                    .await;
+            }
 
             if let PromptSource::Channel(cid) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -2528,6 +2559,38 @@ pub async fn run_prompt_task(
         }
     }
     // _reaction_guard drops here → spawns clear_reactions for all exit paths.
+}
+
+async fn write_semantic_memory(
+    ctx: &PromptContext,
+    agent: &mut OwnedAgent,
+    source: &PromptSource,
+    session_id: &str,
+    user_text: &str,
+) {
+    let assistant_text = agent.acp.take_turn_agent_message();
+    let channel_id = match source {
+        PromptSource::Channel(channel_id) => Some(channel_id.to_string()),
+        PromptSource::Heartbeat => None,
+    };
+    if let Err(error) = ctx
+        .semantic_memory
+        .write_turn(
+            session_id,
+            &ctx.harness_name,
+            channel_id.as_deref(),
+            user_text,
+            &assistant_text,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "memory::mem0",
+            operation = "writeback",
+            error = %error,
+            "ACP semantic memory writeback failed; turn remains successful"
+        );
+    }
 }
 
 /// Retry wrapper for context fetches: one retry with `CONTEXT_FETCH_RETRY_DELAY`
@@ -7471,6 +7534,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,
+            semantic_memory: crate::memory::MemoryProvider::disabled(),
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }

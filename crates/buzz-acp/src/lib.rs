@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod memory;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -112,6 +113,59 @@ fn emit_runtime_lifecycle(
             }),
         );
     }
+}
+
+/// Build the relay-global agent directory record used by member pickers.
+///
+/// External ACP agents are not represented in Desktop's local managed-agent
+/// store, so they must self-publish kind:10100. The NIP-OA tag makes ownership
+/// portable across hosts: the machine running the harness is irrelevant.
+fn build_agent_directory_event(
+    config: &Config,
+    auth_tag: Option<nostr::Tag>,
+) -> Result<Option<nostr::Event>> {
+    let display_name = std::env::var("BUZZ_ACP_DISPLAY_NAME")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(display_name) = display_name else {
+        return Ok(None);
+    };
+    let channel_add_policy = std::env::var("BUZZ_ACP_CHANNEL_ADD_POLICY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| matches!(value.as_str(), "anyone" | "owner_only" | "nobody"))
+        .unwrap_or_else(|| "owner_only".into());
+    let mut content = serde_json::json!({
+        "name": display_name,
+        "display_name": display_name,
+        "agent_type": "agent",
+        "channel_add_policy": channel_add_policy,
+        "respond_to": config.respond_to.to_string(),
+        "respond_to_allowlist": config.respond_to_allowlist,
+    });
+    // Directory state is public routing metadata, never a credential. Keep the
+    // payload stable and explicit so Desktop does not need host-local records.
+    if let Some(object) = content.as_object_mut() {
+        object.insert(
+            "runtime".into(),
+            serde_json::json!(crate::config::normalize_agent_command_identity(
+                &config.agent_command
+            )),
+        );
+    }
+    let builder = nostr::EventBuilder::new(
+        nostr::Kind::Custom(buzz_core::kind::KIND_AGENT_PROFILE as u16),
+        content.to_string(),
+    );
+    let builder = match auth_tag {
+        Some(tag) => builder.tags([tag]),
+        None => builder,
+    };
+    let event = builder
+        .sign_with_keys(&config.keys)
+        .map_err(|error| anyhow::anyhow!("failed to sign agent directory profile: {error}"))?;
+    Ok(Some(event))
 }
 
 /// Resolve the agent's owner pubkey at startup.
@@ -1822,10 +1876,14 @@ async fn tokio_main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
-    let mut relay =
-        HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
-            .await
-            .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
+    let mut relay = HarnessRelay::connect(
+        &config.relay_url,
+        &config.keys,
+        &pubkey_hex,
+        relay_auth_tag.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
     // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -1836,6 +1894,15 @@ async fn tokio_main() -> Result<()> {
     }
 
     tracing::info!("connected to relay at {}", config.relay_url);
+
+    if let Some(event) = build_agent_directory_event(&config, relay_auth_tag)? {
+        relay
+            .event_publisher()
+            .publish_event(event)
+            .await
+            .map_err(|error| anyhow::anyhow!("agent directory publish failed: {error}"))?;
+        tracing::info!("published external agent directory profile");
+    }
 
     relay
         .subscribe_membership_notifications()
@@ -2009,6 +2076,17 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    let semantic_memory = memory::MemoryProvider::from_config(
+        memory::MemoryConfig::from_env().map_err(anyhow::Error::msg)?,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if semantic_memory.enabled() {
+        tracing::info!(
+            target: "memory::mem0",
+            harness = %crate::config::normalize_agent_command_identity(&config.agent_command),
+            "ACP semantic memory provider enabled"
+        );
+    }
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2041,6 +2119,7 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
+        semantic_memory,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });

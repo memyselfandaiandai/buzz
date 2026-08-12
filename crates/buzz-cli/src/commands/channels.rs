@@ -1045,7 +1045,33 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
+    let mut content = serde_json::json!({ "channel_add_policy": policy });
+    if let Some(object) = content.as_object_mut() {
+        if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
+            let display_name = display_name.trim();
+            if !display_name.is_empty() {
+                object.insert("display_name".into(), serde_json::json!(display_name));
+                object.insert("name".into(), serde_json::json!(display_name));
+            }
+        }
+        if let Ok(respond_to) = std::env::var("BUZZ_ACP_RESPOND_TO") {
+            let respond_to = respond_to.trim();
+            if matches!(respond_to, "owner-only" | "allowlist" | "anyone" | "nobody") {
+                object.insert("respond_to".into(), serde_json::json!(respond_to));
+            }
+        }
+        if let Ok(raw) = std::env::var("BUZZ_ACP_RESPOND_TO_ALLOWLIST") {
+            let allowlist: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+                .collect();
+            if !allowlist.is_empty() {
+                object.insert("respond_to_allowlist".into(), serde_json::json!(allowlist));
+            }
+        }
+    }
+    let content = content.to_string();
     use nostr::{EventBuilder, Kind};
     let builder = EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
