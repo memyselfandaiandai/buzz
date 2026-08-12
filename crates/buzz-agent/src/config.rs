@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::memory::{MemoryConfig, MemoryProviderKind};
+
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Reasoning/thinking effort level for providers that support it.
@@ -855,6 +857,9 @@ pub struct Config {
     /// Databricks gateway does not auto-cache, so without this the surfaced
     /// `cache_read_input_tokens` is structurally always 0.
     pub prompt_caching: bool,
+    /// Optional semantic long-term memory provider. Encrypted NIP-AE engrams
+    /// remain independent and are not disabled when this is set.
+    pub(crate) memory: MemoryConfig,
 }
 
 impl Config {
@@ -966,6 +971,18 @@ impl Config {
                 env("BUZZ_AGENT_THINKING_SUMMARY").as_deref(),
             )?,
             prompt_caching: parse_env("BUZZ_AGENT_PROMPT_CACHING", 1u8)? != 0,
+            memory: MemoryConfig {
+                provider: MemoryProviderKind::parse(env("BUZZ_AGENT_MEMORY_PROVIDER").as_deref())?,
+                host: env("MEM0_HOST").unwrap_or_default(),
+                api_key: env("MEM0_API_KEY").unwrap_or_default(),
+                user_id: env("MEM0_USER_ID").unwrap_or_default(),
+                agent_id: env("MEM0_AGENT_ID").unwrap_or_default(),
+                top_k: parse_env("MEM0_TOP_K", 25usize)?,
+                timeout: Duration::from_secs(parse_env("MEM0_TIMEOUT_SECS", 30u64)?),
+                max_injected_bytes: parse_env("MEM0_MAX_INJECTED_BYTES", 128 * 1024usize)?,
+                auto_recall: parse_env("MEM0_AUTO_RECALL", 1u8)? != 0,
+                auto_write: parse_env("MEM0_AUTO_WRITE", 1u8)? != 0,
+            },
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1010,6 +1027,7 @@ impl Config {
             thinking_effort: None,
             thinking_summary: ThinkingSummary::Auto,
             prompt_caching: false,
+            memory: MemoryConfig::disabled(),
         }
     }
 
@@ -1063,6 +1081,7 @@ impl Config {
         if self.max_parallel_tools < 1 {
             return Err("config: BUZZ_AGENT_MAX_PARALLEL_TOOLS must be >= 1".into());
         }
+        self.memory.validate()?;
         if self.mcp_max_restart_attempts < 1 {
             return Err("config: BUZZ_AGENT_MCP_RESTART_MAX_ATTEMPTS must be >= 1".into());
         }

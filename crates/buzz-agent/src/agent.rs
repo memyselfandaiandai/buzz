@@ -14,6 +14,7 @@ use crate::hints::SkillEntry;
 use crate::llm::Llm;
 use crate::mcp::McpRegistry;
 use crate::mcp::ResultBudget;
+use crate::memory::MemoryProvider;
 
 use crate::types::{
     AgentError, CacheTotalState, ContentBlock, HistoryItem, PricingIdentity, ProviderStop,
@@ -141,6 +142,7 @@ pub struct RunCtx<'a> {
     pub session_id: &'a str,
     pub system_prompt: &'a str,
     pub llm: &'a Llm,
+    pub memory: &'a MemoryProvider,
     pub mcp: &'a Arc<McpRegistry>,
     /// Skills discovered at session creation; used by the built-in `load_skill` tool.
     pub skills: &'a [SkillEntry],
@@ -310,6 +312,35 @@ impl RunCtx<'_> {
         if self.original_task.is_none() {
             *self.original_task = Some(user_text.clone());
         }
+        let turn_user_text = user_text.clone();
+        // Recall is turn-scoped and transient: retrieved memories are appended
+        // to the request's system prompt, never to persistent session history.
+        // A provider failure is fail-open so memory cannot disable the agent.
+        let memory_block = if self.memory.auto_recall() {
+            let recalled = tokio::select! {
+                biased;
+                _ = self.cancel.changed() => return Ok(StopReason::Cancelled),
+                result = self.memory.recall(&turn_user_text) => result,
+            };
+            match recalled {
+                Ok(records) => self.memory.prompt_block(&records),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "memory::mem0",
+                        operation = "recall",
+                        error = %error,
+                        "semantic memory recall failed; continuing without memory"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let turn_system_prompt = match memory_block {
+            Some(block) => format!("{}\n\n{}", self.system_prompt, block),
+            None => self.system_prompt.to_owned(),
+        };
         self.history.push(HistoryItem::User(user_text));
 
         // Reset per-turn token accumulators for this prompt.
@@ -378,6 +409,10 @@ impl RunCtx<'_> {
             }
 
             let mut tools = self.mcp.tools();
+            // Native memory tools take precedence over any identically-named
+            // MCP tool so one model-visible name always has one implementation.
+            tools.retain(|tool| !self.memory.is_tool(&tool.name));
+            tools.extend(self.memory.tool_defs());
             // Inject the built-in load_skill tool when skills are available.
             if !self.skills.is_empty() {
                 tools.push(builtin::load_skill_def());
@@ -386,7 +421,7 @@ impl RunCtx<'_> {
             let response_result = tokio::select! {
                 biased;
                 _ = self.cancel.changed() => return Ok(StopReason::Cancelled),
-                r = self.llm.complete(self.cfg, self.system_prompt, self.history, &tools, self.effective_model)
+                r = self.llm.complete(self.cfg, &turn_system_prompt, self.history, &tools, self.effective_model)
                         .instrument(tracing::info_span!("llm", session_id = %self.session_id)) => r,
                 _ = async {
                     // Keepalive ticker: emit a lightweight session update every 30s
@@ -687,6 +722,7 @@ impl RunCtx<'_> {
                         "provider: stop=tool_use but zero tool_calls".into(),
                     ));
                 }
+                let assistant_text = response.text.clone();
                 self.history.push(HistoryItem::Assistant {
                     text: response.text,
                     tool_calls: Vec::new(),
@@ -696,6 +732,8 @@ impl RunCtx<'_> {
                 // Only gate genuine end_turn — don't override max_tokens/refusal.
                 if stop == StopReason::EndTurn {
                     if stop_rejections >= self.cfg.stop_max_rejections {
+                        self.write_memory_turn(&turn_user_text, &assistant_text)
+                            .await;
                         return Ok(stop);
                     }
                     let mut objections = self
@@ -723,6 +761,8 @@ impl RunCtx<'_> {
                         push_hook_outputs_as_tool_results(self.history, "_Stop", &objections);
                         continue;
                     }
+                    self.write_memory_turn(&turn_user_text, &assistant_text)
+                        .await;
                 }
                 return Ok(stop);
             }
@@ -749,6 +789,24 @@ impl RunCtx<'_> {
             if let Some(stop) = self.execute_calls(&calls).await {
                 return Ok(stop);
             }
+        }
+    }
+
+    async fn write_memory_turn(&self, user: &str, assistant: &str) {
+        if !self.memory.auto_write() || assistant.trim().is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .memory
+            .write_turn(self.session_id, user, assistant)
+            .await
+        {
+            tracing::warn!(
+                target: "memory::mem0",
+                operation = "writeback",
+                error = %error,
+                "semantic memory writeback failed; turn completed normally"
+            );
         }
     }
 
@@ -815,6 +873,32 @@ impl RunCtx<'_> {
                 let mut result = builtin::call_load_skill(&call.arguments, self.skills).await;
                 result.provider_id = call.provider_id.clone();
                 emit_completed(self.wire, self.session_id, call, &result).await;
+                results[idx] = Some(result);
+                continue;
+            }
+
+            // Native semantic-memory tools execute in-process through the
+            // configured provider and never expose credentials to the model.
+            if self.memory.is_tool(&call.name) {
+                emit_in_progress(self.wire, self.session_id, call).await;
+                let mut result = self.memory.call_tool(&call.name, &call.arguments).await;
+                result.provider_id = call.provider_id.clone();
+                if result.is_error {
+                    emit_failed(self.wire, self.session_id, call, "memory operation failed").await;
+                } else {
+                    // The model receives the real result through history, but
+                    // ACP observers receive metadata only. This keeps recalled
+                    // facts out of tracing/telemetry payloads.
+                    let observable = ToolResult {
+                        provider_id: call.provider_id.clone(),
+                        content: vec![ToolResultContent::Text(
+                            "{\"result\":\"memory operation completed\",\"content_redacted\":true}"
+                                .into(),
+                        )],
+                        is_error: false,
+                    };
+                    emit_completed(self.wire, self.session_id, call, &observable).await;
+                }
                 results[idx] = Some(result);
                 continue;
             }

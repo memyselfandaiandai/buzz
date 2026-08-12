@@ -165,6 +165,16 @@ Everything is environment variables. No flags, no config files. (We are a subpro
 | `BUZZ_AGENT_MAX_HISTORY_BYTES` | `1048576` | 1 MiB. Old turns are evicted past this. |
 | `BUZZ_AGENT_MAX_TOOL_RESULT_TEXT_BYTES` | `51200` | 50 KiB. Per-result cap on tool-output text; oversize is middle-elided (head + tail kept) with an inline marker. Images are exempt. |
 | `BUZZ_AGENT_REQUIRE_REPLY` | `0` (`1` on mesh) | `1` enables the [reply guard](#reply-guard) — remind the model to publish when a turn is about to end with nothing posted to Buzz. Desktop defaults it to `1` for Buzz shared-compute agents. |
+| `BUZZ_AGENT_MEMORY_PROVIDER` | `none` | Semantic memory provider: `none` or `mem0`. NIP-AE engrams remain enabled independently. |
+| `MEM0_HOST` | — | Self-hosted Mem0 HTTP endpoint. Required when the memory provider is `mem0`. |
+| `MEM0_API_KEY` | — | Optional `X-API-Key` credential. Inject from a secret store; never place it in persona text or prompts. |
+| `MEM0_USER_ID` | — | Required owner/principal scope. Use the same value for agents that should share memory. |
+| `MEM0_AGENT_ID` | — | Required stable per-agent identifier. |
+| `MEM0_TOP_K` | `25` | Automatic recall result count, 1–100. This does not limit stored entries. |
+| `MEM0_TIMEOUT_SECS` | `30` | Per-request memory timeout. Memory failures fail open and do not fail the agent turn. |
+| `MEM0_MAX_INJECTED_BYTES` | `131072` | Per-turn cap on retrieved context injected into the model, 1 KiB–1 MiB. The backing memory pool remains unbounded by the agent. |
+| `MEM0_AUTO_RECALL` | `1` | Search memory automatically at the start of each prompt. |
+| `MEM0_AUTO_WRITE` | `1` | Send successful user/assistant turns for inferred-memory extraction. |
 
 
 ## Reply Guard
@@ -258,6 +268,40 @@ By default (`OPENAI_COMPAT_API=auto`) the agent picks **Responses** when `OPENAI
 
 `Provider` is a Rust `enum` with one `match` in `Llm::complete`. There is no trait, no `Box<dyn>`, no async-trait. Adding a provider is a `match` arm and one `body`/`parse` pair in `llm.rs`.
 
+## Persistent semantic memory
+
+`buzz-agent` can use a self-hosted Mem0 server as a native semantic-memory
+provider. This is separate from Buzz's encrypted NIP-AE engrams: engrams remain
+the owner-controlled agent identity and explicit-memory layer, while Mem0 adds
+semantic recall and server-side extraction across sessions and agents.
+
+```bash
+BUZZ_AGENT_MEMORY_PROVIDER=mem0 \
+MEM0_HOST=http://127.0.0.1:8889 \
+MEM0_API_KEY="$MEM0_API_KEY" \
+MEM0_USER_ID=owner-principal \
+MEM0_AGENT_ID=my-buzz-agent \
+buzz-agent
+```
+
+At the beginning of a prompt, the agent searches Mem0 and appends the results
+to a turn-local system block. Retrieved entries are never persisted in chat
+history, so they do not multiply across rounds or context handoffs. The block
+is explicitly labeled as untrusted data to reduce prompt-injection risk.
+
+After a successful `end_turn`, the user and assistant messages are sent to
+Mem0 with `infer=true`. Recall and writeback fail open: an unavailable memory
+server is logged with operation metadata but does not fail the agent turn.
+The model also receives native `mem0_search`, `mem0_add`, `mem0_update`, and
+`mem0_delete` tools. Actual tool results remain model-visible, while ACP tool
+completion observations contain only a redacted success marker. Memory values,
+queries, and credentials are never emitted as tracing fields.
+
+Use the same `MEM0_USER_ID` for shared owner memory and distinct
+`MEM0_AGENT_ID` values for per-agent attribution. Server-side filters can use
+agent and metadata fields for narrower views while the default automatic recall
+shares the owner scope.
+
 ## MCP Servers
 
 The client passes MCP server specs in `session/new`. The agent spawns each one as a stdio subprocess, calls `tools/list`, and merges everything into a single tool catalog the LLM sees. Tool names are namespaced as `server__tool` (double underscore separator). Bare tool names containing `__` are rejected at registration.
@@ -331,7 +375,7 @@ A short list, because the answer is mostly "no":
 
 - **Not a framework.** No plugins, no recipes, no slash commands, no modes. MCP servers can participate in agent lifecycle via [hook tools](../../docs/MCP_DRIVEN_HOOKS.md) (`_Stop`, `_PostCompact`), but these are advisory, fail-open, and budget-bounded — not a plugin system.
 - **Not streaming.** One non-streaming HTTP POST per round. The LLM's generated text is forwarded to the client as `agent_message_chunk`, but there is no token-level streaming.
-- **Not persistent.** Everything is in-memory, per-process. No SQLite. When context fills, the agent summarizes its own history and continues (context handoff). No external persistence.
+- **Session history is process-local.** When context fills, the agent summarizes its own history and continues (context handoff). Optional Mem0 semantic memory persists selected facts independently of session history; encrypted NIP-AE engrams remain a separate Buzz protocol feature.
 - **Not an SDK.** This is a binary. The protocol seam is stdin/stdout. Use it from any language.
 - **Not a UI.** No TUI, no web, no notifications. The client renders.
 - **Not authenticated.** API keys come from env. Use systemd, Docker secrets, or a wrapper.
