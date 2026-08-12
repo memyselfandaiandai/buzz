@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::{fs, process::Command};
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -51,6 +52,9 @@ pub(crate) struct MemoryConfig {
     pub(crate) provider: MemoryProviderKind,
     pub(crate) host: String,
     pub(crate) api_key: String,
+    pub(crate) api_key_bws_secret_id: String,
+    pub(crate) bws_access_token_file: String,
+    pub(crate) bws_binary: String,
     pub(crate) user_id: String,
     pub(crate) agent_id: String,
     pub(crate) top_k: usize,
@@ -66,6 +70,9 @@ impl MemoryConfig {
             provider: MemoryProviderKind::None,
             host: String::new(),
             api_key: String::new(),
+            api_key_bws_secret_id: String::new(),
+            bws_access_token_file: String::new(),
+            bws_binary: "bws".into(),
             user_id: String::new(),
             agent_id: String::new(),
             top_k: 25,
@@ -96,6 +103,12 @@ impl MemoryConfig {
         if self.agent_id.trim().is_empty() {
             return Err(
                 "config: MEM0_AGENT_ID required when BUZZ_AGENT_MEMORY_PROVIDER=mem0".into(),
+            );
+        }
+        if !self.api_key_bws_secret_id.is_empty() && self.bws_access_token_file.is_empty() {
+            return Err(
+                "config: MEM0_BWS_ACCESS_TOKEN_FILE required when MEM0_API_KEY_BWS_SECRET_ID is set"
+                    .into(),
             );
         }
         if !(1..=100).contains(&self.top_k) {
@@ -138,8 +151,9 @@ impl Mem0Backend {
     fn new(config: &MemoryConfig) -> Result<Self, String> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if !config.api_key.is_empty() {
-            let value = HeaderValue::from_str(&config.api_key)
+        let api_key = resolve_api_key(config)?;
+        if !api_key.is_empty() {
+            let value = HeaderValue::from_str(&api_key)
                 .map_err(|_| "config: MEM0_API_KEY is not a valid HTTP header value".to_string())?;
             headers.insert("x-api-key", value);
         }
@@ -185,6 +199,55 @@ impl Mem0Backend {
             .await
             .map_err(|e| format!("Mem0 returned invalid JSON: {e}"))
     }
+}
+
+fn resolve_api_key(config: &MemoryConfig) -> Result<String, String> {
+    if !config.api_key.is_empty() {
+        return Ok(config.api_key.clone());
+    }
+    if config.api_key_bws_secret_id.is_empty() {
+        return Ok(String::new());
+    }
+
+    let token_file = fs::read_to_string(&config.bws_access_token_file)
+        .map_err(|_| "config: failed to read MEM0_BWS_ACCESS_TOKEN_FILE".to_string())?;
+    let token = token_file
+        .lines()
+        .filter_map(|line| line.strip_prefix("BWS_ACCESS_TOKEN="))
+        .next_back()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "config: BWS_ACCESS_TOKEN missing from token file".to_string())?;
+
+    let mut command = Command::new(&config.bws_binary);
+    command
+        .args([
+            "secret",
+            "get",
+            config.api_key_bws_secret_id.as_str(),
+            "--output",
+            "json",
+        ])
+        .env("BWS_ACCESS_TOKEN", token);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
+        .output()
+        .map_err(|_| "config: failed to start BWS secret resolver".to_string())?;
+    if !output.status.success() {
+        return Err("config: BWS secret resolver failed".into());
+    }
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "config: BWS secret resolver returned invalid JSON".to_string())?;
+    response
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "config: BWS secret has no value".to_string())
 }
 
 fn records_from_response(value: Value) -> Vec<MemoryRecord> {
@@ -605,6 +668,9 @@ mod tests {
             provider: MemoryProviderKind::Mem0,
             host: format!("http://{address}"),
             api_key: "test-key".into(),
+            api_key_bws_secret_id: String::new(),
+            bws_access_token_file: String::new(),
+            bws_binary: "bws".into(),
             user_id: "owner-scope".into(),
             agent_id: "agent-scope".into(),
             top_k: 25,
@@ -760,6 +826,9 @@ mod tests {
             provider: MemoryProviderKind::Mem0,
             host: std::env::var("MEM0_HOST").expect("MEM0_HOST"),
             api_key: std::env::var("MEM0_API_KEY").unwrap_or_default(),
+            api_key_bws_secret_id: String::new(),
+            bws_access_token_file: String::new(),
+            bws_binary: "bws".into(),
             user_id: std::env::var("MEM0_USER_ID").expect("MEM0_USER_ID"),
             agent_id: std::env::var("MEM0_AGENT_ID").expect("MEM0_AGENT_ID"),
             top_k: 25,

@@ -168,6 +168,9 @@ Everything is environment variables. No flags, no config files. (We are a subpro
 | `BUZZ_AGENT_MEMORY_PROVIDER` | `none` | Semantic memory provider: `none` or `mem0`. NIP-AE engrams remain enabled independently. |
 | `MEM0_HOST` | — | Self-hosted Mem0 HTTP endpoint. Required when the memory provider is `mem0`. |
 | `MEM0_API_KEY` | — | Optional `X-API-Key` credential. Inject from a secret store; never place it in persona text or prompts. |
+| `MEM0_API_KEY_BWS_SECRET_ID` | — | Optional Bitwarden Secrets Manager secret ID used when `MEM0_API_KEY` is empty. Keeps the Mem0 key out of Buzz agent JSON. |
+| `MEM0_BWS_ACCESS_TOKEN_FILE` | — | Env-format file containing `BWS_ACCESS_TOKEN`; required with a BWS secret ID. Only the named token is read. |
+| `MEM0_BWS_BINARY` | `bws` | Bitwarden Secrets Manager CLI path or command name. |
 | `MEM0_USER_ID` | — | Required owner/principal scope. Use the same value for agents that should share memory. |
 | `MEM0_AGENT_ID` | — | Required stable per-agent identifier. |
 | `MEM0_TOP_K` | `25` | Automatic recall result count, 1–100. This does not limit stored entries. |
@@ -296,6 +299,11 @@ The model also receives native `mem0_search`, `mem0_add`, `mem0_update`, and
 `mem0_delete` tools. Actual tool results remain model-visible, while ACP tool
 completion observations contain only a redacted success marker. Memory values,
 queries, and credentials are never emitted as tracing fields.
+
+For BWS-backed credentials, set `MEM0_API_KEY_BWS_SECRET_ID` and
+`MEM0_BWS_ACCESS_TOKEN_FILE` instead of `MEM0_API_KEY`. The agent resolves the
+secret once at process start with the BWS CLI, never writes it to disk, and
+omits resolver stdout/stderr from errors and traces.
 
 Use the same `MEM0_USER_ID` for shared owner memory and distinct
 `MEM0_AGENT_ID` values for per-agent attribution. Server-side filters can use
