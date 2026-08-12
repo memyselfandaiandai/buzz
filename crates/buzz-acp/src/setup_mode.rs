@@ -310,6 +310,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     tracing::info!(
         agent = %payload.agent_name,
         requirements = payload.requirements.len(),
+        requirement_details = ?payload.requirements,
         "buzz-acp entering setup mode"
     );
 
