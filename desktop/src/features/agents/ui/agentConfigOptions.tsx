@@ -112,7 +112,7 @@ const PROVIDER_CREDENTIAL_CONFIG: Partial<
     apiKeyLabel: "OpenAI Runtime API Key",
   },
   "openai-compat": {
-    requiredEnvKeys: ["OPENAI_COMPAT_API_KEY"],
+    requiredEnvKeys: ["OPENAI_COMPAT_BASE_URL"],
     secretEnvVar: "OPENAI_COMPAT_API_KEY",
     apiKeyLabel: "OpenAI-compatible Runtime API Key",
   },

@@ -752,6 +752,9 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 pub enum Provider {
     Anthropic,
     OpenAi,
+    /// A custom OpenAI-compatible endpoint. Unlike official OpenAI, the base
+    /// URL is explicit and bearer authentication is optional.
+    OpenAiCompat,
     /// Databricks model serving. Routes to `{base_url}/serving-endpoints/{model}/invocations`
     /// with a dynamically-acquired bearer (OAuth 2.0 PKCE, or static `DATABRICKS_TOKEN`).
     /// Wire format is OpenAI-chat-compatible — reuses the same body builder and parser.
@@ -899,6 +902,16 @@ impl Config {
                 )
                 .ok_or_else(|| "config: OPENAI_COMPAT_MODEL required".to_string())?,
                 env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
+                parse_openai_api(env("OPENAI_COMPAT_API").as_deref())?,
+            ),
+            Provider::OpenAiCompat => (
+                env("OPENAI_COMPAT_API_KEY").unwrap_or_default(),
+                resolve_model(
+                    buzz_agent_model.as_deref(),
+                    env("OPENAI_COMPAT_MODEL").as_deref(),
+                )
+                .ok_or_else(|| "config: OPENAI_COMPAT_MODEL required".to_string())?,
+                parse_openai_compat_base_url(env("OPENAI_COMPAT_BASE_URL").as_deref())?,
                 parse_openai_api(env("OPENAI_COMPAT_API").as_deref())?,
             ),
             Provider::Databricks | Provider::DatabricksV2 => (
@@ -1139,10 +1152,9 @@ fn resolve_provider(
                 "anthropic" => Err(
                     "config: ANTHROPIC_API_KEY required".into(),
                 ),
-                "openai" | "openai-compat" if present_nonempty(openai_key) => Ok(Provider::OpenAi),
-                "openai" | "openai-compat" => Err(
-                    "config: OPENAI_COMPAT_API_KEY required".into(),
-                ),
+                "openai" if present_nonempty(openai_key) => Ok(Provider::OpenAi),
+                "openai" => Err("config: OPENAI_COMPAT_API_KEY required".into()),
+                "openai-compat" => Ok(Provider::OpenAiCompat),
                 "databricks" => Ok(Provider::Databricks),
                 "databricks_v2" | "databricks-v2" => Ok(Provider::DatabricksV2),
                 "openrouter" if present_nonempty(openrouter_key) => Ok(Provider::OpenRouter),
@@ -1156,6 +1168,19 @@ fn resolve_provider(
             "config: BUZZ_AGENT_PROVIDER is required — set it to your provider (e.g. anthropic, openai, databricks)".into(),
         ),
     }
+}
+
+fn parse_openai_compat_base_url(raw: Option<&str>) -> Result<String, String> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "config: OPENAI_COMPAT_BASE_URL required for openai-compat".to_string())?;
+    let parsed = url::Url::parse(value)
+        .map_err(|_| "config: OPENAI_COMPAT_BASE_URL must be a valid HTTP(S) URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("config: OPENAI_COMPAT_BASE_URL must be a valid HTTP(S) URL".to_string());
+    }
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 /// Parse `OPENAI_COMPAT_API`. Pure (env-free) for testability; the
@@ -1450,13 +1475,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_errors_when_requested_provider_key_missing() {
-        // No fallback — missing key returns an error regardless of Databricks availability.
+    fn resolve_provider_requires_only_official_openai_key() {
         let err = resolve_provider(Some("anthropic"), None, None, None).unwrap_err();
         assert!(err.contains("ANTHROPIC_API_KEY required"), "{err}");
 
-        let err = resolve_provider(Some("openai-compat"), None, Some("   "), None).unwrap_err();
+        let err = resolve_provider(Some("openai"), None, Some("   "), None).unwrap_err();
         assert!(err.contains("OPENAI_COMPAT_API_KEY required"), "{err}");
+
+        assert_eq!(
+            resolve_provider(Some("openai-compat"), None, None, None).unwrap(),
+            Provider::OpenAiCompat
+        );
+    }
+
+    #[test]
+    fn openai_compat_base_url_is_required_and_normalized() {
+        assert!(parse_openai_compat_base_url(None)
+            .unwrap_err()
+            .contains("required for openai-compat"));
+        assert!(parse_openai_compat_base_url(Some("ftp://localhost/v1"))
+            .unwrap_err()
+            .contains("valid HTTP(S) URL"));
+        assert_eq!(
+            parse_openai_compat_base_url(Some("  http://localhost:11434/v1///  ")).unwrap(),
+            "http://localhost:11434/v1"
+        );
     }
 
     #[test]

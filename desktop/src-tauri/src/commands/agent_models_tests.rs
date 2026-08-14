@@ -106,6 +106,22 @@ fn openai_models_url_uses_openai_default_base_url() {
 }
 
 #[test]
+fn openai_compat_models_url_requires_custom_base_url() {
+    let err = openai_compatible_models_url_for_discovery(Some("openai-compat"), &BTreeMap::new())
+        .unwrap_err();
+    assert!(err.contains("OPENAI_COMPAT_BASE_URL required"), "{err}");
+
+    let env = BTreeMap::from([(
+        "OPENAI_COMPAT_BASE_URL".to_string(),
+        "http://localhost:11434/v1/".to_string(),
+    )]);
+    assert_eq!(
+        openai_compatible_models_url_for_discovery(Some("openai-compat"), &env).unwrap(),
+        "http://localhost:11434/v1/models"
+    );
+}
+
+#[test]
 fn anthropic_models_url_uses_anthropic_default_base_url() {
     assert_eq!(
         anthropic_models_url(&BTreeMap::new()),
@@ -916,4 +932,65 @@ fn databricks_static_token_error_redacts_echoed_token() {
         error.contains("update it in agent settings"),
         "error lost its remediation: {error}"
     );
+}
+
+#[tokio::test]
+async fn openai_compat_discovery_omits_authorization_without_key() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let captured = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        let body = r#"{"data":[{"id":"llama3","created":1}]}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_ascii_lowercase()
+    });
+
+    let provider = effective_discovery_provider(Some("openai-compat"), None, &BTreeMap::new());
+    let env = BTreeMap::from([("OPENAI_COMPAT_BASE_URL".to_string(), base_url)]);
+    let result = discover_openai_compatible_models(&reqwest::Client::new(), &provider, &env, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.models[0].id, "llama3");
+    let request = captured.await.unwrap();
+    assert!(request.starts_with("get /v1/models "), "{request}");
+    assert!(!request.contains("authorization:"), "{request}");
+}
+
+#[test]
+fn optional_compat_key_allows_explicit_blank_to_shadow_process_env() {
+    let key = "BUZZ_TEST_OPENAI_COMPAT_API_KEY_OVERRIDE";
+    let prior = std::env::var_os(key);
+    std::env::set_var(key, "process-secret");
+
+    let env = BTreeMap::from([(key.to_string(), "   ".to_string())]);
+    assert_eq!(env_or_process_override(&env, key).as_deref(), Some(""));
+
+    match prior {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
 }

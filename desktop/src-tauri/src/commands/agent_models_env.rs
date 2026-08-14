@@ -25,6 +25,20 @@ pub(super) fn env_or_process_value(env: &BTreeMap<String, String>, key: &str) ->
     })
 }
 
+/// Read a trimmed mapped value even when it is blank, falling back to the
+/// process only when the map has no override. Optional credentials use this so
+/// an explicit blank means "send no authentication" rather than inheriting an
+/// unrelated process secret.
+pub(super) fn env_or_process_override(env: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    env.get(key)
+        .map(|value| value.trim().to_string())
+        .or_else(|| {
+            std::env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+        })
+}
+
 /// Clone `env` with `key` set to the value a request actually used, so error
 /// redaction masks the inherited process value and not just the mapped one.
 pub(super) fn redaction_env_with_value(

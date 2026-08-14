@@ -516,6 +516,12 @@ fn buzz_agent_requirements(effective: &EffectiveAgentEnv) -> Vec<Requirement> {
                     key: "OPENAI_COMPAT_API_KEY".to_string(),
                 });
             }
+        Some("openai-compat")
+            if env_key_missing("OPENAI_COMPAT_BASE_URL") => {
+                missing.push(Requirement::EnvKey {
+                    key: "OPENAI_COMPAT_BASE_URL".to_string(),
+                });
+            }
         Some("databricks") | Some("databricks_v2") | Some("databricks-v2")
             // DATABRICKS_HOST is hard-required; DATABRICKS_TOKEN is optional
             // (OAuth PKCE is the normal path — see buzz-agent/src/config.rs:143).
@@ -628,6 +634,14 @@ fn goose_requirements(
         {
             missing.push(Requirement::EnvKey {
                 key: "OPENAI_COMPAT_API_KEY".to_string(),
+            });
+        }
+        Some("openai-compat")
+            if env_key_missing("OPENAI_COMPAT_BASE_URL")
+                && !file_key_present("OPENAI_COMPAT_BASE_URL") =>
+        {
+            missing.push(Requirement::EnvKey {
+                key: "OPENAI_COMPAT_BASE_URL".to_string(),
             });
         }
         Some("databricks") | Some("databricks_v2") | Some("databricks-v2")
@@ -746,6 +760,35 @@ mod tests {
         assert!(result.requirements().contains(&Requirement::EnvKey {
             key: "OPENAI_COMPAT_API_KEY".to_string()
         }));
+    }
+
+    #[test]
+    fn buzz_agent_openai_compat_requires_url_but_not_key() {
+        let without_url = make_env(
+            "buzz-agent",
+            env_with(&[
+                ("BUZZ_AGENT_PROVIDER", "openai-compat"),
+                ("BUZZ_AGENT_MODEL", "llama3"),
+            ]),
+        );
+        let result = agent_readiness(&without_url);
+        assert!(!result.is_ready());
+        assert!(result.requirements().contains(&Requirement::EnvKey {
+            key: "OPENAI_COMPAT_BASE_URL".to_string()
+        }));
+        assert!(!result.requirements().contains(&Requirement::EnvKey {
+            key: "OPENAI_COMPAT_API_KEY".to_string()
+        }));
+
+        let with_url = make_env(
+            "buzz-agent",
+            env_with(&[
+                ("BUZZ_AGENT_PROVIDER", "openai-compat"),
+                ("BUZZ_AGENT_MODEL", "llama3"),
+                ("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1"),
+            ]),
+        );
+        assert!(agent_readiness(&with_url).is_ready());
     }
 
     #[test]
@@ -1203,9 +1246,7 @@ mod tests {
             );
         }
     }
-
     // ── codex readiness version gate ───────────────────────────────────────
-
     /// Build a minimal `KnownAcpRuntime` for testing the codex version gate.
     /// `adapter_commands` are the exact strings passed to `find_command` — use
     /// `&["codex-acp"]` when the binary is on PATH, or `&[<absolute_path>]`
@@ -1249,48 +1290,40 @@ mod tests {
             auth_probe_args: None,
         }
     }
-
     /// Build a temp dir containing a `codex-acp` script with the given body,
     /// prepend it to PATH, and clear the resolve cache.  Returns the temp dir
     /// and the original PATH string for restoration.
     #[cfg(unix)]
     fn setup_temp_codex_acp(script_body: &str) -> (tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("create temp dir");
         let bin = dir.path().join("codex-acp");
         std::fs::write(&bin, script_body).expect("write script");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("chmod script");
-
         let original_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", dir.path().display(), original_path);
         std::env::set_var("PATH", &new_path);
         crate::managed_agents::clear_resolve_cache();
-
         (dir, original_path)
     }
-
     #[cfg(unix)]
     fn leaked_adapter_commands(bin: &std::path::Path) -> &'static [&'static str] {
         let command = Box::leak(bin.display().to_string().into_boxed_str());
         Box::leak(vec![command as &'static str].into_boxed_slice())
     }
-
     /// Restore PATH and clear the resolve cache after a PATH-mutating test.
     #[cfg(unix)]
     fn restore_path(original: &str) {
         std::env::set_var("PATH", original);
         crate::managed_agents::clear_resolve_cache();
     }
-
     /// Codex readiness: outdated adapter (exits non-zero) → AdapterOutdated,
     /// login probe skipped.
     #[cfg(unix)]
     #[test]
     fn cli_login_requirements_codex_outdated_adapter_emits_adapter_outdated() {
         let _guard = crate::managed_agents::lock_path_mutex();
-
         let (dir, orig) = setup_temp_codex_acp("#!/bin/sh\nexit 1\n");
         let exe = present_binary_str();
         // Use the fixture's absolute adapter path here. Bare `codex-acp`
@@ -1305,10 +1338,8 @@ mod tests {
             "run `codex login`",
             &rt,
         );
-
         restore_path(&orig);
         drop(dir);
-
         assert!(
             !reqs.is_empty(),
             "outdated codex adapter must produce a requirement; got {reqs:?}"
@@ -1326,14 +1357,12 @@ mod tests {
             panic!("expected CliLogin requirement; got {:?}", reqs[0]);
         }
     }
-
     /// Codex readiness: adapter exits 0 but output is not a parseable version
     /// → AdapterOutdated (garbage output treated as outdated, same as non-zero).
     #[cfg(unix)]
     #[test]
     fn cli_login_requirements_codex_garbage_version_output_emits_adapter_outdated() {
         let _guard = crate::managed_agents::lock_path_mutex();
-
         let (dir, orig) = setup_temp_codex_acp("#!/bin/sh\necho 'not a version string'\nexit 0\n");
         let exe = present_binary_str();
         let rt = make_codex_runtime(
@@ -1345,10 +1374,8 @@ mod tests {
             "run `codex login`",
             &rt,
         );
-
         restore_path(&orig);
         drop(dir);
-
         assert!(
             !reqs.is_empty(),
             "garbage version output must produce a requirement; got {reqs:?}"
@@ -1366,9 +1393,7 @@ mod tests {
             panic!("expected CliLogin requirement; got {:?}", reqs[0]);
         }
     }
-
     // ── custom/unknown command ─────────────────────────────────────────────
-
     #[test]
     fn unknown_command_is_always_ready() {
         // Since Phase B-7 (readiness exec-check), unknown/custom commands that are
@@ -1381,7 +1406,6 @@ mod tests {
             "unknown/custom command present in PATH should be Ready"
         );
     }
-
     #[test]
     fn unknown_command_missing_from_path_is_not_ready() {
         let env = make_env("my-custom-harness-that-does-not-exist", BTreeMap::new());
@@ -1397,14 +1421,11 @@ mod tests {
             "should surface MissingBinary requirement"
         );
     }
-
     // ── AgentReadiness helpers ─────────────────────────────────────────────
-
     #[test]
     fn agent_readiness_ready_has_empty_requirements() {
         assert!(AgentReadiness::Ready.requirements().is_empty());
     }
-
     #[test]
     fn agent_readiness_not_ready_exposes_requirements() {
         let r = AgentReadiness::NotReady {
@@ -1415,9 +1436,7 @@ mod tests {
         assert!(!r.is_ready());
         assert_eq!(r.requirements().len(), 1);
     }
-
     // ── Requirement serialization ─────────────────────────────────────────
-
     #[test]
     fn requirement_serializes_with_surface_tag() {
         let r = Requirement::NormalizedField {
@@ -1427,13 +1446,11 @@ mod tests {
         assert_eq!(json["surface"], "normalized_field");
         assert_eq!(json["field"], "provider");
     }
-
     #[test]
     fn git_bash_requirement_serializes_correctly() {
         let json = serde_json::to_value(Requirement::GitBash).unwrap();
         assert_eq!(json, serde_json::json!({ "surface": "git_bash" }));
     }
-
     #[test]
     fn env_key_requirement_serializes_correctly() {
         let r = Requirement::EnvKey {
@@ -1443,7 +1460,6 @@ mod tests {
         assert_eq!(json["surface"], "env_key");
         assert_eq!(json["key"], "ANTHROPIC_API_KEY");
     }
-
     #[test]
     fn cli_login_requirement_serializes_correctly() {
         let r = Requirement::CliLogin {
@@ -1460,9 +1476,7 @@ mod tests {
         assert!(json["probe_args"].is_array());
         assert!(json["setup_copy"].as_str().unwrap().contains("codex login"));
     }
-
     // ── resolve_effective_agent_env ─────────────────────────────────────────
-
     #[test]
     fn resolve_effective_agent_env_user_env_wins_over_structured_fields() {
         // A record whose env_vars explicitly set provider/model must win over
@@ -1474,7 +1488,6 @@ mod tests {
             "BUZZ_AGENT_MODEL".to_string(),
             "claude-opus-4-5".to_string(),
         );
-
         // Minimal record: only the fields resolve_effective_agent_env reads.
         let record = crate::managed_agents::types::ManagedAgentRecord {
             pubkey: "test-pubkey".to_string(),
@@ -1531,10 +1544,8 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
         };
-
         let runtime = known_acp_runtime_exact("buzz-agent");
         let effective = resolve_effective_agent_env(&record, &[], runtime, &Default::default());
-
         // User env_vars must be present in the output (last-write-wins).
         assert_eq!(
             effective.env.get("BUZZ_AGENT_PROVIDER").map(String::as_str),
@@ -1545,9 +1556,7 @@ mod tests {
             Some("claude-opus-4-5")
         );
     }
-
     // ── provider-specific model fallback tests ────────────────────────────
-
     #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
         // The baked buzz-releases env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL.
@@ -1565,7 +1574,6 @@ mod tests {
             "DATABRICKS_MODEL must satisfy the model requirement for databricks_v2"
         );
     }
-
     #[test]
     fn buzz_agent_databricks_v2_hyphen_alias_with_databricks_model_is_ready() {
         // buzz-agent accepts both "databricks_v2" and "databricks-v2". The
@@ -1583,7 +1591,6 @@ mod tests {
             "databricks-v2 alias with DATABRICKS_MODEL must be Ready"
         );
     }
-
     #[test]
     fn buzz_agent_databricks_hyphen_alias_missing_host_returns_not_ready() {
         // The hyphen alias "databricks-v2" requires DATABRICKS_HOST just like
@@ -1608,7 +1615,6 @@ mod tests {
             "missing requirements must include DATABRICKS_HOST; got {reqs:?}"
         );
     }
-
     #[test]
     fn buzz_agent_databricks_v1_with_databricks_model_but_no_buzz_agent_model_is_ready() {
         // V1 (Model Serving) also resolves DATABRICKS_MODEL — same fallback applies.
@@ -1625,7 +1631,6 @@ mod tests {
             "DATABRICKS_MODEL must satisfy the model requirement for databricks (V1)"
         );
     }
-
     #[test]
     fn buzz_agent_anthropic_with_anthropic_model_but_no_buzz_agent_model_is_ready() {
         let env = make_env(
@@ -1641,7 +1646,6 @@ mod tests {
             "ANTHROPIC_MODEL must satisfy the model requirement for anthropic"
         );
     }
-
     #[test]
     fn buzz_agent_openai_with_openai_compat_model_but_no_buzz_agent_model_is_ready() {
         let env = make_env(
@@ -1657,7 +1661,6 @@ mod tests {
             "OPENAI_COMPAT_MODEL must satisfy the model requirement for openai"
         );
     }
-
     #[test]
     fn buzz_agent_empty_provider_model_fallback_key_is_not_ready() {
         // An empty DATABRICKS_MODEL with no BUZZ_AGENT_MODEL must still be NotReady.
@@ -1680,9 +1683,7 @@ mod tests {
                 field: "model".to_string()
             }));
     }
-
     // ── OpenRouter readiness ─────────────────────────────────────────────
-
     #[test]
     fn buzz_agent_openrouter_with_all_fields_is_ready() {
         let env = make_env(
@@ -1699,7 +1700,6 @@ mod tests {
             "openrouter with all fields should be ready"
         );
     }
-
     #[test]
     fn buzz_agent_openrouter_missing_key_returns_not_ready() {
         let env = make_env(
@@ -1715,7 +1715,6 @@ mod tests {
             key: "OPENROUTER_API_KEY".to_string()
         }));
     }
-
     #[test]
     fn buzz_agent_openrouter_with_provider_model_fallback_is_ready() {
         let env = make_env(
@@ -1733,7 +1732,6 @@ mod tests {
         );
     }
 }
-
 // Goose file-config-aware requirement tests live in a sibling file so this
 // module stays under the desktop file-size ratchet.
 #[cfg(test)]
