@@ -1,0 +1,84 @@
+name: OCI desktop preflight
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/buzz-backend-kubernetes/**"
+      - "crates/buzz-workspace-controller/**"
+      - "deploy/oci-agent-desktop/**"
+      - "docs/adr/0001-buzz-workspace-controller-boundary.md"
+      - "docs/oci-agent-desktop-preprovision.md"
+      - ".github/workflows/oci-desktop-preflight.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  controller-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: ". -> target"
+      - name: Durable controller tests
+        run: cargo test --locked -p buzz-workspace-controller
+      - name: Durable controller formatting and lints
+        run: |
+          cargo fmt -p buzz-workspace-controller -- --check
+          cargo clippy --locked -p buzz-workspace-controller --all-targets -- -D warnings
+
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Execution contract simulation
+        run: node deploy/oci-agent-desktop/protocol/protocol-smoke.mjs
+      - name: Storage contract simulation
+        run: node deploy/oci-agent-desktop/storage/storage-broker-smoke.mjs
+      - name: Provider-neutral controller enforcement tests
+        run: node --test deploy/oci-agent-desktop/controller/controller.test.mjs
+      - name: Adversarial renderer and closed-world validator tests
+        run: node --test deploy/oci-agent-desktop/kubernetes/closed-world-validator.test.mjs deploy/oci-agent-desktop/kubernetes/renderer-lifecycle.test.mjs
+      - name: Render and validate legacy static fixture
+        run: |
+          node deploy/oci-agent-desktop/kubernetes/render-session.mjs --out /tmp/session.json
+          node deploy/oci-agent-desktop/kubernetes/validate-session.mjs /tmp/session.json
+      - name: Verify immutable Sprig index contains Linux ARM64
+        run: node deploy/oci-agent-desktop/build/verify-image-platform.mjs ghcr.io/block/buzz-sprig:sha-6530b58@sha256:17facfc7608d8ddb33bc056c9aaba1098f4ef6abe5655702fbfd7584d1f74d76
+
+  provider-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: ". -> target"
+      - name: Provider tests
+        run: cargo test --locked -p buzz-backend-kubernetes
+      - name: Native ARM64 GNU build and process smoke
+        run: |
+          cargo build --locked --release -p buzz-backend-kubernetes --target aarch64-unknown-linux-gnu
+          file target/aarch64-unknown-linux-gnu/release/buzz-backend-kubernetes | grep 'ARM aarch64'
+          printf '{"op":"info"}\n' | target/aarch64-unknown-linux-gnu/release/buzz-backend-kubernetes | grep '"ok":true'

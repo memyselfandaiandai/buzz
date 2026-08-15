@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.local/schemas/result-manifest-v1.json",
+  "title": "Buzz disposable worker result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "task_id", "session_id", "agent_id", "status", "started_at", "finished_at", "artifacts", "worker_claims_sha256"],
+  "properties": {
+    "version": {"const": 1},
+    "task_id": {"type": "string", "format": "uuid"},
+    "session_id": {"type": "string", "format": "uuid"},
+    "agent_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "status": {"enum": ["succeeded", "failed", "cancelled", "expired"]},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "worker_claims_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "artifacts": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "bytes", "sha256", "media_type"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^[^/\\\\].*"},
+          "bytes": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "media_type": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "message": {"type": "string", "maxLength": 4096}
+  }
+}

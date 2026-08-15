@@ -1,0 +1,17 @@
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "NetworkPolicy",
+  "metadata": {
+    "name": "allow-everything",
+    "namespace": "buzz-adversarial"
+  },
+  "spec": {
+    "podSelector": {
+      "matchLabels": {
+        "app.kubernetes.io/name": "buzz-desktop"
+      }
+    },
+    "policyTypes": ["Egress"],
+    "egress": [{}]
+  }
+}

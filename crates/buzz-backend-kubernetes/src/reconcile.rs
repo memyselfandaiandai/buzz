@@ -356,7 +356,9 @@ pub async fn deploy(
     cfg: &ProviderConfig,
     env: BTreeMap<String, String>,
 ) -> Result<String, String> {
-    substrate.ensure_namespace(&cfg.namespace).await?;
+    if cfg.manage_namespace {
+        substrate.ensure_namespace(&cfg.namespace).await?;
+    }
     preflight_gc(substrate, identity).await;
 
     let desired = crate::pod::intent_template(cfg, env.keys().cloned()).fingerprint();
@@ -684,6 +686,7 @@ mod tests {
             resources: Resources::default(),
             inactivity_seconds: Some(7200),
             service_account: None,
+            manage_namespace: true,
         }
     }
 
@@ -821,6 +824,17 @@ mod tests {
             [format!("ensure_namespace {}", cfg.namespace)],
             "the no-op row mutated something"
         );
+    }
+
+    #[test]
+    fn precreated_namespace_mode_never_requests_cluster_scope_namespace_access() {
+        let id = identity();
+        let mut cfg = config();
+        cfg.manage_namespace = false;
+        let fake = Fake::default().with_pod(our_pod(&id, &cfg, Some(running())));
+
+        assert_eq!(run(&fake, &id, &cfg).unwrap(), id.pod_name());
+        assert_eq!(fake.mutations(), Vec::<String>::new());
     }
 
     /// ...including when the desired intent has diverged. Edits reach a
