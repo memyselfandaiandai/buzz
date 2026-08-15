@@ -4,6 +4,14 @@ use buzz_workspace_controller::{
 };
 use tempfile::tempdir;
 
+type LegacyProviderAuthority = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
+
 fn request(session: &str, jti: &str, workspace: &str, signed_max: u32) -> AdmissionRequest {
     AdmissionRequest {
         session_id: session.into(),
@@ -25,7 +33,7 @@ fn wal_admission_is_durable_replay_safe_and_scoped() {
     let db = dir.path().join("ledger.db");
     let ledger = Ledger::open(&db).unwrap();
     assert_eq!(ledger.journal_mode().unwrap().to_ascii_lowercase(), "wal");
-    assert_eq!(ledger.schema_version().unwrap(), 4);
+    assert_eq!(ledger.schema_version().unwrap(), 5);
     assert_eq!(Ledger::session_job_quota(), 1);
 
     assert_eq!(
@@ -221,7 +229,7 @@ fn cancellation_expiry_rejection_and_recovery_states_preserve_uncertain_capacity
 }
 
 #[test]
-fn schema_v1_rows_are_quarantined_during_launch_fencing_v4_migration() {
+fn schema_v1_rows_are_quarantined_during_launch_fencing_v5_migration() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("ledger.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -273,11 +281,18 @@ fn schema_v1_rows_are_quarantined_during_launch_fencing_v4_migration() {
     drop(conn);
 
     let ledger = Ledger::open(&db).unwrap();
-    assert_eq!(ledger.schema_version().unwrap(), 4);
+    assert_eq!(ledger.schema_version().unwrap(), 5);
     assert_eq!(
         ledger.state("legacy-session").unwrap(),
         Lifecycle::RecoveryError
     );
+    assert!(matches!(
+        ledger.identity("legacy-session"),
+        Err(ControllerError::UnsupportedAuthorityVersion {
+            found: 0,
+            supported: 5
+        })
+    ));
     assert!(ledger.cancellation_requested("legacy-session").unwrap());
     assert_eq!(
         ledger
@@ -297,6 +312,7 @@ fn schema_v1_rows_are_quarantined_during_launch_fencing_v4_migration() {
         .unwrap();
     assert!(columns.iter().any(|column| column == "launch_epoch"));
     assert!(columns.iter().any(|column| column == "authority_version"));
+    assert!(columns.iter().any(|column| column == "provider_scope"));
     let quarantine: (i64, String, i64) = conn
         .query_row(
             "SELECT authority_version,last_error,version FROM sessions WHERE session_id='legacy-session'",
@@ -328,4 +344,167 @@ fn schema_v1_rows_are_quarantined_during_launch_fencing_v4_migration() {
         session_version, 1,
         "quarantine migration must be idempotent"
     );
+}
+
+#[test]
+fn future_schema_version_fails_closed_on_open() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("future.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE controller_schema(
+             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+             version INTEGER NOT NULL
+         );
+         INSERT INTO controller_schema(singleton,version) VALUES(1,6);",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(matches!(
+        Ledger::open(&db),
+        Err(ControllerError::UnsupportedSchemaVersion {
+            found: 6,
+            supported: 5
+        })
+    ));
+}
+
+#[test]
+fn future_row_authority_version_rejects_identity_and_mutations_without_state_change() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("authority.db");
+    let ledger = Ledger::open(&db).unwrap();
+    let admission = request("s1", "j1", "w1", 20);
+    ledger.prepare_and_admit(&admission).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE sessions SET authority_version=6 WHERE session_id='s1'",
+        [],
+    )
+    .unwrap();
+    let before: (String, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT state,version,reserved,cancellation_requested,
+                    (SELECT COUNT(*) FROM transitions WHERE session_id='s1')
+             FROM sessions WHERE session_id='s1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(conn);
+
+    for result in [
+        ledger.identity("s1").map(|_| ()),
+        ledger.prepare_and_admit(&admission).map(|_| ()),
+        ledger.request_cancellation("s1", "future-row"),
+        ledger.mark_recovery_error("s1", "future-row"),
+    ] {
+        assert!(matches!(
+            result,
+            Err(ControllerError::UnsupportedAuthorityVersion {
+                found: 6,
+                supported: 5
+            })
+        ));
+    }
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let after: (String, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT state,version,reserved,cancellation_requested,
+                    (SELECT COUNT(*) FROM transitions WHERE session_id='s1')
+             FROM sessions WHERE session_id='s1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn schema_v4_rows_are_quarantined_without_creating_v5_authority() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("v4.db");
+    let ledger = Ledger::open(&db).unwrap();
+    ledger
+        .prepare_and_admit(&request("s1", "j1", "w1", 20))
+        .unwrap();
+    drop(ledger);
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE sessions SET authority_version=4,provider_scope='' WHERE session_id='s1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE controller_schema SET version=4 WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let migrated = Ledger::open(&db).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 5);
+    assert_eq!(migrated.state("s1").unwrap(), Lifecycle::RecoveryError);
+    assert!(matches!(
+        migrated.identity("s1"),
+        Err(ControllerError::UnsupportedAuthorityVersion {
+            found: 4,
+            supported: 5
+        })
+    ));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let row: (i64, String, i64, i64, String) = conn
+        .query_row(
+            "SELECT authority_version,provider_scope,reserved,cancellation_requested,last_error
+             FROM sessions WHERE session_id='s1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            4,
+            String::new(),
+            1,
+            1,
+            "legacy-authority-quarantined".into()
+        )
+    );
+    let provider_authority: LegacyProviderAuthority = conn
+        .query_row(
+            "SELECT provider_name,provider_namespace,provider_uid,provider_generation,provider_spec_digest
+             FROM sessions WHERE session_id='s1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(provider_authority, (None, None, None, None, None));
 }

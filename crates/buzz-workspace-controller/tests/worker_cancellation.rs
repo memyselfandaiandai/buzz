@@ -30,12 +30,16 @@ fn active(
     let controller = Controller::new(ledger.clone(), adapter.clone());
     controller.provision_inert(&request(), None).unwrap();
     let spec = ExecutionSpec::new(program, args, "a".repeat(64)).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let capability = controller
-        .authorize_launch("worker-session", &spec, 60, 0)
+        .authorize_launch("worker-session", &spec, now + 60, now)
         .unwrap();
     controller.activate_launch(&capability).unwrap();
     controller
-        .redeem_launch(&capability, "worker-boot-1", &spec, 0)
+        .redeem_launch(&capability, "worker-boot-1", &spec, now)
         .unwrap()
 }
 
@@ -279,4 +283,22 @@ fn one_material_grant_cannot_spawn_twice() {
         .request_cancellation("worker-session", "test complete")
         .unwrap();
     assert_eq!(first.join().unwrap().unwrap(), WorkerExit::Cancelled);
+}
+
+#[test]
+fn spawn_failure_consumes_the_durable_execution_claim() {
+    let dir = tempdir().unwrap();
+    let ledger = Ledger::open(dir.path().join("ledger.db")).unwrap();
+    let adapter = FakeKubernetes::open(dir.path().join("provider.db")).unwrap();
+    let missing = dir.path().join("program-that-does-not-exist.exe");
+    let grant = active(&ledger, &adapter, missing.to_str().unwrap(), vec![]);
+
+    assert!(matches!(
+        run_cancellable_process(&ledger, &grant, Duration::from_millis(20)),
+        Err(ControllerError::Io(_))
+    ));
+    assert!(matches!(
+        run_cancellable_process(&ledger, &grant, Duration::from_millis(20)),
+        Err(ControllerError::ExecutionReplay)
+    ));
 }

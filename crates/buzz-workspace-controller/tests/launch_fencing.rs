@@ -3,6 +3,7 @@ use buzz_workspace_controller::{
     FakeKubernetes, Ledger, Lifecycle, ProviderWorkloadState, Scope, TerminalReceipt,
     WorkspaceAdapter,
 };
+use rusqlite::Connection;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
@@ -41,6 +42,61 @@ fn reopen(root: &std::path::Path) -> Controller<FakeKubernetes> {
     )
 }
 
+fn reopen_with_provider_scope(
+    root: &std::path::Path,
+    provider_db: &str,
+    provider_scope: &str,
+) -> Controller<FakeKubernetes> {
+    Controller::new(
+        Ledger::open(root.join("ledger.db")).unwrap(),
+        FakeKubernetes::open_with_scope(root.join(provider_db), provider_scope).unwrap(),
+    )
+}
+
+#[test]
+fn provider_scope_is_durable_and_scope_drift_fails_before_provider_mutation() {
+    let dir = tempdir().unwrap();
+    let first = reopen_with_provider_scope(
+        dir.path(),
+        "provider-a.db",
+        "kubernetes:context-a:namespace-a",
+    );
+    first.provision_inert(&request(), None).unwrap();
+    let identity = first.ledger().identity("session-1").unwrap();
+    assert_eq!(identity.provider_scope, "kubernetes:context-a:namespace-a");
+
+    let drifted = reopen_with_provider_scope(
+        dir.path(),
+        "provider-b.db",
+        "kubernetes:context-b:namespace-b",
+    );
+    assert!(matches!(
+        drifted.reconcile_session("session-1"),
+        Err(ControllerError::OwnershipMismatch)
+    ));
+    assert_eq!(drifted.adapter().workload_count().unwrap(), 0);
+}
+
+#[test]
+fn fake_provider_owner_drift_fails_closed() {
+    let dir = tempdir().unwrap();
+    let controller = reopen(dir.path());
+    controller.provision_inert(&request(), None).unwrap();
+    let conn = Connection::open(dir.path().join("provider.db")).unwrap();
+    conn.execute(
+        "UPDATE workloads SET owner_id='agent:mallory' WHERE session_id='session-1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let identity = controller.ledger().identity("session-1").unwrap();
+    assert!(matches!(
+        controller.adapter().observe_owned(&identity),
+        Err(ControllerError::OwnershipMismatch)
+    ));
+}
+
 fn inert(controller: &Controller<FakeKubernetes>) {
     controller.provision_inert(&request(), None).unwrap();
     assert_eq!(
@@ -51,6 +107,28 @@ fn inert(controller: &Controller<FakeKubernetes>) {
         controller.ledger().state("session-1").unwrap(),
         Lifecycle::Creating
     );
+}
+
+#[test]
+fn fake_provider_expanded_durable_fence_drift_fails_closed() {
+    let dir = tempdir().unwrap();
+    let controller = reopen(dir.path());
+    inert(&controller);
+    let identity = controller.session_identity("session-1").unwrap();
+    controller
+        .adapter()
+        .replace_provider_fence_for_test(
+            "session-1",
+            &identity.provider_name,
+            &identity.provider_namespace,
+            &"b".repeat(64),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        controller.adapter().observe_owned(&identity),
+        Err(ControllerError::OwnershipMismatch)
+    ));
 }
 
 #[test]
@@ -328,6 +406,37 @@ fn stale_tampered_or_replayed_capabilities_fail_closed() {
 }
 
 #[test]
+fn provider_location_and_spec_tampering_cannot_redeem_or_claim() {
+    for field in ["name", "namespace", "spec"] {
+        let dir = tempdir().unwrap();
+        let controller = reopen(dir.path());
+        inert(&controller);
+        let capability = controller
+            .authorize_launch("session-1", &execution_spec(), NOW + 60, NOW)
+            .unwrap();
+        controller.activate_launch(&capability).unwrap();
+        let mut tampered = capability;
+        match field {
+            "name" => tampered.provider_name = "foreign-job".into(),
+            "namespace" => tampered.provider_namespace = "foreign-namespace".into(),
+            "spec" => tampered.provider_spec_digest = "b".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            controller.redeem_launch(&tampered, "worker-boot-1", &execution_spec(), NOW),
+            Err(ControllerError::ActivationBindingMismatch)
+        ));
+        assert_eq!(
+            controller
+                .adapter()
+                .execution_claim_mutations("session-1")
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
 fn workload_uid_or_generation_replacement_blocks_activation_and_redemption() {
     let dir = tempdir().unwrap();
     let controller = reopen(dir.path());
@@ -454,6 +563,13 @@ fn provider_creation_returns_identity_that_the_ledger_persists() {
 
     let identity = controller.ledger().identity("session-1").unwrap();
     assert!(!identity.provider_uid.starts_with("fake-uid:"));
+    assert_eq!(identity.provider_name, "workspace-1");
+    assert_eq!(identity.provider_namespace, "fake-workspaces");
+    assert_eq!(identity.provider_spec_digest.len(), 64);
+    assert!(identity
+        .provider_spec_digest
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     assert!(identity.provider_generation > 0);
     let observed = controller.adapter().observe_owned(&identity).unwrap();
     assert_eq!(observed.provider_uid, identity.provider_uid);

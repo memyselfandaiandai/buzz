@@ -15,6 +15,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROLLER_SCHEMA_VERSION: u32 = 5;
 /// Maximum lifetime of a locally modeled activation capability.
 pub const MAX_ACTIVATION_TTL_SECONDS: i64 = 300;
 type TerminalSessionRow = (
@@ -75,6 +76,10 @@ pub enum ControllerError {
     InvalidRequest(&'static str),
     #[error("corrupt lifecycle value in ledger: {0}")]
     CorruptState(String),
+    #[error("unsupported controller schema version {found}; this binary supports {supported}")]
+    UnsupportedSchemaVersion { found: u32, supported: u32 },
+    #[error("unsupported session authority version {found}; this binary supports {supported}")]
+    UnsupportedAuthorityVersion { found: u32, supported: u32 },
     #[error("simulated controller crash at {0:?}")]
     SimulatedCrash(CrashPoint),
     #[error("provider adapter state is inconsistent: {0}")]
@@ -349,8 +354,20 @@ fn add_column_if_missing(
         ("sessions", "provider_uid", "TEXT") => {
             "ALTER TABLE sessions ADD COLUMN provider_uid TEXT"
         }
+        ("sessions", "provider_name", "TEXT") => {
+            "ALTER TABLE sessions ADD COLUMN provider_name TEXT"
+        }
+        ("sessions", "provider_namespace", "TEXT") => {
+            "ALTER TABLE sessions ADD COLUMN provider_namespace TEXT"
+        }
+        ("sessions", "provider_spec_digest", "TEXT") => {
+            "ALTER TABLE sessions ADD COLUMN provider_spec_digest TEXT"
+        }
         ("sessions", "provider_generation", "INTEGER") => {
             "ALTER TABLE sessions ADD COLUMN provider_generation INTEGER"
+        }
+        ("sessions", "provider_scope", "TEXT NOT NULL DEFAULT 'fake-kubernetes'") => {
+            "ALTER TABLE sessions ADD COLUMN provider_scope TEXT NOT NULL DEFAULT 'fake-kubernetes'"
         }
         ("sessions", "authority_version", "INTEGER NOT NULL DEFAULT 0") => {
             "ALTER TABLE sessions ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0"
@@ -411,7 +428,28 @@ impl Ledger {
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 version INTEGER NOT NULL CHECK(version > 0)
             );
-            INSERT INTO controller_schema(singleton, version) VALUES (1, 4)
+            INSERT INTO controller_schema(singleton, version) VALUES (1, 5)
+                ON CONFLICT(singleton) DO NOTHING;
+            "#,
+        )?;
+        let found: u32 = conn.query_row(
+            "SELECT version FROM controller_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if found > CONTROLLER_SCHEMA_VERSION {
+            return Err(ControllerError::UnsupportedSchemaVersion {
+                found,
+                supported: CONTROLLER_SCHEMA_VERSION,
+            });
+        }
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS controller_schema (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version INTEGER NOT NULL CHECK(version > 0)
+            );
+            INSERT INTO controller_schema(singleton, version) VALUES (1, 5)
                 ON CONFLICT(singleton) DO NOTHING;
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
@@ -419,9 +457,13 @@ impl Ledger {
                 capability_digest TEXT NOT NULL UNIQUE,
                 owner_id TEXT NOT NULL,
                 workspace_id TEXT NOT NULL UNIQUE,
+                provider_name TEXT,
+                provider_namespace TEXT,
                 provider_uid TEXT UNIQUE,
                 provider_generation INTEGER,
-                authority_version INTEGER NOT NULL DEFAULT 4 CHECK(authority_version >= 0),
+                provider_spec_digest TEXT,
+                provider_scope TEXT NOT NULL DEFAULT 'fake-kubernetes',
+                authority_version INTEGER NOT NULL DEFAULT 5 CHECK(authority_version >= 0),
                 scope_kind TEXT NOT NULL CHECK(scope_kind IN ('agent','tenant','issuer')),
                 scope_id TEXT NOT NULL,
                 signed_max_concurrency INTEGER NOT NULL CHECK(signed_max_concurrency > 0),
@@ -500,8 +542,17 @@ impl Ledger {
                 [],
             )?;
         }
+        add_column_if_missing(&conn, "sessions", "provider_name", "TEXT")?;
+        add_column_if_missing(&conn, "sessions", "provider_namespace", "TEXT")?;
         add_column_if_missing(&conn, "sessions", "provider_uid", "TEXT")?;
         add_column_if_missing(&conn, "sessions", "provider_generation", "INTEGER")?;
+        add_column_if_missing(&conn, "sessions", "provider_spec_digest", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "sessions",
+            "provider_scope",
+            "TEXT NOT NULL DEFAULT 'fake-kubernetes'",
+        )?;
         add_column_if_missing(
             &conn,
             "sessions",
@@ -547,25 +598,26 @@ impl Ledger {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
              INSERT INTO transitions(session_id,from_state,to_state,event)
-             SELECT session_id,state,'recovery_error','schema-v4-legacy-authority-quarantine'
+             SELECT session_id,state,'recovery_error','schema-v5-legacy-authority-quarantine'
              FROM sessions
-             WHERE authority_version < 4
-               AND (SELECT version FROM controller_schema WHERE singleton=1) < 4
+             WHERE authority_version < 5
+               AND (SELECT version FROM controller_schema WHERE singleton=1) < 5
                AND state NOT IN ('cleaned','rejected','recovery_error');
              UPDATE sessions
              SET state='recovery_error',cancellation_requested=1,
                  last_error='legacy-authority-quarantined',version=version+1,
                  updated_at=unixepoch()
-             WHERE authority_version < 4
-               AND (SELECT version FROM controller_schema WHERE singleton=1) < 4
+             WHERE authority_version < 5
+               AND (SELECT version FROM controller_schema WHERE singleton=1) < 5
                AND state NOT IN ('cleaned','rejected');
              UPDATE launch_authorizations
              SET status='revoked',revoked_at=COALESCE(revoked_at,unixepoch())
              WHERE status='issued'
                AND session_id IN (
-                   SELECT session_id FROM sessions WHERE authority_version < 4
+                   SELECT session_id FROM sessions WHERE authority_version < 5
                );
              UPDATE controller_schema SET version=4 WHERE singleton=1 AND version < 4;
+             UPDATE controller_schema SET version=5 WHERE singleton=1 AND version < 5;
              COMMIT;",
         )?;
         Ok(())
@@ -598,10 +650,19 @@ impl Ledger {
     }
 
     pub fn prepare(&self, request: &AdmissionRequest) -> Result<AdmissionOutcome> {
+        self.prepare_for_provider(request, "fake-kubernetes")
+    }
+
+    pub fn prepare_for_provider(
+        &self,
+        request: &AdmissionRequest,
+        provider_scope: &str,
+    ) -> Result<AdmissionOutcome> {
         request.validate()?;
+        validate_provider_scope(provider_scope)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = prepare_in_tx(&tx, request);
+        let result = prepare_in_tx(&tx, request, provider_scope);
         if result.is_ok() {
             tx.commit()?;
         }
@@ -622,10 +683,19 @@ impl Ledger {
     }
 
     pub fn prepare_and_admit(&self, request: &AdmissionRequest) -> Result<AdmissionOutcome> {
+        self.prepare_and_admit_for_provider(request, "fake-kubernetes")
+    }
+
+    pub fn prepare_and_admit_for_provider(
+        &self,
+        request: &AdmissionRequest,
+        provider_scope: &str,
+    ) -> Result<AdmissionOutcome> {
         request.validate()?;
+        validate_provider_scope(provider_scope)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = match prepare_in_tx(&tx, request) {
+        let result = match prepare_in_tx(&tx, request, provider_scope) {
             Ok(AdmissionOutcome::Existing(Lifecycle::Prepared)) => {
                 admit_in_tx(&tx, &request.session_id)
             }
@@ -678,6 +748,7 @@ impl Ledger {
         let normalized_path = artifact.normalized_path()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, session_id)?;
         let (state, used, limit): (String, i64, i64) = tx
             .query_row(
                 "SELECT state,artifact_bytes,artifact_limit_bytes FROM sessions WHERE session_id=?1",
@@ -747,6 +818,7 @@ impl Ledger {
         let transfer_digest_set = serde_json::to_string(&claimed_transfers)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, &receipt.session_id)?;
         let (
             state,
             artifact_bytes,
@@ -857,6 +929,7 @@ impl Ledger {
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, session_id)?;
         let (owner, workspace, state, existing_claim): (String, String, String, Option<String>) = tx
             .query_row(
                 "SELECT owner_id,workspace_id,state,cleanup_claim FROM sessions WHERE session_id=?1",
@@ -900,6 +973,7 @@ impl Ledger {
     pub fn mark_cleaned(&self, session_id: &str, claim: &str) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, session_id)?;
         let (state, existing_claim): (String, Option<String>) = tx
             .query_row(
                 "SELECT state,cleanup_claim FROM sessions WHERE session_id=?1",
@@ -940,6 +1014,7 @@ impl Ledger {
     pub fn request_cancellation(&self, session_id: &str, reason: &str) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, session_id)?;
         let current = state_from_transaction(&tx, session_id)?;
         if current == Lifecycle::Cancelled {
             revoke_issued_in_tx(&tx, session_id)?;
@@ -1017,6 +1092,7 @@ impl Ledger {
     pub fn mark_recovery_error(&self, session_id: &str, reason: &str) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, session_id)?;
         let current = state_from_transaction(&tx, session_id)?;
         if matches!(
             current,
@@ -1051,24 +1127,39 @@ impl Ledger {
     }
 }
 
-fn prepare_in_tx(tx: &Transaction<'_>, request: &AdmissionRequest) -> Result<AdmissionOutcome> {
-    if let Some(outcome) = existing_or_conflict(tx, request)? {
+fn validate_provider_scope(provider_scope: &str) -> Result<()> {
+    if provider_scope.is_empty()
+        || provider_scope.trim() != provider_scope
+        || provider_scope.len() > 255
+    {
+        return Err(ControllerError::InvalidRequest("invalid provider scope"));
+    }
+    Ok(())
+}
+
+fn prepare_in_tx(
+    tx: &Transaction<'_>,
+    request: &AdmissionRequest,
+    provider_scope: &str,
+) -> Result<AdmissionOutcome> {
+    if let Some(outcome) = existing_or_conflict(tx, request, provider_scope)? {
         return Ok(outcome);
     }
     let (scope_kind, scope_id) = request.scope.parts();
     let artifact_limit = sqlite_i64(request.artifact_limit_bytes)?;
     tx.execute(
         "INSERT INTO sessions (
-            session_id,jti,capability_digest,owner_id,workspace_id,scope_kind,scope_id,
+            session_id,jti,capability_digest,owner_id,workspace_id,provider_scope,scope_kind,scope_id,
             signed_max_concurrency,deployment_max_concurrency,artifact_limit_bytes,expires_at,
             state,authority_version
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'prepared',4)",
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'prepared',5)",
         params![
             request.session_id,
             request.jti,
             request.capability_digest,
             request.owner_id,
             request.workspace_id,
+            provider_scope,
             scope_kind,
             scope_id,
             request.signed_max_concurrency,
@@ -1128,6 +1219,7 @@ struct SessionRow {
 }
 
 fn session_row(tx: &Transaction<'_>, session_id: &str) -> Result<SessionRow> {
+    ensure_supported_authority_tx(tx, session_id)?;
     let row: Option<(String, String, String, u32, u32)> = tx
         .query_row(
             "SELECT state,scope_kind,scope_id,signed_max_concurrency,deployment_max_concurrency FROM sessions WHERE session_id=?1",
@@ -1154,27 +1246,33 @@ type ExistingSession = (
     String,
     String,
     String,
+    String,
     u32,
     u32,
     i64,
     i64,
+    u32,
 );
 
 fn existing_or_conflict(
     tx: &Transaction<'_>,
     request: &AdmissionRequest,
+    provider_scope: &str,
 ) -> Result<Option<AdmissionOutcome>> {
     let existing: Option<ExistingSession> = tx
         .query_row(
-            "SELECT state,jti,capability_digest,owner_id,workspace_id,scope_kind,scope_id,
-                    signed_max_concurrency,deployment_max_concurrency,artifact_limit_bytes,expires_at
+            "SELECT state,jti,capability_digest,owner_id,workspace_id,provider_scope,scope_kind,scope_id,
+                    signed_max_concurrency,deployment_max_concurrency,artifact_limit_bytes,expires_at,
+                    authority_version
              FROM sessions WHERE session_id=?1",
             [&request.session_id],
             |row| {
                 Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
                     row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
-                ))
+ row.get(11)?,
+ row.get(12)?,
+ ))
             },
         )
         .optional()?;
@@ -1184,19 +1282,23 @@ fn existing_or_conflict(
         digest,
         owner,
         workspace,
+        persisted_provider_scope,
         kind,
         scope_id,
         signed,
         deployment,
         artifact_limit,
         expires,
+        authority_version,
     )) = existing
     {
+        ensure_supported_authority_version(authority_version)?;
         let (expected_kind, expected_scope) = request.scope.parts();
         if jti == request.jti
             && digest == request.capability_digest
             && owner == request.owner_id
             && workspace == request.workspace_id
+            && persisted_provider_scope == provider_scope
             && kind == expected_kind
             && scope_id == expected_scope
             && signed == request.signed_max_concurrency
@@ -1246,6 +1348,28 @@ fn existing_or_conflict(
     Ok(None)
 }
 
+fn ensure_supported_authority_version(found: u32) -> Result<()> {
+    if found != CONTROLLER_SCHEMA_VERSION {
+        return Err(ControllerError::UnsupportedAuthorityVersion {
+            found,
+            supported: CONTROLLER_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_supported_authority_tx(tx: &Transaction<'_>, session_id: &str) -> Result<()> {
+    let found = tx
+        .query_row(
+            "SELECT authority_version FROM sessions WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ControllerError::SessionNotFound)?;
+    ensure_supported_authority_version(found)
+}
+
 fn transition_in_tx(
     tx: &Transaction<'_>,
     session_id: &str,
@@ -1253,6 +1377,7 @@ fn transition_in_tx(
     event: &str,
     reserve: Option<bool>,
 ) -> Result<()> {
+    ensure_supported_authority_tx(tx, session_id)?;
     let current = state_from_transaction(tx, session_id)?;
     if current == next {
         return Ok(());
@@ -1317,6 +1442,7 @@ fn state_from_connection(conn: &Connection, session_id: &str) -> Result<Lifecycl
 }
 
 fn state_from_transaction(tx: &Transaction<'_>, session_id: &str) -> Result<Lifecycle> {
+    ensure_supported_authority_tx(tx, session_id)?;
     let state: Option<String> = tx
         .query_row(
             "SELECT state FROM sessions WHERE session_id=?1",
@@ -1356,7 +1482,21 @@ fn map_unique_constraint(error: rusqlite::Error) -> ControllerError {
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn authority_digest(domain: &str, parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain.as_bytes());
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn sqlite_i64(value: u64) -> Result<i64> {
@@ -1435,6 +1575,30 @@ impl ExecutionSpec {
     }
 }
 
+type SessionIdentityRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    u32,
+);
+
+type ProviderBindingRow = (
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
     pub session_id: String,
@@ -1444,8 +1608,11 @@ pub struct SessionIdentity {
     pub provider_scope: String,
     pub create_operation_key: String,
     pub delete_operation_key: String,
+    pub provider_name: String,
+    pub provider_namespace: String,
     pub provider_uid: String,
     pub provider_generation: i64,
+    pub provider_spec_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1454,8 +1621,11 @@ pub struct ActivationCapability {
     pub token: String,
     pub session_id: String,
     pub workspace_id: String,
+    pub provider_name: String,
+    pub provider_namespace: String,
     pub provider_uid: String,
     pub provider_generation: i64,
+    pub provider_spec_digest: String,
     pub task_input_digest: String,
     pub execution_spec_digest: String,
     pub expires_at: i64,
@@ -1482,8 +1652,11 @@ impl ActivationCapability {
     fn binding_matches(&self, identity: &SessionIdentity) -> bool {
         self.session_id == identity.session_id
             && self.workspace_id == identity.workspace_id
+            && self.provider_name == identity.provider_name
+            && self.provider_namespace == identity.provider_namespace
             && self.provider_uid == identity.provider_uid
             && self.provider_generation == identity.provider_generation
+            && self.provider_spec_digest == identity.provider_spec_digest
     }
 
     fn grant(
@@ -1512,67 +1685,128 @@ impl ActivationCapability {
 impl Ledger {
     pub fn identity(&self, session_id: &str) -> Result<SessionIdentity> {
         let conn = self.connection()?;
-        conn.query_row(
-            "SELECT session_id,owner_id,workspace_id,capability_digest,
-                    provider_uid,provider_generation
-             FROM sessions WHERE session_id=?1",
-            [session_id],
-            |row| {
-                let session_id: String = row.get(0)?;
-                let capability_digest: String = row.get(3)?;
-                Ok(SessionIdentity {
-                    owner_id: row.get(1)?,
-                    workspace_id: row.get(2)?,
-                    provider_scope: "fake-kubernetes".into(),
-                    create_operation_key: format!("create:{capability_digest}:{session_id}"),
-                    delete_operation_key: format!("delete:{capability_digest}:{session_id}"),
-                    provider_uid: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    provider_generation: row.get::<_, Option<i64>>(5)?.unwrap_or_default(),
-                    session_id,
-                    capability_digest,
-                })
-            },
-        )
-        .optional()?
-        .ok_or(ControllerError::SessionNotFound)
+        let row: SessionIdentityRow = conn
+            .query_row(
+                "SELECT session_id,owner_id,workspace_id,capability_digest,provider_scope,
+                        provider_name,provider_namespace,provider_uid,provider_generation,
+                        provider_spec_digest,authority_version
+                 FROM sessions WHERE session_id=?1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(ControllerError::SessionNotFound)?;
+        if row.10 != CONTROLLER_SCHEMA_VERSION {
+            return Err(ControllerError::UnsupportedAuthorityVersion {
+                found: row.10,
+                supported: CONTROLLER_SCHEMA_VERSION,
+            });
+        }
+        let operation_parts = [
+            row.4.as_bytes(),
+            row.3.as_bytes(),
+            row.0.as_bytes(),
+            row.2.as_bytes(),
+            row.1.as_bytes(),
+        ];
+        let create_operation_key =
+            authority_digest("buzz/provider-create-operation/v1", &operation_parts);
+        let delete_operation_key =
+            authority_digest("buzz/provider-delete-operation/v1", &operation_parts);
+        Ok(SessionIdentity {
+            session_id: row.0,
+            owner_id: row.1,
+            workspace_id: row.2,
+            capability_digest: row.3,
+            create_operation_key,
+            delete_operation_key,
+            provider_scope: row.4,
+            provider_name: row.5.unwrap_or_default(),
+            provider_namespace: row.6.unwrap_or_default(),
+            provider_uid: row.7.unwrap_or_default(),
+            provider_generation: row.8.unwrap_or_default(),
+            provider_spec_digest: row.9.unwrap_or_default(),
+        })
     }
 
     fn bind_provider_identity(&self, session_id: &str, binding: &ProviderBinding) -> Result<()> {
-        if binding.provider_uid.is_empty() || binding.provider_generation <= 0 {
+        if binding.provider_name.is_empty()
+            || binding.provider_namespace.is_empty()
+            || binding.provider_uid.is_empty()
+            || binding.provider_generation <= 0
+            || !is_sha256(&binding.provider_spec_digest)
+        {
             return Err(ControllerError::AdapterState("invalid provider binding"));
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: (String, i64, Option<String>, Option<i64>) = tx
+        ensure_supported_authority_tx(&tx, session_id)?;
+        let row: ProviderBindingRow = tx
             .query_row(
-                "SELECT state,cancellation_requested,provider_uid,provider_generation
+                "SELECT state,cancellation_requested,provider_name,provider_namespace,
+                        provider_uid,provider_generation,provider_spec_digest
                  FROM sessions WHERE session_id=?1",
                 [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(ControllerError::SessionNotFound)?;
         if row.1 != 0 || Lifecycle::from_str(&row.0)? != Lifecycle::Creating {
             return Err(ControllerError::ExecutionAborted);
         }
-        match (row.2, row.3) {
-            (Some(uid), Some(generation))
-                if uid == binding.provider_uid && generation == binding.provider_generation =>
+        match (&row.2, &row.3, &row.4, row.5, &row.6) {
+            (Some(name), Some(namespace), Some(uid), Some(generation), Some(spec_digest))
+                if name == &binding.provider_name
+                    && namespace == &binding.provider_namespace
+                    && uid == &binding.provider_uid
+                    && generation == binding.provider_generation
+                    && spec_digest == &binding.provider_spec_digest =>
             {
                 tx.commit()?;
                 return Ok(());
             }
-            (None, None) => {}
+            (None, None, None, None, None) => {}
             _ => return Err(ControllerError::OwnershipMismatch),
         }
         let updated = tx.execute(
-            "UPDATE sessions SET provider_uid=?2,provider_generation=?3,version=version+1,
-                                 updated_at=unixepoch()
-             WHERE session_id=?1 AND provider_uid IS NULL AND provider_generation IS NULL",
+            "UPDATE sessions
+             SET provider_name=?2,provider_namespace=?3,provider_uid=?4,
+                 provider_generation=?5,provider_spec_digest=?6,
+                 version=version+1,updated_at=unixepoch()
+             WHERE session_id=?1 AND provider_name IS NULL AND provider_namespace IS NULL
+               AND provider_uid IS NULL AND provider_generation IS NULL
+               AND provider_spec_digest IS NULL",
             params![
                 session_id,
+                binding.provider_name,
+                binding.provider_namespace,
                 binding.provider_uid,
-                binding.provider_generation
+                binding.provider_generation,
+                binding.provider_spec_digest
             ],
         )?;
         if updated != 1 {
@@ -1605,6 +1839,15 @@ impl Ledger {
     }
 
     fn validate_launch(&self, capability: &ActivationCapability) -> Result<()> {
+        let identity = self.identity(&capability.session_id)?;
+        if capability.provider_name != identity.provider_name
+            || capability.provider_namespace != identity.provider_namespace
+            || capability.provider_uid != identity.provider_uid
+            || capability.provider_generation != identity.provider_generation
+            || capability.provider_spec_digest != identity.provider_spec_digest
+        {
+            return Err(ControllerError::ActivationBindingMismatch);
+        }
         let conn = self.connection()?;
         let row: Option<LaunchValidationRow> = conn
             .query_row(
@@ -1673,7 +1916,8 @@ impl Ledger {
         let conn = self.connection()?;
         conn.query_row(
             "SELECT a.activation_token,a.workspace_id,a.provider_uid,a.provider_generation,
-                    a.task_input_digest,a.execution_spec_digest,a.expires_at,a.launch_epoch
+                    a.task_input_digest,a.execution_spec_digest,a.expires_at,a.launch_epoch,
+                    s.provider_name,s.provider_namespace,s.provider_spec_digest
              FROM launch_authorizations a JOIN sessions s ON s.session_id=a.session_id
              WHERE a.session_id=?1 AND a.launch_epoch=s.launch_epoch AND a.status='issued'",
             [session_id],
@@ -1688,6 +1932,9 @@ impl Ledger {
                     execution_spec_digest: row.get(5)?,
                     expires_at: row.get(6)?,
                     launch_epoch: row.get(7)?,
+                    provider_name: row.get(8)?,
+                    provider_namespace: row.get(9)?,
+                    provider_spec_digest: row.get(10)?,
                 })
             },
         )
@@ -1711,6 +1958,7 @@ impl Ledger {
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, session_id)?;
         let (state, cancelled, session_expires, launch_epoch, workspace): (
             String,
             i64,
@@ -1819,6 +2067,9 @@ impl Ledger {
                         workspace_id: bound_workspace,
                         provider_uid: uid,
                         provider_generation: generation,
+                        provider_name: identity.provider_name.clone(),
+                        provider_namespace: identity.provider_namespace.clone(),
+                        provider_spec_digest: identity.provider_spec_digest.clone(),
                         task_input_digest: digest,
                         execution_spec_digest: spec_digest,
                         expires_at: expiry,
@@ -1836,17 +2087,32 @@ impl Ledger {
         let next_epoch = launch_epoch
             .checked_add(1)
             .ok_or(ControllerError::AdapterState("launch epoch exhausted"))?;
-        let mut hasher = Sha256::new();
-        hasher.update(uuid::Uuid::new_v4().as_bytes());
-        hasher.update(session_id.as_bytes());
-        hasher.update(identity.workspace_id.as_bytes());
-        hasher.update(identity.provider_uid.as_bytes());
-        hasher.update(identity.provider_generation.to_le_bytes());
-        hasher.update(task_input_digest.as_bytes());
-        hasher.update(execution_spec_digest.as_bytes());
-        hasher.update(expires_at.to_le_bytes());
-        hasher.update(next_epoch.to_le_bytes());
-        let token = hex::encode(hasher.finalize());
+        let nonce = uuid::Uuid::new_v4();
+        let provider_generation = identity.provider_generation.to_be_bytes();
+        let expiry = expires_at.to_be_bytes();
+        let epoch = next_epoch.to_be_bytes();
+        let token = authority_digest(
+            "buzz/activation-capability/v1",
+            &[
+                nonce.as_bytes(),
+                session_id.as_bytes(),
+                identity.workspace_id.as_bytes(),
+                identity.owner_id.as_bytes(),
+                identity.capability_digest.as_bytes(),
+                identity.provider_scope.as_bytes(),
+                identity.create_operation_key.as_bytes(),
+                identity.delete_operation_key.as_bytes(),
+                identity.provider_name.as_bytes(),
+                identity.provider_namespace.as_bytes(),
+                identity.provider_uid.as_bytes(),
+                &provider_generation,
+                identity.provider_spec_digest.as_bytes(),
+                task_input_digest.as_bytes(),
+                execution_spec_digest.as_bytes(),
+                &expiry,
+                &epoch,
+            ],
+        );
         tx.execute(
             "UPDATE sessions SET launch_epoch=?2,version=version+1,updated_at=unixepoch()
              WHERE session_id=?1",
@@ -1879,6 +2145,9 @@ impl Ledger {
             workspace_id: identity.workspace_id.clone(),
             provider_uid: identity.provider_uid.clone(),
             provider_generation: identity.provider_generation,
+            provider_name: identity.provider_name.clone(),
+            provider_namespace: identity.provider_namespace.clone(),
+            provider_spec_digest: identity.provider_spec_digest.clone(),
             task_input_digest: task_input_digest.to_owned(),
             execution_spec_digest,
             expires_at,
@@ -1912,6 +2181,7 @@ impl Ledger {
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, &capability.session_id)?;
         let (state, cancelled, current_epoch, session_expires): (String, i64, i64, i64) = tx
             .query_row(
                 "SELECT state,cancellation_requested,launch_epoch,expires_at
@@ -2074,6 +2344,7 @@ impl Ledger {
     {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&tx, &grant.session_id)?;
         let row = tx
             .query_row(
                 "SELECT s.state,s.cancellation_requested,s.workspace_id,s.launch_epoch,
@@ -2127,6 +2398,9 @@ impl Ledger {
         if cancelled != 0 {
             return Err(ControllerError::ExecutionAborted);
         }
+        if expiry <= unix_time_seconds()? {
+            return Err(ControllerError::ActivationExpired);
+        }
         let stored_spec: ExecutionSpec = serde_json::from_str(&spec_json)?;
         if Lifecycle::from_str(&state)? != Lifecycle::Active
             || status != "redeemed"
@@ -2163,18 +2437,48 @@ impl Ledger {
         if updated != 1 {
             return Err(ControllerError::ExecutionReplay);
         }
+        tx.commit()?;
         before_spawn();
+        let mut start_conn = self.connection()?;
+        let start_tx = start_conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_supported_authority_tx(&start_tx, &grant.session_id)?;
+        let (start_state, start_cancelled, start_expiry, start_execution_status): (
+            String,
+            i64,
+            i64,
+            String,
+        ) = start_tx.query_row(
+            "SELECT s.state,s.cancellation_requested,a.expires_at,a.execution_status
+                 FROM sessions s JOIN launch_authorizations a
+                   ON a.session_id=s.session_id AND a.launch_epoch=s.launch_epoch
+                 WHERE s.session_id=?1 AND a.material_receipt_token=?2",
+            params![grant.session_id, grant.material_receipt_token],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if start_cancelled != 0 || Lifecycle::from_str(&start_state)? != Lifecycle::Active {
+            return Err(ControllerError::ExecutionAborted);
+        }
+        if start_expiry != grant.expires_at {
+            return Err(ControllerError::ActivationBindingMismatch);
+        }
+        if start_execution_status != "claimed" {
+            return Err(ControllerError::ActivationBindingMismatch);
+        }
         let mut command = std::process::Command::new(&stored_spec.program);
         command
             .args(&stored_spec.args)
             .env_clear()
             .envs(stored_spec.environment.iter().cloned());
         configure_process_group(&mut command);
-        let mut child = command.spawn()?;
-        if let Err(error) = tx.commit() {
-            terminate_process_tree(&mut child)?;
-            return Err(ControllerError::Sqlite(error));
+        // This is the start linearization point: cancellation writers remain blocked by
+        // the immediate transaction, and expiry is sampled immediately before the OS
+        // spawn syscall. The transaction contains no writes and is intentionally dropped
+        // after spawn, so no fallible database commit occurs after process creation.
+        if start_expiry <= unix_time_seconds()? {
+            return Err(ControllerError::ActivationExpired);
         }
+        let child = command.spawn()?;
+        drop(start_tx);
         Ok(child)
     }
 }
@@ -2211,12 +2515,17 @@ pub struct ProviderObservation {
     pub provider_generation: i64,
     pub launch_epoch: i64,
     pub task_input_digest: Option<String>,
+    pub activation_token_digest: Option<String>,
+    pub execution_spec_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderBinding {
+    pub provider_name: String,
+    pub provider_namespace: String,
     pub provider_uid: String,
     pub provider_generation: i64,
+    pub provider_spec_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2228,6 +2537,8 @@ pub struct ProviderExecutionClaim {
 
 /// Provider-neutral operations required by durable launch and cleanup recovery.
 pub trait WorkspaceAdapter: Clone {
+    /// Stable authority domain for this provider context and namespace.
+    fn provider_scope(&self) -> &str;
     /// Creates the exact workload in an inert, non-executing state and returns provider identity.
     fn create_owned(&self, identity: &SessionIdentity) -> Result<ProviderBinding>;
     /// Projects one exact authorization using ownership/generation preconditions.
@@ -2259,17 +2570,22 @@ pub trait WorkspaceAdapter: Clone {
 #[derive(Debug, Clone)]
 pub struct FakeKubernetes {
     path: PathBuf,
+    provider_scope: String,
 }
 
 #[derive(Debug)]
 struct FakeProviderRecord {
     workspace_id: String,
+    owner_id: String,
     capability_digest: String,
     provider_scope: String,
     create_operation_key: String,
     delete_operation_key: String,
     provider_uid: String,
     provider_generation: i64,
+    provider_name: String,
+    provider_namespace: String,
+    provider_spec_digest: String,
     present: i64,
     launch_state: String,
     activation_epoch: i64,
@@ -2283,30 +2599,38 @@ impl FakeProviderRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             workspace_id: row.get(0)?,
-            capability_digest: row.get(1)?,
-            provider_scope: row.get(2)?,
-            create_operation_key: row.get(3)?,
-            delete_operation_key: row.get(4)?,
-            provider_uid: row.get(5)?,
-            provider_generation: row.get(6)?,
-            present: row.get(7)?,
-            launch_state: row.get(8)?,
-            activation_epoch: row.get(9)?,
-            activation_token: row.get(10)?,
-            activation_task_digest: row.get(11)?,
-            activation_spec_digest: row.get(12)?,
-            lose_activation_response: row.get(13)?,
+            owner_id: row.get(1)?,
+            capability_digest: row.get(2)?,
+            provider_scope: row.get(3)?,
+            create_operation_key: row.get(4)?,
+            delete_operation_key: row.get(5)?,
+            provider_uid: row.get(6)?,
+            provider_generation: row.get(7)?,
+            provider_name: row.get(8)?,
+            provider_namespace: row.get(9)?,
+            provider_spec_digest: row.get(10)?,
+            present: row.get(11)?,
+            launch_state: row.get(12)?,
+            activation_epoch: row.get(13)?,
+            activation_token: row.get(14)?,
+            activation_task_digest: row.get(15)?,
+            activation_spec_digest: row.get(16)?,
+            lose_activation_response: row.get(17)?,
         })
     }
 
     fn matches(&self, identity: &SessionIdentity) -> bool {
         self.ownership_matches(identity)
+            && self.provider_name == identity.provider_name
+            && self.provider_namespace == identity.provider_namespace
             && self.provider_uid == identity.provider_uid
             && self.provider_generation == identity.provider_generation
+            && self.provider_spec_digest == identity.provider_spec_digest
     }
 
     fn ownership_matches(&self, identity: &SessionIdentity) -> bool {
         self.workspace_id == identity.workspace_id
+            && self.owner_id == identity.owner_id
             && self.capability_digest == identity.capability_digest
             && self.provider_scope == identity.provider_scope
             && self.create_operation_key == identity.create_operation_key
@@ -2316,24 +2640,40 @@ impl FakeProviderRecord {
 
 impl FakeKubernetes {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_scope(path, "fake-kubernetes")
+    }
+
+    pub fn open_with_scope(
+        path: impl AsRef<Path>,
+        provider_scope: impl Into<String>,
+    ) -> Result<Self> {
+        let provider_scope = provider_scope.into();
+        validate_provider_scope(&provider_scope)?;
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|_| ControllerError::InvalidRequest("cannot create provider directory"))?;
         }
-        let adapter = Self { path };
+        let adapter = Self {
+            path,
+            provider_scope,
+        };
         let conn = adapter.connection()?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS workloads (
                 session_id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL DEFAULT '',
                 capability_digest TEXT NOT NULL,
                 provider_scope TEXT NOT NULL,
                 create_operation_key TEXT NOT NULL UNIQUE,
                 delete_operation_key TEXT NOT NULL UNIQUE,
                 provider_uid TEXT NOT NULL UNIQUE,
                 provider_generation INTEGER NOT NULL,
+                provider_name TEXT NOT NULL DEFAULT '',
+                provider_namespace TEXT NOT NULL DEFAULT '',
+                provider_spec_digest TEXT NOT NULL DEFAULT '',
                 present INTEGER NOT NULL CHECK(present IN (0,1)),
                 launch_state TEXT NOT NULL DEFAULT 'activated'
                     CHECK(launch_state IN ('inert','activated','deleted')),
@@ -2354,6 +2694,11 @@ impl FakeKubernetes {
             "#,
         )?;
         for (column, definition) in [
+            ("owner_id", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_scope", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_name", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_namespace", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_spec_digest", "TEXT NOT NULL DEFAULT ''"),
             ("launch_state", "TEXT NOT NULL DEFAULT 'activated'"),
             ("activation_epoch", "INTEGER NOT NULL DEFAULT 0"),
             ("activation_token", "TEXT"),
@@ -2480,6 +2825,31 @@ impl FakeKubernetes {
         Ok(())
     }
 
+    pub fn replace_provider_fence_for_test(
+        &self,
+        session_id: &str,
+        provider_name: &str,
+        provider_namespace: &str,
+        provider_spec_digest: &str,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            "UPDATE workloads
+             SET provider_name=?2,provider_namespace=?3,provider_spec_digest=?4
+             WHERE session_id=?1 AND present=1",
+            params![
+                session_id,
+                provider_name,
+                provider_namespace,
+                provider_spec_digest
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ControllerError::SessionNotFound);
+        }
+        Ok(())
+    }
+
     pub fn replace_uid_for_test(
         &self,
         session_id: &str,
@@ -2498,34 +2868,63 @@ impl FakeKubernetes {
     }
 }
 
+fn fake_provider_binding(
+    identity: &SessionIdentity,
+    uid: String,
+    generation: i64,
+) -> ProviderBinding {
+    ProviderBinding {
+        provider_name: identity.workspace_id.clone(),
+        provider_namespace: "fake-workspaces".to_owned(),
+        provider_uid: uid,
+        provider_generation: generation,
+        provider_spec_digest: authority_digest(
+            "buzz/fake-provider-spec/v1",
+            &[
+                identity.workspace_id.as_bytes(),
+                identity.capability_digest.as_bytes(),
+            ],
+        ),
+    }
+}
+
 impl WorkspaceAdapter for FakeKubernetes {
+    fn provider_scope(&self) -> &str {
+        &self.provider_scope
+    }
+
     fn create_owned(&self, identity: &SessionIdentity) -> Result<ProviderBinding> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<FakeProviderRecord> = tx
             .query_row(
-                "SELECT workspace_id,capability_digest,provider_scope,create_operation_key,
-                        delete_operation_key,provider_uid,provider_generation,present,
-                        launch_state,activation_epoch,activation_token,activation_task_digest,
-                        activation_spec_digest,lose_activation_response
+                "SELECT workspace_id,owner_id,capability_digest,provider_scope,create_operation_key,
+                        delete_operation_key,provider_uid,provider_generation,provider_name,
+                        provider_namespace,provider_spec_digest,present,launch_state,activation_epoch,
+                        activation_token,activation_task_digest,activation_spec_digest,
+                        lose_activation_response
                  FROM workloads WHERE session_id=?1",
                 [&identity.session_id],
                 FakeProviderRecord::from_row,
             )
             .optional()?;
         if let Some(existing) = existing {
+            let binding = fake_provider_binding(
+                identity,
+                existing.provider_uid.clone(),
+                existing.provider_generation,
+            );
+            let durable_binding_matches = identity.provider_name == binding.provider_name
+                && identity.provider_namespace == binding.provider_namespace
+                && identity.provider_uid == binding.provider_uid
+                && identity.provider_generation == binding.provider_generation
+                && identity.provider_spec_digest == binding.provider_spec_digest;
             if !existing.ownership_matches(identity)
-                || (!identity.provider_uid.is_empty()
-                    && (existing.provider_uid != identity.provider_uid
-                        || existing.provider_generation != identity.provider_generation))
+                || (!identity.provider_uid.is_empty() && !durable_binding_matches)
             {
                 return Err(ControllerError::OwnershipMismatch);
             }
             if existing.present == 1 {
-                let binding = ProviderBinding {
-                    provider_uid: existing.provider_uid,
-                    provider_generation: existing.provider_generation,
-                };
                 tx.commit()?;
                 return Ok(binding);
             }
@@ -2544,29 +2943,36 @@ impl WorkspaceAdapter for FakeKubernetes {
         {
             return Err(ControllerError::OwnershipMismatch);
         }
-        if !identity.provider_uid.is_empty() || identity.provider_generation != 0 {
+        if !identity.provider_name.is_empty()
+            || !identity.provider_namespace.is_empty()
+            || !identity.provider_uid.is_empty()
+            || identity.provider_generation != 0
+            || !identity.provider_spec_digest.is_empty()
+        {
             return Err(ControllerError::AdapterState(
                 "bound provider workload is authoritatively absent",
             ));
         }
-        let binding = ProviderBinding {
-            provider_uid: uuid::Uuid::new_v4().to_string(),
-            provider_generation: 1,
-        };
+        let binding = fake_provider_binding(identity, uuid::Uuid::new_v4().to_string(), 1);
         tx.execute(
             "INSERT INTO workloads(
-                session_id,workspace_id,capability_digest,provider_scope,create_operation_key,
-                delete_operation_key,provider_uid,provider_generation,present,launch_state,create_mutations
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,'inert',1)",
+                session_id,workspace_id,owner_id,capability_digest,provider_scope,create_operation_key,
+                delete_operation_key,provider_uid,provider_generation,provider_name,
+                provider_namespace,provider_spec_digest,present,launch_state,create_mutations
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,'inert',1)",
             params![
                 identity.session_id,
                 identity.workspace_id,
+                identity.owner_id,
                 identity.capability_digest,
                 identity.provider_scope,
                 identity.create_operation_key,
                 identity.delete_operation_key,
                 binding.provider_uid,
                 binding.provider_generation,
+                binding.provider_name,
+                binding.provider_namespace,
+                binding.provider_spec_digest,
             ],
         )?;
         tx.commit()?;
@@ -2585,10 +2991,11 @@ impl WorkspaceAdapter for FakeKubernetes {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: FakeProviderRecord = tx
             .query_row(
-                "SELECT workspace_id,capability_digest,provider_scope,create_operation_key,
-                        delete_operation_key,provider_uid,provider_generation,present,
-                        launch_state,activation_epoch,activation_token,activation_task_digest,
-                        activation_spec_digest,lose_activation_response
+                "SELECT workspace_id,owner_id,capability_digest,provider_scope,create_operation_key,
+                        delete_operation_key,provider_uid,provider_generation,provider_name,
+                        provider_namespace,provider_spec_digest,present,launch_state,activation_epoch,
+                        activation_token,activation_task_digest,activation_spec_digest,
+                        lose_activation_response
                  FROM workloads WHERE session_id=?1",
                 [&identity.session_id],
                 FakeProviderRecord::from_row,
@@ -2667,10 +3074,11 @@ impl WorkspaceAdapter for FakeKubernetes {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: FakeProviderRecord = tx
             .query_row(
-                "SELECT workspace_id,capability_digest,provider_scope,create_operation_key,
-                        delete_operation_key,provider_uid,provider_generation,present,
-                        launch_state,activation_epoch,activation_token,activation_task_digest,
-                        activation_spec_digest,lose_activation_response
+                "SELECT workspace_id,owner_id,capability_digest,provider_scope,create_operation_key,
+                        delete_operation_key,provider_uid,provider_generation,provider_name,
+                        provider_namespace,provider_spec_digest,present,launch_state,activation_epoch,
+                        activation_token,activation_task_digest,activation_spec_digest,
+                        lose_activation_response
                  FROM workloads WHERE session_id=?1",
                 [&identity.session_id],
                 FakeProviderRecord::from_row,
@@ -2753,10 +3161,11 @@ impl WorkspaceAdapter for FakeKubernetes {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<FakeProviderRecord> = tx
             .query_row(
-                "SELECT workspace_id,capability_digest,provider_scope,create_operation_key,
-                        delete_operation_key,provider_uid,provider_generation,present,
-                        launch_state,activation_epoch,activation_token,activation_task_digest,
-                        activation_spec_digest,lose_activation_response
+                "SELECT workspace_id,owner_id,capability_digest,provider_scope,create_operation_key,
+                        delete_operation_key,provider_uid,provider_generation,provider_name,
+                        provider_namespace,provider_spec_digest,present,launch_state,activation_epoch,
+                        activation_token,activation_task_digest,activation_spec_digest,
+                        lose_activation_response
                  FROM workloads WHERE session_id=?1",
                 [&identity.session_id],
                 FakeProviderRecord::from_row,
@@ -2793,10 +3202,11 @@ impl WorkspaceAdapter for FakeKubernetes {
         let conn = self.connection()?;
         let existing: Option<FakeProviderRecord> = conn
             .query_row(
-                "SELECT workspace_id,capability_digest,provider_scope,create_operation_key,
-                        delete_operation_key,provider_uid,provider_generation,present,
-                        launch_state,activation_epoch,activation_token,activation_task_digest,
-                        activation_spec_digest,lose_activation_response
+                "SELECT workspace_id,owner_id,capability_digest,provider_scope,create_operation_key,
+                        delete_operation_key,provider_uid,provider_generation,provider_name,
+                        provider_namespace,provider_spec_digest,present,launch_state,activation_epoch,
+                        activation_token,activation_task_digest,activation_spec_digest,
+                        lose_activation_response
                  FROM workloads WHERE session_id=?1",
                 [&identity.session_id],
                 FakeProviderRecord::from_row,
@@ -2809,6 +3219,8 @@ impl WorkspaceAdapter for FakeKubernetes {
                 provider_generation: identity.provider_generation,
                 launch_epoch: 0,
                 task_input_digest: None,
+                activation_token_digest: None,
+                execution_spec_digest: None,
             });
         };
         if !existing.matches(identity) {
@@ -2830,6 +3242,10 @@ impl WorkspaceAdapter for FakeKubernetes {
             provider_generation: existing.provider_generation,
             launch_epoch: existing.activation_epoch,
             task_input_digest: existing.activation_task_digest,
+            activation_token_digest: existing
+                .activation_token
+                .map(|token| hex::encode(Sha256::digest(token.as_bytes()))),
+            execution_spec_digest: existing.activation_spec_digest,
         })
     }
 }
@@ -2851,6 +3267,14 @@ impl<A: WorkspaceAdapter> Controller<A> {
 
     pub fn adapter(&self) -> &A {
         &self.adapter
+    }
+
+    pub fn session_identity(&self, session_id: &str) -> Result<SessionIdentity> {
+        let identity = self.ledger.identity(session_id)?;
+        if identity.provider_scope != self.adapter.provider_scope() {
+            return Err(ControllerError::OwnershipMismatch);
+        }
+        Ok(identity)
     }
 
     fn execution_aborted(&self, session_id: &str) -> Result<bool> {
@@ -2875,11 +3299,14 @@ impl<A: WorkspaceAdapter> Controller<A> {
         request: &AdmissionRequest,
         crash: Option<CrashPoint>,
     ) -> Result<()> {
+        validate_provider_scope(self.adapter.provider_scope())?;
         if crash == Some(CrashPoint::AfterPrepared) {
-            self.ledger.prepare(request)?;
+            self.ledger
+                .prepare_for_provider(request, self.adapter.provider_scope())?;
             crash_if(crash, CrashPoint::AfterPrepared)?;
         } else {
-            self.ledger.prepare_and_admit(request)?;
+            self.ledger
+                .prepare_and_admit_for_provider(request, self.adapter.provider_scope())?;
         }
         if self.ledger.state(&request.session_id)? == Lifecycle::Prepared {
             self.ledger.admit(&request.session_id)?;
@@ -2911,7 +3338,7 @@ impl<A: WorkspaceAdapter> Controller<A> {
                 });
             }
         }
-        let identity = self.ledger.identity(&request.session_id)?;
+        let identity = self.session_identity(&request.session_id)?;
         let binding = self.adapter.create_owned(&identity)?;
         self.ledger
             .bind_provider_identity(&request.session_id, &binding)?;
@@ -2931,7 +3358,7 @@ impl<A: WorkspaceAdapter> Controller<A> {
         expires_at: i64,
         now: i64,
     ) -> Result<ActivationCapability> {
-        let identity = self.ledger.identity(session_id)?;
+        let identity = self.session_identity(session_id)?;
         self.ledger
             .authorize_launch(session_id, &identity, execution_spec, expires_at, now)
     }
@@ -2945,7 +3372,7 @@ impl<A: WorkspaceAdapter> Controller<A> {
             return Err(ControllerError::ExecutionAborted);
         }
         self.ledger.validate_launch(capability)?;
-        let identity = self.ledger.identity(&capability.session_id)?;
+        let identity = self.session_identity(&capability.session_id)?;
         self.adapter.activate_owned(&identity, capability)
     }
 
@@ -2960,13 +3387,20 @@ impl<A: WorkspaceAdapter> Controller<A> {
         if self.execution_aborted(&capability.session_id)? {
             return Err(ControllerError::ExecutionAborted);
         }
-        let identity = self.ledger.identity(&capability.session_id)?;
+        let identity = self.session_identity(&capability.session_id)?;
+        if !capability.binding_matches(&identity) {
+            return Err(ControllerError::ActivationBindingMismatch);
+        }
         let observed = self.adapter.observe_owned(&identity)?;
         if observed.state != ProviderWorkloadState::Activated
             || observed.provider_uid != capability.provider_uid
             || observed.provider_generation != capability.provider_generation
             || observed.launch_epoch != capability.launch_epoch
             || observed.task_input_digest.as_deref() != Some(capability.task_input_digest.as_str())
+            || observed.activation_token_digest.as_deref()
+                != Some(hex::encode(Sha256::digest(capability.token.as_bytes())).as_str())
+            || observed.execution_spec_digest.as_deref()
+                != Some(capability.execution_spec_digest.as_str())
         {
             return Err(ControllerError::ActivationNotObserved);
         }
@@ -2999,7 +3433,7 @@ impl<A: WorkspaceAdapter> Controller<A> {
         workspace_id: &str,
         crash: Option<CrashPoint>,
     ) -> Result<()> {
-        let identity = self.ledger.identity(&receipt.session_id)?;
+        let identity = self.session_identity(&receipt.session_id)?;
         if identity.owner_id != owner_id || identity.workspace_id != workspace_id {
             return Err(ControllerError::OwnershipMismatch);
         }
@@ -3028,7 +3462,7 @@ impl<A: WorkspaceAdapter> Controller<A> {
     pub fn reconcile_session(&self, session_id: &str) -> Result<()> {
         for _ in 0..8 {
             let state = self.ledger.state(session_id)?;
-            let identity = self.ledger.identity(session_id)?;
+            let identity = self.session_identity(session_id)?;
             if self.ledger.cancellation_requested(session_id)?
                 && matches!(
                     state,
@@ -3069,7 +3503,7 @@ impl<A: WorkspaceAdapter> Controller<A> {
                     let Some(capability) = self.ledger.current_issued_launch(session_id)? else {
                         return Ok(());
                     };
-                    let identity = self.ledger.identity(session_id)?;
+                    let identity = self.session_identity(session_id)?;
                     if let Err(error) = self.adapter.activate_owned(&identity, &capability) {
                         let observed = self.adapter.observe_owned(&identity)?;
                         let exact_activation_observed = observed.state
@@ -3078,7 +3512,14 @@ impl<A: WorkspaceAdapter> Controller<A> {
                             && observed.provider_generation == capability.provider_generation
                             && observed.launch_epoch == capability.launch_epoch
                             && observed.task_input_digest.as_deref()
-                                == Some(capability.task_input_digest.as_str());
+                                == Some(capability.task_input_digest.as_str())
+                            && observed.activation_token_digest.as_deref()
+                                == Some(
+                                    hex::encode(Sha256::digest(capability.token.as_bytes()))
+                                        .as_str(),
+                                )
+                            && observed.execution_spec_digest.as_deref()
+                                == Some(capability.execution_spec_digest.as_str());
                         if !exact_activation_observed {
                             return Err(error);
                         }
@@ -3157,6 +3598,15 @@ pub enum WorkerExit {
     CancelledBeforeSpawn,
     Cancelled,
     Exited(Option<i32>),
+}
+
+fn unix_time_seconds() -> Result<i64> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ControllerError::AdapterState("system clock precedes Unix epoch"))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| ControllerError::AdapterState("system clock exceeds i64 range"))
 }
 
 /// Runs a local worker only after validating an exact redeemed task-material grant.
@@ -3275,7 +3725,7 @@ mod spawn_linearization_tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cancellation_cannot_commit_between_execution_claim_and_physical_spawn() {
+    fn cancellation_after_durable_execution_claim_commits_before_spawn_and_prevents_execution() {
         const NOW: i64 = 1_900_000_000;
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.db");
@@ -3336,12 +3786,15 @@ mod spawn_linearization_tests {
         });
         thread::sleep(Duration::from_millis(100));
         assert!(
-            !cancellation.is_finished(),
-            "cancellation committed while execution claim held the writer transaction"
+            cancellation.is_finished(),
+            "cancellation did not commit after the durable execution claim"
         );
 
         release.wait();
-        worker.join().unwrap().unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(ControllerError::ExecutionAborted)
+        ));
         cancellation.join().unwrap().unwrap();
         assert_eq!(
             Ledger::open(&ledger_path)
@@ -3350,5 +3803,57 @@ mod spawn_linearization_tests {
                 .unwrap(),
             Lifecycle::Cancelled
         );
+    }
+
+    #[test]
+    fn expired_redeemed_grant_never_reaches_process_creation() {
+        const NOW: i64 = 1_900_000_000;
+        let dir = tempdir().unwrap();
+        let ledger = Ledger::open(dir.path().join("ledger.db")).unwrap();
+        let controller = Controller::new(
+            ledger.clone(),
+            FakeKubernetes::open(dir.path().join("provider.db")).unwrap(),
+        );
+        let request = AdmissionRequest {
+            session_id: "expired-spawn-session".into(),
+            jti: "expired-spawn-jti".into(),
+            capability_digest: "sha256:expired-spawn".into(),
+            owner_id: "agent:expired-spawn".into(),
+            workspace_id: "expired-spawn-workspace".into(),
+            scope: Scope::Agent("agent:expired-spawn".into()),
+            signed_max_concurrency: 1,
+            deployment_max_concurrency: 1,
+            artifact_limit_bytes: 1,
+            expires_at: 2_000_000_000,
+        };
+        controller.provision_inert(&request, None).unwrap();
+        let missing = dir.path().join("program-that-does-not-exist.exe");
+        let spec = ExecutionSpec::new(missing.to_string_lossy(), vec![], "a".repeat(64)).unwrap();
+        let capability = controller
+            .authorize_launch(&request.session_id, &spec, NOW + 60, NOW)
+            .unwrap();
+        controller.activate_launch(&capability).unwrap();
+        let mut grant = controller
+            .redeem_launch(&capability, "expired-spawn-boot", &spec, NOW)
+            .unwrap();
+        let expired_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 1;
+        ledger
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE launch_authorizations SET expires_at=?1 WHERE session_id=?2",
+                params![expired_at, request.session_id],
+            )
+            .unwrap();
+        grant.expires_at = expired_at;
+
+        assert!(matches!(
+            ledger.claim_and_spawn_task_material_grant(&grant, || {}),
+            Err(ControllerError::ActivationExpired)
+        ));
     }
 }
