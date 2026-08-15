@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "logical_tools": {
+    "allow": [
+      "checkout_workspace",
+      "list_workspace_files",
+      "stage_artifact",
+      "commit_checkpoint",
+      "get_checkpoint_status",
+      "restore_checkpoint",
+      "finish_workspace"
+    ],
+    "deny_capability_classes": [
+      "authentication_management",
+      "raw_provider_proxy",
+      "remote_shell_or_workbench",
+      "sharing_or_permissions",
+      "permanent_delete",
+      "unrestricted_drive_search",
+      "artifact_acceptance"
+    ]
+  },
+  "defaults": {
+    "capability_ttl_seconds": 7200,
+    "completion_grace_seconds": 600,
+    "orphan_scan_seconds": 300,
+    "partial_upload_max_age_seconds": 3600,
+    "max_concurrent_sessions_per_agent": 2,
+    "max_concurrent_sessions_total": 20,
+    "max_parallel_transfers_per_session": 2,
+    "soft_byte_ratio": 0.8,
+    "freeze_byte_ratio": 1.0,
+    "rate_violations_before_freeze": 3
+  },
+  "responses": {
+    "cross_workspace_access": "revoke_and_quarantine",
+    "forbidden_capability_class": "revoke",
+    "hash_mismatch": "quarantine",
+    "expired_capability": "reject",
+    "soft_byte_limit": "throttle",
+    "hard_byte_limit": "freeze",
+    "upstream_403_or_429": "backoff_and_alert",
+    "orphaned_partial_upload": "quarantine_then_cleanup",
+    "accepted_artifact": "retain"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.local/schemas/storage-capability-v1.json",
+  "title": "Buzz brokered storage capability",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "issuer", "audience", "jti", "task_id", "session_id", "agent_id", "project_id", "workspace_id", "storage_binding_id", "root_file_id", "issued_at", "not_before", "expires_at", "allowed_operations", "limits", "policy_sha256", "cancellation_token_sha256"],
+  "properties": {
+    "version": {"const": 1},
+    "issuer": {"const": "final-form"},
+    "audience": {"const": "buzz-storage-broker"},
+    "jti": {"type": "string", "format": "uuid"},
+    "task_id": {"type": "string", "format": "uuid"},
+    "session_id": {"type": "string", "format": "uuid"},
+    "agent_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "project_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "workspace_id": {"type": "string", "format": "uuid"},
+    "storage_binding_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"},
+    "root_file_id": {"type": "string", "minLength": 8, "maxLength": 256},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "not_before": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "allowed_operations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {"enum": ["checkout_workspace", "list_workspace_files", "stage_artifact", "commit_checkpoint", "get_checkpoint_status", "restore_checkpoint", "finish_workspace"]}
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_operations", "max_read_bytes", "max_write_bytes", "max_object_bytes", "max_concurrent_transfers"],
+      "properties": {
+        "max_operations": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "max_read_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
+        "max_write_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
+        "max_object_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
+        "max_concurrent_transfers": {"type": "integer", "minimum": 1, "maximum": 8}
+      }
+    },
+    "policy_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "cancellation_token_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.local/schemas/broker-transfer-receipt-v1.json",
+  "title": "Buzz storage broker transfer receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "issuer", "receipt_id", "capability_jti", "task_id", "session_id", "workspace_id", "storage_binding_id", "backend_object_id", "operation", "logical_path", "bytes", "sha256", "media_type", "started_at", "finished_at", "status"],
+  "properties": {
+    "version": {"const": 1},
+    "issuer": {"const": "final-form-storage-broker"},
+    "receipt_id": {"type": "string", "format": "uuid"},
+    "capability_jti": {"type": "string", "format": "uuid"},
+    "task_id": {"type": "string", "format": "uuid"},
+    "session_id": {"type": "string", "format": "uuid"},
+    "workspace_id": {"type": "string", "format": "uuid"},
+    "storage_binding_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"},
+    "backend_object_id": {"type": "string", "minLength": 8, "maxLength": 256},
+    "operation": {"enum": ["upload", "download"]},
+    "logical_path": {"type": "string", "minLength": 1, "maxLength": 1024},
+    "bytes": {"type": "integer", "minimum": 0},
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "media_type": {"type": "string", "minLength": 1, "maxLength": 255},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["verified", "failed"]},
+    "message": {"type": "string", "maxLength": 4096}
+  }
+}

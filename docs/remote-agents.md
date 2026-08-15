@@ -1396,8 +1396,11 @@ removable with `kubectl delete`.
 ### `provider_config` v1 fields
 
 `context`, `namespace`, `image`, `cpu_request`, `memory_request`,
-`cpu_limit`, `memory_limit`, `inactivity_seconds`, `service_account` —
-9 of the 20-field validation cap. Node selectors, tolerations, and PVCs are
+`cpu_limit`, `memory_limit`, `inactivity_seconds`, `service_account`,
+`manage_namespace` — 10 of the 20-field validation cap. The final field
+defaults to `true` for compatibility; set it to `false` when FINAL-FORM has
+pre-created the session namespace and the provider identity has only a
+namespace-scoped Role. Node selectors, tolerations, and PVCs are
 deliberately baked out of v1 to preserve budget.
 
 ### Distribution
