@@ -278,3 +278,70 @@ both a capability and long-lived signer material.
 This boundary complements, but does not replace, the lifecycle scheduler in
 [ADR-0002](0002-durable-turn-lifecycle-spine.md) and the remote workspace
 authority in [ADR-0001](0001-buzz-workspace-controller-boundary.md).
+
+## Addendum 2026-08-17 — Remote-ready at-rest + scheduler bridge (docs-only lock)
+
+No code change beyond this addendum and comments. The invariants below are the
+remote-ready contract; future slices wire through them, they do not re-decide
+them. Evidence lives in
+[../durable-scheduler-checkpoint-validation.md](../durable-scheduler-checkpoint-validation.md) (Addendum 2026-08-17).
+
+### Locked invariants
+
+1. **Transport is Tailscale.** The broker's service-authenticated transport for
+   remote/Kubernetes workers is Tailnet-bound (ACL-gated, broker loopback-bound).
+   Dev Tailnet `100.117.196.100 <-> 100.125.42.122` proves the path. This locks
+   the `Local v1 and remote/Kubernetes isolation` placeholder
+   "for example a Tailscale- or mTLS-bound broker" — mTLS remains a fallback-only
+   note and does not reopen the choice.
+
+2. **At-rest store is the same lifecycle SQLite WAL on the device persistent path.**
+   `crates/buzz-lifecycle` SQLite WAL (`SCHEMA_VERSION 8`, `journal_mode=WAL`,
+   `synchronous=FULL`, foreign keys, bounded busy timeout, one connection per
+   operation via `spawn_blocking`) placed on the **device persistent path**
+   (`Tauri app_data_dir`, e.g. `.../buzz/lifecycle.db`), not an ephemeral
+   `BUZZ_ACP_LIFECYCLE_*_DB` env-var-only location. Encrypted at rest **if the OS
+   supports it** (OS file protection / DPAPI / Keychain / full-disk encryption);
+   the lifecycle crate does not add a second cipher. Backup/restore verification
+   remains a production gate.
+
+3. **Retention caps — 30d / 500 MiB soft / 1 GiB hard, tombstones kept, VACUUM.**
+   Per-`(owner,agent)` `retention_policies` (v8, `schema.rs:306`):
+   default **30 days / 500 MiB soft / 1 GiB hard**, slider **7–90 days /
+   256 MiB–2 GiB**, `hard_bytes >= soft_bytes`, `retention_days BETWEEN 7 AND 90`.
+   `enforce_retention` prunes oldest terminal states first by TTL then by
+   soft-watermark size, **never blocks admission**, keeps `rejected` tombstones,
+   and `VACUUM`s (fresh connection post-commit) iff `pruned > 0`. Proven by
+   `tests/retention.rs` (`retention_caps_evict_oldest_terminal_with_ttl_and_size_and_never_block_admission`).
+
+4. **Launch fence — lifecycle v8, `create_inert_turn -> mint -> IMMEDIATE epoch bump -> single-use`, cancel-wins.**
+   Tables `launch_fences` + `activation_capabilities` (v8) already close the
+   cancellation/launch race locally:
+   `create_inert_turn` (ensures fence, admits inert `Accepted`) →
+   `mint_activation_capability` (`next_epoch = current + 1`, fence not bumped on mint) →
+   `cancel_turn_with_fence` **or** `activate_with_capability` bumps
+   `launch_epoch +1` in the **same `IMMEDIATE` transaction** as the state
+   transition and marks competing caps `consumed=1` (`launch_epoch <= next_epoch`);
+   capability is single-use; late `activate` after `cancel`/terminal returns
+   `AlreadyConsumed`/`CancelledConflict` — **cancel-wins**, monotonic epoch.
+   Proven by `tests/launch_fence.rs` (`launch_fence_cancel_wins_over_concurrent_activate`)
+   and `store.rs:ensure_launch_fence_tx` / `mint_activation_capability` /
+   `cancel_turn_with_fence` / `activate_with_capability`. Remote slices must wire
+   the **actual provider launch** through this fence; the SQLite marker alone is
+   not the external side-effect fence.
+
+### Acceptance matrix update (remote-ready row deltas)
+
+- **Transport:** Remote row now reads "Tailscale Tailnet, ACL-gated" (locked above),
+  not "Tailscale- or mTLS-bound (to be decided)".
+- **At-rest / retention / compaction / backup:** Retention/compaction shape locked
+  above; remaining gate narrows to **backup/restore verification + OS at-rest encryption proof per target**.
+- **Cancellation/launch:** Local `cancel-wins` fence locked in v8 above; remaining gate narrows to **wiring the fence through the real remote provider launch** and its installed-runtime test.
+
+### Non-change note
+
+No ACP/MCP runtime is wired to the persistent path or to Tailscale by default in
+this slice. All selectors remain default-off; the pilot remains local-only.
+Production still requires backup/restore verification, per-target OS at-rest proof,
+installed-runtime crash/reconnect/cancel canary, live-relay receipt/terminal outbox
+validation, and CI reproduction of the five-boundary crash matrix.

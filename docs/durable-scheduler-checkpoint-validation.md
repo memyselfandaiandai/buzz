@@ -200,3 +200,55 @@ path matches were intentional fake Windows-path normalization fixtures under
   protection for signed inputs and captured final text.
 - Run an isolated installed-runtime canary before any shared or production
   activation. All lifecycle selectors remain unset by default.
+
+## Addendum 2026-08-17 — Remote-ready at-rest + scheduler bridge (docs-only lock)
+
+This addendum locks the transport, at-rest placement, retention caps, and
+launch-fence choices that future remote/Kubernetes slices must not re-decide.
+No `buzz-acp`/`buzz-lifecycle` behavior changes in this slice beyond comments;
+the store already implements the invariant locally.
+
+### Transport — Tailscale (locked)
+
+Service-authenticated transport is **Tailscale**. The dev Tailnet proving the
+path is `100.117.196.100 <-> 100.125.42.122` (control-plane ↔ worker),
+broker loopback-bound, Tailnet ACL-gated. This resolves the ADR-0003
+placeholder "for example a Tailscale- or mTLS-bound broker" — mTLS remains a
+documented fallback only if Tailnet is unavailable and does not reopen the
+choice for this slice.
+
+### At-rest store — same lifecycle SQLite WAL on device persistent path (locked)
+
+The lifecycle DB is the same `crates/buzz-lifecycle` SQLite WAL already used
+for the scheduler: `SCHEMA_VERSION = 8`, `journal_mode=WAL`,
+`synchronous=FULL`, foreign keys, bounded busy timeout, one connection per
+operation via `spawn_blocking`. The remote-ready invariant places it on the
+**device persistent path** (`Tauri app_data_dir`, e.g. desktop
+`.../buzz/lifecycle.db`) rather than an ephemeral env-var-only location. The
+file is **encrypted at rest if the OS supports it** (OS file protection /
+DPAPI / Keychain / full-disk encryption); the store does not add a second
+at-rest cipher. Backup/restore verification stays a production gate.
+
+### Retention caps — 30d / 500 MiB soft / 1 GiB hard, tombstones kept, VACUUM (locked)
+
+Per-`(owner,agent)` policy in `retention_policies` (v8):
+default **30 days / 500 MiB soft / 1 GiB hard**, slider **7–90 days /
+256 MiB–2 GiB** (`CHECK(soft_bytes BETWEEN 268435456 AND 2147483648 AND hard_bytes >= soft_bytes)` and `RetentionPolicy::validate`), **tombstones** (`rejected` state) **kept**, `enforce_retention` prunes oldest `completed/failed/cancelled/expired` first by TTL then by soft-watermark size, **never blocks admission**, and runs `VACUUM` iff `pruned > 0` (via a fresh connection after commit). Proven by `crates/buzz-lifecycle/tests/retention.rs` (`retention_caps_evict_oldest_terminal_with_ttl_and_size_and_never_block_admission`) and `RetentionUsage`/`RetentionEnforceResult`.
+
+### Launch fence — lifecycle v8, cancel-wins, IMMEDIATE epoch bump, single-use (locked)
+
+The cancellation/launch race is already closed in `lifecycle v8` via
+`launch_fences` + `activation_capabilities`:
+`create_inert_turn` (ensures fence row, admits inert `Accepted`) →
+`mint_activation_capability` (`next_epoch = current + 1`, fence **not** bumped on mint) →
+`cancel_turn_with_fence` **or** `activate_with_capability` bumps `launch_epoch` by `+1` in the **same `IMMEDIATE` transaction** as the state transition and marks competing capabilities `consumed=1` (`WHERE launch_epoch <= next_epoch`). Capability is **single-use**; late `activate` after `cancel` (or after terminal) returns `AlreadyConsumed`/`CancelledConflict` — **cancel-wins**, monotonic `launch_epoch`. Proven by `crates/buzz-lifecycle/tests/launch_fence.rs` (`launch_fence_cancel_wins_over_concurrent_activate`) and `store.rs:ensure_launch_fence_tx` / `mint_activation_capability` / `cancel_turn_with_fence` / `activate_with_capability`.
+
+### What this slice does not change
+
+- No ACP/MCP runtime wires the persistent path or Tailscale by default; all selectors remain **default-off** and the pilot remains local-only.
+- Production still needs: backup/restore verification, OS at-rest encryption proof per target, installed-runtime crash/reconnect/cancel canary, live-relay receipt/terminal outbox validation, and CI reproduction of the five-boundary crash matrix.
+
+### Updated production gates (narrowed)
+
+- ~~Define approved retention, deletion, compaction, backup, and at-rest protection~~ — **Retention policy and at-rest placement are locked above; remaining gate is backup/restore verification + OS at-rest encryption proof per target.**
+- ~~Add an external capability fence across authoritative cancellation and the actual ACP/provider launch~~ — **Covered by lifecycle v8 launch fence above; remaining gate is wiring the fence through the actual remote provider launch path and its installed-runtime test.**
