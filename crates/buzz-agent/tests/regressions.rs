@@ -271,17 +271,15 @@ fn openai_tool_call(id: &str, name: &str, args: Value) -> Value {
 }
 
 async fn init_session(h: &mut Harness, mcp_servers: Value) -> String {
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
     h.send(
         "initialize",
         json!({"protocolVersion":1,"clientCapabilities":{}}),
     )
     .await;
     let _ = h.recv().await;
-    h.send(
-        "session/new",
-        json!({"cwd":"/tmp","mcpServers": mcp_servers}),
-    )
-    .await;
+    h.send("session/new", json!({"cwd":cwd,"mcpServers": mcp_servers}))
+        .await;
     let r = h
         .recv_until(|v| v.get("result").is_some() || v.get("error").is_some())
         .await;
@@ -445,6 +443,124 @@ async fn tool_metadata_caps_enforced() {
         );
     }
     h.shutdown().await;
+}
+
+fn captured_tool_names(request: &Value) -> Vec<&str> {
+    request["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect()
+}
+
+/// The pilot is default-off: an unset policy keeps the pre-existing complete
+/// model-visible catalog on the first request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_exposure_defaults_to_full_catalog() {
+    let llm = spawn_capturing_llm(vec![openai_text("done")]).await;
+    let mut h = Harness::spawn(&llm.url).await;
+    let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
+    let sid = init_session(
+        &mut h,
+        json!([{
+            "name": "fake",
+            "command": fake_mcp,
+            "args": [],
+            "env": [{ "name": "FAKE_MCP_SHELL_TOOL", "value": "1" }],
+        }]),
+    )
+    .await;
+
+    let response = prompt_to_completion(&mut h, &sid).await;
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let captured = llm.captured.lock().await;
+    let names = captured_tool_names(&captured[0]);
+    assert!(names.contains(&"fake__shell"), "shell missing: {names:?}");
+    assert!(
+        names.contains(&"fake__tool_0"),
+        "default must expose the complete catalog: {names:?}"
+    );
+    drop(captured);
+    h.shutdown().await;
+}
+
+/// Anchoring affects only the first provider request. A hidden-on-that-request
+/// tool is still authorized by the full registry, the next tool-loop round is
+/// promoted to the full catalog, and a later user turn starts full as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_tool_exposure_promotes_without_mutating_registry() {
+    let llm = spawn_capturing_llm(vec![
+        openai_tool_call("hidden-call", "fake__tool_0", json!({})),
+        openai_text("first done"),
+        openai_text("second done"),
+    ])
+    .await;
+    let mut h =
+        Harness::spawn_with_env(&llm.url, &[("BUZZ_AGENT_TOOL_EXPOSURE", "anchored")]).await;
+    let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
+    let sid = init_session(
+        &mut h,
+        json!([{
+            "name": "fake",
+            "command": fake_mcp,
+            "args": [],
+            "env": [{ "name": "FAKE_MCP_SHELL_TOOL", "value": "1" }],
+        }]),
+    )
+    .await;
+
+    let first = prompt_to_completion(&mut h, &sid).await;
+    assert_eq!(first["result"]["stopReason"], "end_turn");
+    let second = prompt_to_completion(&mut h, &sid).await;
+    assert_eq!(second["result"]["stopReason"], "end_turn");
+
+    let captured = llm.captured.lock().await;
+    assert_eq!(captured.len(), 3);
+    let initial = captured_tool_names(&captured[0]);
+    assert_eq!(initial, vec!["fake__shell"]);
+
+    let promoted = captured_tool_names(&captured[1]);
+    assert!(promoted.contains(&"fake__shell"));
+    assert!(promoted.contains(&"fake__tool_0"));
+    assert!(
+        captured[1]["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "hidden-call"
+                    && message["content"] == "ok"
+            })),
+        "hidden-on-first-request call did not execute through the complete registry"
+    );
+
+    let later_turn = captured_tool_names(&captured[2]);
+    assert!(later_turn.contains(&"fake__shell"));
+    assert!(later_turn.contains(&"fake__tool_0"));
+    drop(captured);
+    h.shutdown().await;
+}
+
+/// Startup rejects typos instead of silently widening back to the full tool
+/// catalog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_tool_exposure_fails_clearly() {
+    let bin = env!("CARGO_BIN_EXE_buzz-agent");
+    let output = tokio::process::Command::new(bin)
+        .env("BUZZ_AGENT_PROVIDER", "openai")
+        .env("OPENAI_COMPAT_API_KEY", "test")
+        .env("OPENAI_COMPAT_MODEL", "fake-model")
+        .env("BUZZ_AGENT_TOOL_EXPOSURE", "gradual")
+        .output()
+        .await
+        .expect("run buzz-agent");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BUZZ_AGENT_TOOL_EXPOSURE=gradual") && stderr.contains("full|anchored"),
+        "unexpected startup error: {stderr}"
+    );
 }
 
 /// Cap on MCP server count: 17 servers must be rejected.

@@ -1,0 +1,18 @@
+[package]
+name = "buzz-capability-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Strict loopback client for short-lived Buzz signing capabilities"
+
+[dependencies]
+buzz-signing-capability = { workspace = true }
+nostr = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }

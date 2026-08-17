@@ -686,18 +686,36 @@ fn resolve_command_uncached(command: &str) -> Option<PathBuf> {
         return Some(managed);
     }
 
+    #[cfg(not(windows))]
     for candidate in path_candidates_from_env(command) {
         if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
 
-    // On Windows, also scan PATH for .cmd/.bat shims (npm globals).
+    // Preserve PATH directory precedence on Windows. Scanning every `.exe`
+    // before any `.cmd` can incorrectly select a later application-bundled
+    // executable instead of an earlier npm shim. Check all supported
+    // extensions within each directory before moving to the next directory.
     #[cfg(windows)]
+    {
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for basename in &basenames {
+                    let candidate = dir.join(basename);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     {
         for basename in command_basenames(command).iter().skip(1) {
             for candidate in path_candidates_from_env_raw(basename) {
-                if candidate.is_file() {
+                if is_executable_file(&candidate) {
                     return Some(candidate);
                 }
             }
@@ -734,6 +752,7 @@ fn resolve_command_uncached(command: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(windows))]
 fn path_candidates_from_env(command: &str) -> Vec<PathBuf> {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -744,9 +763,8 @@ fn path_candidates_from_env(command: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Like `path_candidates_from_env` but joins `basename` as-is (no `.exe` suffix).
-/// Used for `.cmd`/`.bat` shim resolution on Windows.
-#[cfg(windows)]
+/// Like `path_candidates_from_env` but joins `basename` as-is.
+#[cfg(not(windows))]
 fn path_candidates_from_env_raw(basename: &str) -> Vec<PathBuf> {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -1010,7 +1028,7 @@ fn probe_auth_status(binary_path: &Path, probe_args: &[&str]) -> AuthStatus {
 
     let augmented_path = cli_probe::augmented_path();
 
-    let mut command = std::process::Command::new(binary_path);
+    let mut command = cli_probe::command_for_binary(binary_path);
     command.args(&probe_args[1..]);
     if let Some(ref path) = augmented_path {
         command.env("PATH", path);
@@ -1193,7 +1211,7 @@ pub(crate) fn probe_codex_acp_version_with_path(
     // inherits its descriptor, bounding the post-exit read cross-platform.
     let mut tmp = tempfile::tempfile().ok()?;
 
-    let mut command = Command::new(binary_path);
+    let mut command = crate::managed_agents::readiness::cli_probe::command_for_binary(binary_path);
     command.arg("--version");
     if let Some(path) = augmented_path {
         command.env("PATH", path);

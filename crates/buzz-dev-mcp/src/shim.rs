@@ -1,3 +1,4 @@
+use crate::credentials::ChildCredentials;
 use nostr::ToBech32;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -5,37 +6,47 @@ use zeroize::Zeroize;
 
 /// Session-scoped shim directory providing tools and git config to shell children.
 ///
-/// On install:
+/// In legacy mode, on install:
 /// 1. Creates a 0700 tempdir with symlinks back to our binary (multicall)
 /// 2. If `NOSTR_PRIVATE_KEY` is set: writes a 0600 keyfile, derives the pubkey,
 ///    builds ephemeral `GIT_CONFIG_*` env vars, then removes the env var
 /// 3. Prepends the shim dir to PATH
 ///
-/// Shell children receive `path_env`, `git_env`, and `BUZZ_PRIVATE_KEY` (for
-/// the buzz CLI). `NOSTR_PRIVATE_KEY` is removed from the process env after
-/// the keyfile is written — git helpers read from the keyfile only.
+/// Broker mode instead installs only the ordinary tool shims and carries a
+/// fixed capability projection. It never reads or writes a Nostr keyfile and
+/// never configures the Nostr Git credential or signing helpers.
 /// Cleaned up on drop (TempDir).
 pub struct Shim {
     _dir: TempDir,
     pub path_env: String,
     pub git_env: Vec<(String, String)>,
+    pub credentials: ChildCredentials,
 }
 
 impl Shim {
     pub fn install() -> std::io::Result<Self> {
+        let credentials = ChildCredentials::from_env().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("buzz-dev-mcp credential configuration failed: {error}"),
+            )
+        })?;
+        Self::install_with_credentials(credentials)
+    }
+
+    pub(crate) fn install_with_credentials(credentials: ChildCredentials) -> std::io::Result<Self> {
         let dir = tempfile::Builder::new().prefix("buzz-dev-mcp-").tempdir()?;
         set_owner_only(dir.path())?;
 
         let self_exe = std::env::current_exe()?;
 
-        // Multicall symlinks — all resolve back to this binary.
-        for name in [
-            "rg",
-            "tree",
-            "buzz",
-            "git-credential-nostr",
-            "git-sign-nostr",
-        ] {
+        // Multicall symlinks — all resolve back to this binary. Broker mode
+        // deliberately does not make the raw-key Git helpers available.
+        let mut names = vec!["rg", "tree", "buzz"];
+        if !credentials.is_broker_v1() {
+            names.extend(["git-credential-nostr", "git-sign-nostr"]);
+        }
+        for name in names {
             symlink(&self_exe, &dir.path().join(name))?;
         }
 
@@ -48,30 +59,41 @@ impl Shim {
             .to_string_lossy()
             .into_owned();
 
-        // Read and unconditionally remove NOSTR_PRIVATE_KEY from this process's
-        // env. The key must never leak to child processes regardless of whether
-        // keyfile creation succeeds.
-        let mut nostr_key = std::env::var("NOSTR_PRIVATE_KEY").ok();
-        std::env::remove_var("NOSTR_PRIVATE_KEY");
+        let git_env = if credentials.is_broker_v1() {
+            Vec::new()
+        } else {
+            // Read and unconditionally remove NOSTR_PRIVATE_KEY from this
+            // process's env. The key must never leak to child processes
+            // regardless of whether keyfile creation succeeds.
+            let mut nostr_key = std::env::var("NOSTR_PRIVATE_KEY").ok();
+            std::env::remove_var("NOSTR_PRIVATE_KEY");
 
-        // Ephemeral git config: write key to 0600 keyfile, derive pubkey, build
-        // GIT_CONFIG_* env vars for nostr auth + signing.
-        let git_env = match nostr_key
-            .as_deref()
-            .and_then(|k| write_keyfile(dir.path(), k))
-        {
-            Some(info) => build_git_env(&info),
-            None => Vec::new(),
+            // Ephemeral git config: write key to 0600 keyfile, derive pubkey,
+            // build GIT_CONFIG_* env vars for Nostr auth + signing.
+            let git_env = match nostr_key
+                .as_deref()
+                .and_then(|key| write_keyfile(dir.path(), key))
+            {
+                Some(info) => build_git_env(&info),
+                None => Vec::new(),
+            };
+            if let Some(ref mut key) = nostr_key {
+                key.zeroize();
+            }
+            git_env
         };
-        if let Some(ref mut k) = nostr_key {
-            k.zeroize();
-        }
 
         Ok(Self {
             _dir: dir,
             path_env,
             git_env,
+            credentials,
         })
+    }
+
+    #[cfg(test)]
+    fn directory(&self) -> &Path {
+        self._dir.path()
     }
 }
 
@@ -356,6 +378,39 @@ pub fn artifact_dir(session_root: &Path) -> PathBuf {
     let p = session_root.join("artifacts");
     let _ = std::fs::create_dir_all(&p);
     p
+}
+
+#[cfg(test)]
+mod broker_tests {
+    use super::Shim;
+    use crate::credentials::ChildCredentials;
+
+    #[test]
+    fn broker_shim_has_no_keyfile_or_nostr_git_configuration() {
+        let shim = Shim::install_with_credentials(ChildCredentials::broker_for_tests(
+            "wss://relay.example.com",
+        ))
+        .expect("broker shim install");
+
+        assert!(
+            shim.git_env.is_empty(),
+            "broker mode must not configure Git"
+        );
+        assert!(!shim.directory().join(".nostr-key").exists());
+
+        let names: Vec<String> = std::fs::read_dir(shim.directory())
+            .expect("shim listing")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.starts_with("git-credential-nostr")
+                    && !name.starts_with("git-sign-nostr")),
+            "raw-key Git helpers must not be exposed in broker mode"
+        );
+    }
 }
 
 #[cfg(test)]

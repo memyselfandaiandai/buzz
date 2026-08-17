@@ -8,6 +8,7 @@ mod handoff;
 mod hints;
 mod llm;
 mod mcp;
+mod memory;
 pub mod types;
 mod wire;
 
@@ -42,6 +43,7 @@ use crate::config::{Config, MAX_SYSTEM_PROMPT_BYTES, PROTOCOL_VERSION};
 use crate::hints::SkillEntry;
 use crate::llm::Llm;
 use crate::mcp::McpRegistry;
+use crate::memory::MemoryProvider;
 use crate::types::{ContentBlock, HistoryItem};
 use crate::wire::{
     classify, goose_session_update, Inbound, InitializeParams, SessionCancelParams,
@@ -52,6 +54,7 @@ use crate::wire::{
 struct App {
     cfg: Config,
     llm: Arc<Llm>,
+    memory: Arc<MemoryProvider>,
     sessions: Mutex<HashMap<String, Session>>,
     /// Cached model catalog for Databricks providers. Populated lazily on the
     /// first successful `session/new` discovery call. Failed discovery is never
@@ -179,10 +182,12 @@ async fn async_main() {
         .init();
     let cfg = Config::from_env().unwrap_or_else(|e| die(e));
     let llm = Arc::new(Llm::new(&cfg).unwrap_or_else(|e| die(e.to_string())));
+    let memory = Arc::new(MemoryProvider::from_config(&cfg.memory).unwrap_or_else(|e| die(e)));
     let max_line = cfg.max_line_bytes;
     let app = Arc::new(App {
         cfg,
         llm,
+        memory,
         sessions: Mutex::new(HashMap::new()),
         models_cache: tokio::sync::OnceCell::new(),
     });
@@ -729,6 +734,7 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
         session_id: &sid,
         system_prompt: &effective_system_prompt,
         llm: &app.llm,
+        memory: &app.memory,
         mcp: &mcp,
         skills: &skills,
         wire: &wire_tx,

@@ -46,3 +46,22 @@ fn probe_codex_acp_version_uses_augmented_path_for_env_shebang_interpreter() {
         "the injected augmented PATH should allow /usr/bin/env to find node"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn probe_codex_acp_version_runs_windows_batch_shim() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let shim_path = temp.path().join("codex-acp.cmd");
+    fs::write(
+        &shim_path,
+        "@echo off\r\necho @agentclientprotocol/codex-acp 1.1.14\r\n",
+    )
+    .expect("write batch shim");
+
+    assert_eq!(
+        probe_codex_acp_version_with_path(&shim_path, None),
+        Some((1, 1, 14)),
+    );
+}

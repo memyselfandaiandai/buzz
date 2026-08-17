@@ -14,7 +14,7 @@ use crate::{
     util::now_iso,
 };
 
-mod path;
+pub(crate) mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
 
@@ -517,7 +517,12 @@ pub fn spawn_agent_child(
         nvm_bin,
     );
 
-    let mut command = std::process::Command::new(&resolved_acp_command);
+    // Custom ACP harnesses may themselves be Windows `.cmd`/`.bat` wrappers
+    // (for example, a BWS-injected launcher). Use the same native command
+    // construction as readiness probes so those wrappers are executable.
+    let mut command = crate::managed_agents::readiness::cli_probe::command_for_binary(
+        &resolved_acp_command,
+    );
     if let Some(home) = super::default_agent_workdir() {
         command.current_dir(home);
     }

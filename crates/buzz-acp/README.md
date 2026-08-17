@@ -119,6 +119,58 @@ All configuration is via environment variables (or CLI flags — every env var h
 
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
 
+### Logging safety
+
+ACP wire logging emits structural metadata by default, not prompt, response, or
+session content. `BUZZ_ACP_LOG_SENSITIVE_CONTENT=true` is an explicit,
+environment-only debug override that can emit bounded plaintext content. Never
+enable it in a shared or production runtime, and treat any logs created while
+it was enabled as sensitive data.
+
+### Observer transcript content
+
+`acp_read` and `acp_write` observer events are structural projections. They do
+not contain prompt/response bodies, workspace paths, MCP commands, arguments or
+environment, session/run identifiers, or ACP error/tool payloads. Do not change
+the Desktop to reconstruct content from these wire events.
+
+Versioned semantic events are the narrow exception for the authenticated
+owner-facing transcript UI:
+
+- `transcript_prompt` v1 contains only `source` (`session/prompt` or
+  `session/steer`) and the exact display-authorized prompt `blocks` after a
+  successful write.
+- `transcript_system_context` v1 contains only `source: session/new` and the
+  effective display-authorized system-context `text` after successful session
+  creation.
+- `transcript_session_update` v1 carries bounded owner-visible agent-message
+  text, or safe activity metadata: opaque SHA-256 message/tool keys,
+  allowlisted tool status, plan completion counts, usage token counts, and
+  command/config counts. Thought content, tool title/kind/arguments/results,
+  plan text, command names, configuration values, and active run IDs are never
+  included. Their UI rows degrade explicitly to `content hidden`/count-only
+  representations.
+- `transcript_permission` v1 is emitted only after a permission response is
+  written and contains only `outcome: approved|denied|cancelled`; request,
+  tool, option, and JSON-RPC identifiers are excluded.
+
+These events intentionally contain conversation content, including persona,
+agent memory, and channel canvas when those are part of the effective prompt.
+They must remain limited to the authenticated owner/observer path and must
+never include `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`, MCP environment, command or
+arguments, cwd, or a raw ACP envelope. The normal observer framing limit still
+applies (65,535 serialized plaintext bytes). Content-bearing ACP semantic
+events are fitted as complete serialized `ObserverEvent` frames before entering
+the in-process observer, so JSON escaping, Unicode/control characters, envelope
+metadata, and block-array overhead count toward the same exact ceiling. Prompt
+fitting may shed earlier context blocks but preserves the final triggering
+user-event block. The existing publisher fit remains the final framing ceiling.
+The in-process replay buffer is bounded to 1,000 events. Published or
+Desktop-archived observer frames may
+outlive that buffer, so operators must treat them as conversation records and
+apply the same access, backup, deletion, and retention controls as message
+history. This exception does not make sensitive-content wire logging safe.
+
 ### Parallel Agents & Heartbeat
 
 | Flag | Env Var | Default | Description |
@@ -260,6 +312,112 @@ Forum event kinds:
 Each channel has at most one prompt in flight. Multiple channels can be processed concurrently when agents > 1.
 
 > **Note:** On startup, the harness replays all unprocessed @mentions since the last run. Expect a burst of activity if there are stale events in the channel.
+
+## Experimental durable scheduler pilot
+
+The `durable-turn-lifecycle` build feature includes an executable local
+scheduler pilot. It remains experimental, off by default, and absent from the
+installed Buzz runtime. A non-empty absolute
+`BUZZ_ACP_LIFECYCLE_SCHEDULER_DB` is mutually exclusive with
+`BUZZ_ACP_LIFECYCLE_SHADOW_DB` and `BUZZ_ACP_LIFECYCLE_AUTHORITATIVE_DB`;
+startup fails if more than one selector is set. With no selector, existing ACP
+behavior is unchanged.
+
+The pilot intentionally accepts only this compatibility envelope:
+
+- `BUZZ_ACP_AGENTS=1`;
+- `BUZZ_ACP_MULTIPLE_EVENT_HANDLING=queue`;
+- `BUZZ_ACP_DEDUP=queue`;
+- `BUZZ_ACP_HEARTBEAT_INTERVAL=0`; and
+- `BUZZ_ACP_LAZY_POOL=false` (or unset).
+
+Startup fails outside that envelope. The lifecycle scheduler—not the in-memory
+`EventQueue`—is the sole pending-work authority. Each signed event remains a
+separate durable turn. Admission commits opaque signed input and dispatch
+metadata together; an idle ACP worker is reserved before one atomic claim
+returns that input. Claims are epoch/execution fenced and distinguish
+`reserved` from `launched`, so restart can safely requeue work that never
+reached ACP while quarantining potentially side-effecting work as
+`hold_uncertain`. A malformed or legacy-fabricated opaque input is cancelled
+once without launch rather than cycling through claims.
+
+The owner and other permitted people enter the `User` lane. A sender enters the
+`Agent` lane only after the existing NIP-OA sibling verification proves the same
+owner; an allowlist match alone is still user work. The `Background` lane is
+reserved for future internal routines in this pilot.
+
+This is not a production switch. For a local canary, build with
+`--features durable-turn-lifecycle`, use a fresh absolute database path, set
+only the scheduler selector plus the five envelope values above, and use an
+isolated relay/channel. Do not change modes in a running process.
+
+For rollback, stop the pilot, inspect its bounded scheduler snapshot, and
+reconcile or explicitly terminalize all active, pending, and `hold_uncertain`
+work. Only then unset `BUZZ_ACP_LIFECYCLE_SCHEDULER_DB` and restart without any
+lifecycle selector. Preserve the pilot database for inspection; never reuse it
+for shadow or queue-authoritative mode. Unsetting the selector does not migrate
+or reconcile scheduler work, and legacy relay replay can duplicate an
+unreconciled turn.
+
+The pilot does not support multiple ACP slots, merged steer/interrupt batches,
+durable heartbeat/background routines, or automatic replay of uncertain work.
+It stores signed input for a fixed 30-day pilot retention derived from the
+signed event timestamp. Production still needs an approved deletion,
+retention, compaction, backup, and at-rest protection policy.
+
+Production readiness also requires an external capability fence across
+cancellation and ACP/provider launch (the SQLite `launched` marker alone is not
+that fence), a relay-validated receipt/final outbox recovery contract, restored
+legacy steer-membership semantics, and a passing full ACP bash-backed suite in
+supported Linux CI.
+
+### Local broker-v1 credential pilot
+
+Legacy mode remains the default and still passes `BUZZ_PRIVATE_KEY` and an
+optional `BUZZ_AUTH_TAG` to the configured MCP server. A default-off local
+pilot removes those long-lived values from ACP and MCP child environments:
+
+```bash
+cargo build -p buzz-acp --features signing-capability-broker
+export BUZZ_CREDENTIAL_MODE=broker-v1
+export BUZZ_ACP_NO_PRESENCE=true
+export BUZZ_ACP_NO_MEMORY=true
+export BUZZ_ACP_MEMORY_PROVIDER=none
+export BUZZ_ACP_HEARTBEAT_INTERVAL=0
+export BUZZ_ACP_MAX_TURNS_PER_SESSION=0
+export BUZZ_ACP_LAZY_POOL=false
+```
+
+The trusted harness still reads `BUZZ_PRIVATE_KEY` and `BUZZ_AUTH_TAG` for
+relay connection and broker signing. After startup channel discovery, it binds
+an ephemeral raw-TCP broker to IPv4 loopback and issues one inactive capability
+per ACP process generation. `session/new` receives only
+`BUZZ_CREDENTIAL_MODE=broker-v1`, the six `BUZZ_CAPABILITY_*`/public/relay
+projection values, and optional public display/Git-origin metadata. Successful
+`session/new` activates the capability; spawn/configuration failure, process
+death, cancellation-driven respawn, or harness shutdown revokes it. Capabilities
+expire within two hours and authorize only identity metadata, the local-v1 Buzz
+message event kinds, and `POST /query` or `POST /events` for startup channels.
+
+This pilot intentionally rotates the whole ACP process instead of creating a
+second session on one capability. Membership changes and owner-requested
+session rotation restart the harness so a new fixed channel scope is derived.
+Standalone `models`, `auth-methods`, and `authenticate` helper processes are
+unsupported in broker mode. Presence, heartbeat routines, core/semantic
+memory, protected media, Git credential helpers, arbitrary shell relay
+credentials, and operations outside the broker-aware Buzz CLI subset remain
+disabled or fail closed.
+
+This is local-v1 validation only: do not enable it for an installed production,
+remote, OCI, or Kubernetes worker. Loopback shares the host trust boundary and
+does not isolate a hostile same-account process. Production still requires
+remote transport authentication/isolation, scheduler-to-launch capability
+fencing, receipt/outbox recovery, approved credential retention/rotation, and
+supported Linux CI. Roll back by stopping the harness, unsetting
+`BUZZ_CREDENTIAL_MODE`, and restarting; there is no fallback within a running
+process. The full threat model, operation inventory, acceptance matrix, and
+remaining gates are recorded in
+[ADR-0003](../../docs/adr/0003-capability-broker-boundary.md).
 
 ## Bring Your Own Harness (BYOH)
 

@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use crate::builtin;
 use crate::config::{
-    pricing_authority, Config, MAX_PROMPT_BYTES, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_RESULT_BYTES,
+    pricing_authority, Config, ToolExposure, MAX_PROMPT_BYTES, MAX_TOOL_CALLS_PER_TURN,
+    MAX_TOOL_RESULT_BYTES,
 };
 use crate::handoff::{ContextRecovery, HandoffOutcome};
 use crate::hints::SkillEntry;
 use crate::llm::Llm;
 use crate::mcp::McpRegistry;
 use crate::mcp::ResultBudget;
+use crate::memory::MemoryProvider;
 
 use crate::types::{
     AgentError, CacheTotalState, ContentBlock, HistoryItem, PricingIdentity, ProviderStop,
@@ -32,6 +35,136 @@ const UNSUPPORTED_IMAGE_TOOL_MESSAGE: &str = "The current model does not support
 /// result because truncation can happen without a tool call (and an unpaired
 /// tool result is invalid on every provider wire format).
 const MAX_TOKENS_RECOVERY_MESSAGE: &str = "Your previous response reached the model's output token limit and was truncated. Any incomplete tool calls were discarded and were not run. Stop prolonged internal reasoning now. Use the available tools immediately: write a script or artifact to a file and run it in small, verifiable steps instead of emitting the entire solution inline. Continue the task concisely from the preserved text.";
+
+/// Tool names are useful for rollout diagnosis but must not turn one trace
+/// event into a second catalog payload.
+const MAX_LOGGED_VISIBLE_TOOL_NAMES: usize = 32;
+
+/// Whether this provider request receives the complete catalog or the narrow
+/// first-request anchor. Dispatch still uses the unmodified `McpRegistry`.
+fn tool_exposure_stage(
+    policy: ToolExposure,
+    is_first_session_prompt: bool,
+    round: u32,
+) -> &'static str {
+    if policy == ToolExposure::Anchored && is_first_session_prompt && round == 0 {
+        "anchored"
+    } else {
+        "full"
+    }
+}
+
+fn is_anchor_tool(name: &str) -> bool {
+    name.ends_with("__shell") || name.ends_with("__read_file")
+}
+
+/// Feed a JSON value to SHA-256 with explicit type and length framing. Object
+/// keys are sorted so the digest is independent of `serde_json::Map` ordering.
+fn hash_canonical_json(hasher: &mut Sha256, value: &serde_json::Value) {
+    fn framed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    match value {
+        serde_json::Value::Null => hasher.update(b"n"),
+        serde_json::Value::Bool(value) => {
+            hasher.update(b"b");
+            hasher.update([u8::from(*value)]);
+        }
+        serde_json::Value::Number(value) => {
+            hasher.update(b"d");
+            framed(hasher, value.to_string().as_bytes());
+        }
+        serde_json::Value::String(value) => {
+            hasher.update(b"s");
+            framed(hasher, value.as_bytes());
+        }
+        serde_json::Value::Array(values) => {
+            hasher.update(b"a");
+            hasher.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                hash_canonical_json(hasher, value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            hasher.update(b"o");
+            hasher.update((values.len() as u64).to_be_bytes());
+            let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for key in keys {
+                framed(hasher, key.as_bytes());
+                if let Some(value) = values.get(key) {
+                    hash_canonical_json(hasher, value);
+                }
+            }
+        }
+    }
+}
+
+/// Stable digest of model-relevant catalog identity. Descriptions are
+/// intentionally excluded: they can be large and are never logged.
+fn tool_catalog_digest(tools: &[crate::types::ToolDef]) -> String {
+    let mut sorted: Vec<&crate::types::ToolDef> = tools.iter().collect();
+    sorted.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"buzz-agent-tool-catalog-v1");
+    hasher.update((sorted.len() as u64).to_be_bytes());
+    for tool in sorted {
+        hasher.update((tool.name.len() as u64).to_be_bytes());
+        hasher.update(tool.name.as_bytes());
+        hash_canonical_json(&mut hasher, &tool.input_schema);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn bounded_visible_tool_names(tools: &[crate::types::ToolDef]) -> (Vec<&str>, usize) {
+    let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    names.sort_unstable();
+    let omitted = names.len().saturating_sub(MAX_LOGGED_VISIBLE_TOOL_NAMES);
+    names.truncate(MAX_LOGGED_VISIBLE_TOOL_NAMES);
+    (names, omitted)
+}
+
+fn apply_tool_exposure(
+    tools: &mut Vec<crate::types::ToolDef>,
+    policy: ToolExposure,
+    is_first_session_prompt: bool,
+    round: u32,
+) {
+    let stage = tool_exposure_stage(policy, is_first_session_prompt, round);
+    let available_count = tools.len();
+    let catalog_digest = tool_catalog_digest(tools);
+    if stage == "anchored" {
+        tools.retain(|tool| is_anchor_tool(&tool.name));
+    }
+    let visible_count = tools.len();
+    let (visible_names, visible_names_omitted) = bounded_visible_tool_names(tools);
+    tracing::info!(
+        target: "buzz_agent::tool_exposure",
+        policy = policy.as_str(),
+        stage,
+        availableCount = available_count,
+        visibleCount = visible_count,
+        "applied model-visible tool exposure policy"
+    );
+    // Exact tool names and the catalog fingerprint expose the agent's
+    // capability inventory. Keep them available for explicitly enabled debug
+    // diagnostics, but do not emit them in the normal INFO stream.
+    tracing::debug!(
+        target: "buzz_agent::tool_exposure",
+        policy = policy.as_str(),
+        stage,
+        availableCount = available_count,
+        visibleCount = visible_count,
+        visibleNames = ?visible_names,
+        visibleNamesTruncated = visible_names_omitted > 0,
+        visibleNamesOmitted = visible_names_omitted,
+        catalogDigest = %catalog_digest,
+        "model-visible tool exposure inventory"
+    );
+}
 
 /// Remove image blocks that the provider has explicitly rejected while keeping
 /// their surrounding tool result (and therefore the tool-call/result pairing)
@@ -141,6 +274,7 @@ pub struct RunCtx<'a> {
     pub session_id: &'a str,
     pub system_prompt: &'a str,
     pub llm: &'a Llm,
+    pub memory: &'a MemoryProvider,
     pub mcp: &'a Arc<McpRegistry>,
     /// Skills discovered at session creation; used by the built-in `load_skill` tool.
     pub skills: &'a [SkillEntry],
@@ -307,9 +441,39 @@ impl RunCtx<'_> {
                 "prompt: exceeds {MAX_PROMPT_BYTES} bytes"
             )));
         }
-        if self.original_task.is_none() {
+        let is_first_session_prompt = self.original_task.is_none();
+        if is_first_session_prompt {
             *self.original_task = Some(user_text.clone());
         }
+        let turn_user_text = user_text.clone();
+        // Recall is turn-scoped and transient: retrieved memories are appended
+        // to the request's system prompt, never to persistent session history.
+        // A provider failure is fail-open so memory cannot disable the agent.
+        let memory_block = if self.memory.auto_recall() {
+            let recalled = tokio::select! {
+                biased;
+                _ = self.cancel.changed() => return Ok(StopReason::Cancelled),
+                result = self.memory.recall(&turn_user_text) => result,
+            };
+            match recalled {
+                Ok(records) => self.memory.prompt_block(&records),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "memory::mem0",
+                        operation = "recall",
+                        error = %error,
+                        "semantic memory recall failed; continuing without memory"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let turn_system_prompt = match memory_block {
+            Some(block) => format!("{}\n\n{}", self.system_prompt, block),
+            None => self.system_prompt.to_owned(),
+        };
         self.history.push(HistoryItem::User(user_text));
 
         // Reset per-turn token accumulators for this prompt.
@@ -378,15 +542,25 @@ impl RunCtx<'_> {
             }
 
             let mut tools = self.mcp.tools();
+            // Native memory tools take precedence over any identically-named
+            // MCP tool so one model-visible name always has one implementation.
+            tools.retain(|tool| !self.memory.is_tool(&tool.name));
+            tools.extend(self.memory.tool_defs());
             // Inject the built-in load_skill tool when skills are available.
             if !self.skills.is_empty() {
                 tools.push(builtin::load_skill_def());
             }
+            apply_tool_exposure(
+                &mut tools,
+                self.cfg.tool_exposure,
+                is_first_session_prompt,
+                round,
+            );
             round = round.saturating_add(1);
             let response_result = tokio::select! {
                 biased;
                 _ = self.cancel.changed() => return Ok(StopReason::Cancelled),
-                r = self.llm.complete(self.cfg, self.system_prompt, self.history, &tools, self.effective_model)
+                r = self.llm.complete(self.cfg, &turn_system_prompt, self.history, &tools, self.effective_model)
                         .instrument(tracing::info_span!("llm", session_id = %self.session_id)) => r,
                 _ = async {
                     // Keepalive ticker: emit a lightweight session update every 30s
@@ -687,6 +861,7 @@ impl RunCtx<'_> {
                         "provider: stop=tool_use but zero tool_calls".into(),
                     ));
                 }
+                let assistant_text = response.text.clone();
                 self.history.push(HistoryItem::Assistant {
                     text: response.text,
                     tool_calls: Vec::new(),
@@ -696,6 +871,8 @@ impl RunCtx<'_> {
                 // Only gate genuine end_turn — don't override max_tokens/refusal.
                 if stop == StopReason::EndTurn {
                     if stop_rejections >= self.cfg.stop_max_rejections {
+                        self.write_memory_turn(&turn_user_text, &assistant_text)
+                            .await;
                         return Ok(stop);
                     }
                     let mut objections = self
@@ -723,6 +900,8 @@ impl RunCtx<'_> {
                         push_hook_outputs_as_tool_results(self.history, "_Stop", &objections);
                         continue;
                     }
+                    self.write_memory_turn(&turn_user_text, &assistant_text)
+                        .await;
                 }
                 return Ok(stop);
             }
@@ -749,6 +928,24 @@ impl RunCtx<'_> {
             if let Some(stop) = self.execute_calls(&calls).await {
                 return Ok(stop);
             }
+        }
+    }
+
+    async fn write_memory_turn(&self, user: &str, assistant: &str) {
+        if !self.memory.auto_write() || assistant.trim().is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .memory
+            .write_turn(self.session_id, user, assistant)
+            .await
+        {
+            tracing::warn!(
+                target: "memory::mem0",
+                operation = "writeback",
+                error = %error,
+                "semantic memory writeback failed; turn completed normally"
+            );
         }
     }
 
@@ -815,6 +1012,32 @@ impl RunCtx<'_> {
                 let mut result = builtin::call_load_skill(&call.arguments, self.skills).await;
                 result.provider_id = call.provider_id.clone();
                 emit_completed(self.wire, self.session_id, call, &result).await;
+                results[idx] = Some(result);
+                continue;
+            }
+
+            // Native semantic-memory tools execute in-process through the
+            // configured provider and never expose credentials to the model.
+            if self.memory.is_tool(&call.name) {
+                emit_in_progress(self.wire, self.session_id, call).await;
+                let mut result = self.memory.call_tool(&call.name, &call.arguments).await;
+                result.provider_id = call.provider_id.clone();
+                if result.is_error {
+                    emit_failed(self.wire, self.session_id, call, "memory operation failed").await;
+                } else {
+                    // The model receives the real result through history, but
+                    // ACP observers receive metadata only. This keeps recalled
+                    // facts out of tracing/telemetry payloads.
+                    let observable = ToolResult {
+                        provider_id: call.provider_id.clone(),
+                        content: vec![ToolResultContent::Text(
+                            "{\"result\":\"memory operation completed\",\"content_redacted\":true}"
+                                .into(),
+                        )],
+                        is_error: false,
+                    };
+                    emit_completed(self.wire, self.session_id, call, &observable).await;
+                }
                 results[idx] = Some(result);
                 continue;
             }
@@ -1248,6 +1471,74 @@ fn map_stop(p: ProviderStop) -> StopReason {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn tool(name: &str, schema: serde_json::Value) -> crate::types::ToolDef {
+        crate::types::ToolDef {
+            name: name.to_owned(),
+            description: "not part of the digest".to_owned(),
+            input_schema: schema,
+        }
+    }
+
+    #[test]
+    fn anchored_exposure_is_first_session_request_only() {
+        assert_eq!(
+            tool_exposure_stage(ToolExposure::Anchored, true, 0),
+            "anchored"
+        );
+        assert_eq!(tool_exposure_stage(ToolExposure::Anchored, true, 1), "full");
+        assert_eq!(
+            tool_exposure_stage(ToolExposure::Anchored, false, 0),
+            "full"
+        );
+        assert_eq!(tool_exposure_stage(ToolExposure::Full, true, 0), "full");
+    }
+
+    #[test]
+    fn anchored_exposure_keeps_only_qualified_shell_and_read_file() {
+        let mut tools = vec![
+            tool("dev__shell", json!({"type":"object"})),
+            tool("dev__read_file", json!({"type":"object"})),
+            tool("dev__write_file", json!({"type":"object"})),
+            tool("shell", json!({"type":"object"})),
+        ];
+        apply_tool_exposure(&mut tools, ToolExposure::Anchored, true, 0);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["dev__shell", "dev__read_file"]);
+    }
+
+    #[test]
+    fn catalog_digest_is_stable_across_tool_and_object_key_order() {
+        let first = vec![
+            tool(
+                "dev__shell",
+                json!({"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}),
+            ),
+            tool("dev__read_file", json!({"required":["path"]})),
+        ];
+        let second = vec![
+            tool("dev__read_file", json!({"required":["path"]})),
+            tool(
+                "dev__shell",
+                json!({"properties":{"a":{"type":"number"},"z":{"type":"string"}},"type":"object"}),
+            ),
+        ];
+        assert_eq!(tool_catalog_digest(&first), tool_catalog_digest(&second));
+    }
+
+    #[test]
+    fn visible_tool_names_trace_field_is_sorted_and_bounded() {
+        let tools: Vec<crate::types::ToolDef> = (0..40)
+            .rev()
+            .map(|index| tool(&format!("dev__tool_{index:02}"), json!({})))
+            .collect();
+        let (names, omitted) = bounded_visible_tool_names(&tools);
+        assert_eq!(names.len(), MAX_LOGGED_VISIBLE_TOOL_NAMES);
+        assert_eq!(omitted, 8);
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(names.first().copied(), Some("dev__tool_00"));
+        assert_eq!(names.last().copied(), Some("dev__tool_31"));
+    }
 
     /// `truncate_history` cannot serve as the context-window fallback: it is
     /// measured in BYTES (`max_history_bytes`, default 16 MiB, a request-body

@@ -51,6 +51,14 @@ pub struct QueuedEvent {
     pub prompt_tag: String,
 }
 
+#[cfg(any(test, feature = "durable-turn-lifecycle"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAdmissionStatus {
+    Accept,
+    WouldDropInFlight,
+    AtCapacity,
+}
+
 /// A single event inside a [`FlushBatch`].
 #[derive(Debug, Clone)]
 pub struct BatchEvent {
@@ -249,6 +257,30 @@ impl EventQueue {
         }
         queue.push_back(event);
         true
+    }
+
+    /// Read-only admission check for a durable pre-queue authority.
+    ///
+    /// The main reactor is the sole queue mutator, so an authoritative caller
+    /// can check this immediately before committing admission and then call
+    /// `push` without an intervening queue mutation. This prevents the legacy
+    /// eviction/drop behavior from silently discarding a durably accepted turn.
+    #[cfg(any(test, feature = "durable-turn-lifecycle"))]
+    pub fn admission_status(&self, channel_id: Uuid) -> QueueAdmissionStatus {
+        if matches!(self.dedup_mode, DedupMode::Drop)
+            && self.in_flight_channels.contains(&channel_id)
+        {
+            return QueueAdmissionStatus::WouldDropInFlight;
+        }
+        if self
+            .queues
+            .get(&channel_id)
+            .is_some_and(|queue| queue.len() >= MAX_PENDING_PER_CHANNEL)
+        {
+            QueueAdmissionStatus::AtCapacity
+        } else {
+            QueueAdmissionStatus::Accept
+        }
     }
 
     /// Try to flush the next batch.
@@ -495,6 +527,18 @@ impl EventQueue {
         }
         self.retry_after.insert(channel_id, Instant::now() + delay);
         None
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    pub fn retry_schedule(&self, channel_id: Uuid) -> (u32, Duration) {
+        let retry_count = self.retry_counts.get(&channel_id).copied().unwrap_or(0);
+        let delay = self
+            .retry_after
+            .get(&channel_id)
+            .map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+        (retry_count, delay)
     }
 
     /// Re-queue a batch preserving original `received_at` timestamps.
@@ -1834,6 +1878,32 @@ mod tests {
 
     fn any_in_flight(q: &EventQueue) -> bool {
         !q.in_flight_channels.is_empty()
+    }
+
+    #[test]
+    fn durable_admission_status_exposes_drop_and_capacity_before_mutation() {
+        let channel_id = Uuid::new_v4();
+        let mut drop_queue = EventQueue::new(DedupMode::Drop);
+        assert_eq!(
+            drop_queue.admission_status(channel_id),
+            QueueAdmissionStatus::Accept
+        );
+        assert!(drop_queue.push(make_queued(channel_id, "first")));
+        let _in_flight = drop_queue.flush_next().expect("first batch");
+        assert_eq!(
+            drop_queue.admission_status(channel_id),
+            QueueAdmissionStatus::WouldDropInFlight
+        );
+
+        let mut full_queue = EventQueue::new(DedupMode::Queue);
+        for index in 0..MAX_PENDING_PER_CHANNEL {
+            assert!(full_queue.push(make_queued(channel_id, &format!("event-{index}"))));
+        }
+        assert_eq!(
+            full_queue.admission_status(channel_id),
+            QueueAdmissionStatus::AtCapacity
+        );
+        assert_eq!(pending_count(&full_queue), MAX_PENDING_PER_CHANNEL);
     }
 
     #[test]

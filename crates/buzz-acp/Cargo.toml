@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "ACP harness that bridges Buzz events to AI agents"
 
+[features]
+default = []
+durable-turn-lifecycle = ["dep:buzz-lifecycle"]
+signing-capability-broker = ["dep:buzz-signing-capability"]
+
 [lib]
 name = "buzz_acp"
 path = "src/lib.rs"
@@ -20,6 +25,8 @@ path = "src/main.rs"
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
+buzz-lifecycle = { workspace = true, optional = true }
+buzz-signing-capability = { workspace = true, optional = true }
 
 # Nostr
 nostr = { workspace = true }
@@ -61,6 +68,7 @@ tracing-subscriber = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+zeroize = { workspace = true }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -79,3 +87,6 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
+axum = { workspace = true }
+tempfile = "3"
+rusqlite = { version = "=0.39.0", features = ["bundled"] }

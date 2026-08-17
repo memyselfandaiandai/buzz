@@ -39,7 +39,7 @@ pub async fn cmd_get_users(
         return Err(CliError::Usage("--pubkey: maximum 200 pubkeys".into()));
     }
 
-    let my_pk = client.keys().public_key().to_hex();
+    let my_pk = client.public_key().to_hex();
     let authors: Vec<&str> = if pubkeys.is_empty() {
         vec![my_pk.as_str()]
     } else {
@@ -87,7 +87,7 @@ pub async fn cmd_get_users(
 fn effective_owner(client: &BuzzClient) -> String {
     client
         .auth_tag_owner_hex()
-        .unwrap_or_else(|| client.keys().public_key().to_hex())
+        .unwrap_or_else(|| client.public_key().to_hex())
 }
 
 fn resolve_owner(client: &BuzzClient, owner: Option<&str>) -> Result<Option<String>, CliError> {
@@ -415,7 +415,7 @@ pub async fn cmd_set_profile(
     )
     .map_err(|e| CliError::Other(format!("build_profile failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
 
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
@@ -427,7 +427,7 @@ pub async fn cmd_set_profile(
 async fn fetch_current_profile(
     client: &BuzzClient,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CliError> {
-    let my_pk = client.keys().public_key().to_hex();
+    let my_pk = client.public_key().to_hex();
     let filter = serde_json::json!({
         "kinds": [0],
         "authors": [my_pk],
@@ -506,7 +506,7 @@ fn presence_subject(event: &serde_json::Value) -> &str {
 /// publishes the event directly — bypassing the HTTP bridge.
 pub async fn cmd_set_presence(client: &BuzzClient, status: &str) -> Result<(), CliError> {
     let builder = buzz_sdk::build_presence_update(status).map_err(crate::validate::sdk_err)?;
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
 
     let resp = client.publish_ephemeral_event(event).await?;
     println!("{}", normalize_write_response(&resp));
@@ -523,7 +523,7 @@ pub async fn cmd_set_status(
     emoji: Option<&str>,
 ) -> Result<(), CliError> {
     let builder = buzz_sdk::build_user_status(text, emoji).map_err(crate::validate::sdk_err)?;
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())

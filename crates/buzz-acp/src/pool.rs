@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -45,6 +46,19 @@ use crate::relay::{ChannelInfo, RestClient};
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum retained assistant text for the experimental harness-owned final
+/// reply path. It matches the stream-message content ceiling, while retaining
+/// the existing digest for all modes.
+pub const MAX_VISIBLE_FINAL_TEXT_BYTES: usize = 64 * 1024;
+
+const HARNESS_OWNED_FINAL_REPLY_INSTRUCTION: &str = "\
+[Harness-owned final reply]\n\
+For a direct response to a person, put the complete user-facing answer in your final \
+assistant response. The harness captures that final response for later durable delivery; \
+do not send a duplicate `buzz messages send` for that final reply. Continue to use Buzz \
+tools for intentional additional messages or actions. Do not put private reasoning in the \
+final response.";
 
 // FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
 // a recoverable copy in TaskMeta for panic recovery in Queue mode.
@@ -77,6 +91,21 @@ pub struct TaskMeta {
     /// live session. The session ID prevents a late ack from contaminating a
     /// replacement session after task return.
     pub successful_steer_deliveries: HashSet<SuccessfulSteerDelivery>,
+    /// Fenced durable scheduler identity for this provider task.
+    ///
+    /// `None` for legacy queue and heartbeat tasks. Scheduler tasks install
+    /// this only after the claim has advanced from reserved to launched.
+    #[cfg(feature = "durable-turn-lifecycle")]
+    pub scheduler_claim: Option<SchedulerTaskClaim>,
+}
+
+/// Scheduler claim metadata retained until result or panic settlement.
+#[cfg(feature = "durable-turn-lifecycle")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchedulerTaskClaim {
+    pub identity: buzz_lifecycle::RunClaimIdentity,
+    pub dispatch: buzz_lifecycle::DispatchIntent,
+    pub phase: buzz_lifecycle::RunClaimPhase,
 }
 
 /// Agent-level model capabilities. Populated on first session creation.
@@ -278,9 +307,27 @@ pub struct PromptResult {
     pub source: PromptSource,
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
+    /// Signed input event IDs that triggered this attempt. Preserved on both
+    /// success and failure so durable lifecycle reporting never has to infer
+    /// identity from mutable queue state.
+    pub triggering_event_ids: Vec<String>,
+    /// SHA-256 digest of the visible assistant output for successful channel
+    /// turns. `None` for failures, heartbeats, and synthetic test results.
+    pub result_digest: Option<String>,
+    /// Bounded user-facing assistant text captured only when experimental
+    /// harness-owned final delivery is enabled. No relay publication occurs in
+    /// this layer.
+    pub visible_final_text: Option<String>,
     pub outcome: PromptOutcome,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
+}
+
+struct PromptResultIdentity {
+    turn_id: String,
+    triggering_event_ids: Vec<String>,
+    result_digest: Option<String>,
+    visible_final_text: Option<String>,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -387,10 +434,9 @@ pub struct SteerRequest {
 /// Why a mid-turn steer failed, on either transport
 /// (`_goose/unstable/session/steer` or `_session/steering`).
 ///
-/// String and integer fields are intentionally `Debug`-only — read by
-/// `tracing` macros in the main loop's `PoolEvent::SteerAck` arm via
-/// `?ack`. The dead-code lint can't see that path because it doesn't
-/// trace through `Debug` derives, hence the `#[allow]`.
+/// Agent-controlled messages and outcomes are deliberately excluded. This
+/// value crosses task boundaries and may be structurally logged by the main
+/// loop, so it carries only the stable classification needed for control flow.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum SteerError {
@@ -404,10 +450,10 @@ pub enum SteerError {
     ///   application level (e.g. wrong run id). Release the withheld event
     ///   for normal dispatch; do NOT fire the fallback — the turn is still
     ///   running or just ended.
-    AgentError { code: i64, message: String },
+    AgentError { code: i64 },
     /// Transport-level failure: write error, read EOF, JSON-RPC framing
-    /// violation, etc. The string carries the underlying `AcpError`'s display.
-    Transport(String),
+    /// violation, etc. Details remain internal to the originating task.
+    Transport,
     /// At steer-write time neither steer transport was available: no
     /// `expectedRunId` (`AcpClient::active_run_id` was `None`, so the
     /// goose-native method could not be formed) and the agent did not
@@ -421,15 +467,15 @@ pub enum SteerError {
     /// A `_session/steering` request returned a JSON-RPC *success* whose
     /// `outcome` was not one of the two recognized delivery outcomes
     /// (`injected`, `startedNewTurn`) — including `failed` (codex-acp) and a
-    /// missing `outcome` entirely. `outcome` carries what the agent actually
-    /// reported, for logs.
+    /// missing `outcome` entirely. The raw agent-controlled value is not
+    /// retained in this cross-task result.
     ///
     /// The steer did NOT land, so the main loop must release the withheld
     /// event and fire the cancel+merge fallback — exactly like a write that
     /// never happened. Treating an unrecognized success as delivery would
     /// drop the user's message: codex-acp answers unrecognized extension
     /// methods with a bare `{}` success rather than `-32601`.
-    OutcomeRejected { outcome: String },
+    OutcomeRejected,
     /// The read loop never got to dispatch the steer because the prompt
     /// completed first. Delivery state for the underlying message is
     /// unknown after prompt completion — the main loop must treat this as
@@ -564,6 +610,10 @@ pub struct PromptContext {
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
+    /// Capture bounded ACP assistant text on successful channel turns for
+    /// experimental, default-off durable harness-owned delivery. Capture alone
+    /// does not publish; durable authority and its outbox must also be enabled.
+    pub capture_visible_final: bool,
     /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
     /// on `session/new`. Never part of the prompt.
     pub session_title: Option<String>,
@@ -599,6 +649,9 @@ pub struct PromptContext {
     /// `[Agent Memory — core]` section. On by default; disabled via
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY`.
     pub memory_enabled: bool,
+    /// Turn-scoped semantic recall and successful-turn writeback for external
+    /// ACP adapters. Disabled unless `BUZZ_ACP_MEMORY_PROVIDER=mem0`.
+    pub semantic_memory: crate::memory::MemoryProvider,
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
@@ -606,6 +659,45 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+}
+
+/// Append the mode-specific instruction without changing legacy prompts when
+/// harness-owned final capture is disabled.
+pub(crate) fn with_harness_owned_final_reply_instruction(
+    system_prompt: Option<String>,
+    enabled: bool,
+) -> Option<String> {
+    if !enabled {
+        return system_prompt;
+    }
+    Some(match system_prompt {
+        Some(prompt) if !prompt.trim().is_empty() => {
+            format!("{prompt}\n\n{HARNESS_OWNED_FINAL_REPLY_INSTRUCTION}")
+        }
+        _ => HARNESS_OWNED_FINAL_REPLY_INSTRUCTION.to_string(),
+    })
+}
+
+fn capture_visible_final_text(enabled: bool, assistant_text: &str) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+
+    let trimmed = assistant_text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.len() <= MAX_VISIBLE_FINAL_TEXT_BYTES {
+        return Some(trimmed.to_string());
+    }
+
+    let boundary = trimmed
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_VISIBLE_FINAL_TEXT_BYTES)
+        .last()
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    Some(trimmed[..boundary].to_string())
 }
 
 impl AgentPool {
@@ -703,7 +795,7 @@ impl AgentPool {
     ///
     /// Returns `Ok(())` if the request was accepted by the read loop's
     /// receiver (capacity-1 mpsc; one slot is the single in-flight steer
-    /// write). Returns `Err(SteerError::Transport(_))` on `Full`/`Closed`
+    /// write). Returns `Err(SteerError::Transport)` on `Full`/`Closed`
     /// (already-in-flight write, or read loop torn down). Callers must
     /// fall back to the universal `ControlSignal::Steer` cancel+merge path
     /// on `Err`.
@@ -730,12 +822,8 @@ impl AgentPool {
             .values_mut()
             .find(|m| m.channel_id == Some(channel_id))
             .ok_or(SteerError::PromptCompleted)?;
-        let tx = meta
-            .steer_tx
-            .as_ref()
-            .ok_or_else(|| SteerError::Transport("steer_tx not installed".into()))?;
-        tx.try_send(request)
-            .map_err(|e| SteerError::Transport(e.to_string()))
+        let tx = meta.steer_tx.as_ref().ok_or(SteerError::Transport)?;
+        tx.try_send(request).map_err(|_| SteerError::Transport)
     }
 
     /// Durably associate a successful steer with the exact ACP session that
@@ -997,27 +1085,51 @@ async fn create_session_and_apply_model(
         .session_title
         .as_deref()
         .map(|agent_name| compose_session_title(agent_name, channel.name));
-    let mcp_servers = mcp_servers_with_git_origin(
+    let mut mcp_servers = mcp_servers_with_git_origin(
         &ctx.mcp_servers,
         channel.id,
         channel.channel_type,
         ctx.session_title.as_deref(),
     );
+    agent.acp.apply_process_capability_to_mcp(&mut mcp_servers);
 
-    let resp = agent
+    let session_system_prompt = session_new_system_prompt(
+        is_goose,
+        agent.protocol_version,
+        &agent.agent_name,
+        combined_system_prompt.as_deref(),
+    );
+    let system_context_was_sent = session_system_prompt.is_some();
+    agent.acp.prepare_process_session()?;
+    let resp = match agent
         .acp
         .session_new_full(
             &ctx.cwd,
             mcp_servers,
-            session_new_system_prompt(
-                is_goose,
-                agent.protocol_version,
-                &agent.agent_name,
-                combined_system_prompt.as_deref(),
-            ),
+            session_system_prompt,
             session_title.as_deref(),
         )
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            agent.acp.revoke_process_capability();
+            return Err(error);
+        }
+    };
+    agent.acp.activate_process_capability()?;
+
+    // Raw ACP wire observations are deliberately structural projections. Emit
+    // the display-authorized system context through a narrow semantic event so
+    // the desktop never has to recover content from `session/new` (which also
+    // carries cwd, MCP commands/environment, and other sensitive wire fields).
+    // Emit only after session creation succeeds, and only when this adapter
+    // actually received the context through the standard session/new path.
+    if system_context_was_sent {
+        if let Some(text) = combined_system_prompt.as_deref() {
+            agent.acp.observe_transcript_system_context(text);
+        }
+    }
 
     if is_goose && agent.goose_system_prompt_supported != Some(false) {
         if let Some(prompt) = combined_system_prompt.as_deref() {
@@ -1188,17 +1300,25 @@ async fn apply_model_switch(
         | Ok(Err(e @ AcpError::Timeout(_)))
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
+            let safe = crate::safe_acp_error(&e);
             tracing::error!(
                 target: "pool::model",
-                "fatal error setting model {desired} via {method_label}: {e}"
+                errorKind = safe.kind,
+                errorCode = ?safe.code,
+                "fatal error setting model {desired} via {method_label}: {}",
+                safe.operator_copy,
             );
             return Err(e);
         }
         // Application-level errors (Json, etc.) — agent is fine, just uses default model.
         Ok(Err(e)) => {
+            let safe = crate::safe_acp_error(&e);
             tracing::warn!(
                 target: "pool::model",
-                "failed to set model {desired} via {method_label}: {e} — proceeding with agent default"
+                errorKind = safe.kind,
+                errorCode = ?safe.code,
+                "failed to set model {desired} via {method_label}: {} — proceeding with agent default",
+                safe.operator_copy,
             );
         }
         Err(_) => {
@@ -1264,17 +1384,25 @@ async fn apply_permission_mode(
         | Ok(Err(e @ AcpError::Timeout(_)))
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
+            let safe = crate::safe_acp_error(&e);
             tracing::error!(
                 target: "pool::permission",
-                "fatal error setting permission mode {wire:?}: {e}"
+                errorKind = safe.kind,
+                errorCode = ?safe.code,
+                "fatal error setting permission mode {wire:?}: {}",
+                safe.operator_copy,
             );
             return Err(e);
         }
         // Application-level errors — agent is fine, just uses default permission mode.
         Ok(Err(e)) => {
+            let safe = crate::safe_acp_error(&e);
             tracing::warn!(
                 target: "pool::permission",
-                "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
+                errorKind = safe.kind,
+                errorCode = ?safe.code,
+                "failed to set permission mode {wire:?}: {} — falling back to per-tool auto-approval",
+                safe.operator_copy,
             );
         }
         Err(_) => {
@@ -1447,8 +1575,43 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
 fn send_prompt_result(
     result_tx: &mpsc::UnboundedSender<PromptResult>,
     turn_id: &str,
+    agent: OwnedAgent,
+    source: PromptSource,
+    outcome: PromptOutcome,
+    batch: Option<FlushBatch>,
+) {
+    let result_digest = digest_attempt_outcome(&outcome);
+    let triggering_event_ids = batch
+        .as_ref()
+        .map(|batch| {
+            batch
+                .events
+                .iter()
+                .chain(batch.cancelled_events.iter())
+                .map(|event| event.event.id.to_hex())
+                .collect()
+        })
+        .unwrap_or_default();
+    send_prompt_result_with_identity(
+        result_tx,
+        agent,
+        source,
+        PromptResultIdentity {
+            turn_id: turn_id.to_owned(),
+            triggering_event_ids,
+            result_digest,
+            visible_final_text: None,
+        },
+        outcome,
+        batch,
+    );
+}
+
+fn send_prompt_result_with_identity(
+    result_tx: &mpsc::UnboundedSender<PromptResult>,
     mut agent: OwnedAgent,
     source: PromptSource,
+    identity: PromptResultIdentity,
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
@@ -1456,7 +1619,10 @@ fn send_prompt_result(
     let _ = result_tx.send(PromptResult {
         agent,
         source,
-        turn_id: turn_id.to_owned(),
+        turn_id: identity.turn_id,
+        triggering_event_ids: identity.triggering_event_ids,
+        result_digest: identity.result_digest,
+        visible_final_text: identity.visible_final_text,
         outcome,
         batch,
     });
@@ -1953,9 +2119,13 @@ pub async fn run_prompt_task(
                             return;
                         }
                         Err(e) => {
+                            let safe = crate::safe_acp_error(&e);
                             tracing::error!(
                                 target: "pool::session",
-                                "cancel_with_cleanup failed during initial_message timeout: {e}"
+                                errorKind = safe.kind,
+                                errorCode = ?safe.code,
+                                "cancel_with_cleanup failed during initial_message timeout: {}",
+                                safe.operator_copy,
                             );
                             agent.state.invalidate(&source);
                         }
@@ -1989,9 +2159,13 @@ pub async fn run_prompt_task(
                     return;
                 }
                 Err(e) => {
+                    let safe = crate::safe_acp_error(&e);
                     tracing::error!(
                         target: "pool::session",
-                        "initial_message failed for channel {cid}: {e} — invalidating session"
+                        errorKind = safe.kind,
+                        errorCode = ?safe.code,
+                        "initial_message failed for channel {cid}: {} — invalidating session",
+                        safe.operator_copy,
                     );
                     agent.state.invalidate(&source);
                     send_prompt_result(
@@ -2017,7 +2191,7 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let mut prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
@@ -2126,6 +2300,21 @@ pub async fn run_prompt_task(
         );
         return;
     };
+
+    // Recall is transient and turn-scoped. Query with the actual user-facing
+    // prompt, then add retrieved data as its own ACP content block. Provider
+    // failures never prevent the downstream agent from running.
+    let memory_user_text = prompt_sections.join("\n\n");
+    match ctx.semantic_memory.recall_block(&memory_user_text).await {
+        Ok(Some(block)) => prompt_sections.push(block),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            target: "memory::mem0",
+            operation = "recall",
+            error = %error,
+            "ACP semantic memory recall failed; continuing without memory"
+        ),
+    }
 
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
@@ -2335,6 +2524,22 @@ pub async fn run_prompt_task(
                             &control_signal,
                         );
                         let usage = agent.acp.take_turn_usage();
+                        let assistant_text = agent.acp.take_turn_agent_message();
+                        write_semantic_memory(
+                            &ctx,
+                            &source,
+                            &session_id,
+                            &memory_user_text,
+                            &assistant_text,
+                        )
+                        .await;
+                        let visible_final_text = capture_visible_final_text(
+                            ctx.capture_visible_final,
+                            &assistant_text,
+                        );
+                        let result_digest = digest_visible_output(
+                            visible_final_text.as_deref().unwrap_or(&assistant_text),
+                        );
                         publish_agent_turn_metric(
                             &ctx,
                             usage,
@@ -2344,11 +2549,16 @@ pub async fn run_prompt_task(
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
                         )
                         .await;
-                        send_prompt_result(
+                        send_prompt_result_with_identity(
                             &result_tx,
-                            &turn_id,
                             agent,
                             source,
+                            PromptResultIdentity {
+                                turn_id,
+                                triggering_event_ids,
+                                result_digest: Some(result_digest),
+                                visible_final_text,
+                            },
                             PromptOutcome::Ok(StopReason::EndTurn),
                             None, // turn succeeded — batch was processed, no requeue
                         );
@@ -2362,6 +2572,22 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            let assistant_text = agent.acp.take_turn_agent_message();
+            if !matches!(stop_reason, StopReason::Cancelled | StopReason::Refusal) {
+                write_semantic_memory(
+                    &ctx,
+                    &source,
+                    &session_id,
+                    &memory_user_text,
+                    &assistant_text,
+                )
+                .await;
+            }
+            let visible_final_text =
+                capture_visible_final_text(ctx.capture_visible_final, &assistant_text);
+            let result_digest =
+                digest_visible_output(visible_final_text.as_deref().unwrap_or(&assistant_text));
 
             if let PromptSource::Channel(cid) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -2418,11 +2644,16 @@ pub async fn run_prompt_task(
             )
             .await;
 
-            send_prompt_result(
+            send_prompt_result_with_identity(
                 &result_tx,
-                &turn_id,
                 agent,
                 source,
+                PromptResultIdentity {
+                    turn_id,
+                    triggering_event_ids,
+                    result_digest: Some(result_digest),
+                    visible_final_text,
+                },
                 PromptOutcome::Ok(stop_reason),
                 None,
             );
@@ -2510,9 +2741,13 @@ pub async fn run_prompt_task(
                     );
                 }
                 Err(e) => {
+                    let safe = crate::safe_acp_error(&e);
                     tracing::error!(
                         target: "pool::prompt",
-                        "cancel_with_cleanup error: {e} — invalidating session"
+                        errorKind = safe.kind,
+                        errorCode = ?safe.code,
+                        "cancel_with_cleanup error: {} — invalidating session",
+                        safe.operator_copy,
                     );
                     agent.state.invalidate(&source);
                     let usage = agent.acp.take_turn_usage();
@@ -2564,7 +2799,14 @@ pub async fn run_prompt_task(
             );
         }
         Err(e) => {
-            tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
+            let safe = crate::safe_acp_error(&e);
+            tracing::error!(
+                target: "pool::prompt",
+                errorKind = safe.kind,
+                errorCode = ?safe.code,
+                "session_prompt error: {}",
+                safe.operator_copy,
+            );
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
@@ -2592,6 +2834,64 @@ pub async fn run_prompt_task(
         }
     }
     // _reaction_guard drops here → spawns clear_reactions for all exit paths.
+}
+
+async fn write_semantic_memory(
+    ctx: &PromptContext,
+    source: &PromptSource,
+    session_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+) {
+    let channel_id = match source {
+        PromptSource::Channel(channel_id) => Some(channel_id.to_string()),
+        PromptSource::Heartbeat => None,
+    };
+    if let Err(error) = ctx
+        .semantic_memory
+        .write_turn(
+            session_id,
+            &ctx.harness_name,
+            channel_id.as_deref(),
+            user_text,
+            assistant_text,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "memory::mem0",
+            operation = "writeback",
+            error = %error,
+            "ACP semantic memory writeback failed; turn remains successful"
+        );
+    }
+}
+
+fn digest_visible_output(assistant_text: &str) -> String {
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(assistant_text.as_bytes()))
+    )
+}
+
+pub(crate) fn digest_attempt_outcome(outcome: &PromptOutcome) -> Option<String> {
+    let material = match outcome {
+        PromptOutcome::Ok(_) => return None,
+        PromptOutcome::Error(error) => {
+            let safe = crate::safe_acp_error(error);
+            format!("error:{}:code={:?}", safe.kind, safe.code)
+        }
+        PromptOutcome::AgentExited => "agent_exited".to_owned(),
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout".to_owned(),
+        PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }) => {
+            format!("hard_timeout:recently_active={recently_active}")
+        }
+        PromptOutcome::Cancelled => "cancelled".to_owned(),
+        PromptOutcome::CancelDrainTimeout(grace) => {
+            format!("cancel_drain_timeout_ms={}", grace.as_millis())
+        }
+    };
+    Some(digest_visible_output(&material))
 }
 
 /// Retry wrapper for context fetches: one retry with `CONTEXT_FETCH_RETRY_DELAY`
@@ -4409,6 +4709,23 @@ mod tests {
             args: vec![],
             env: vec![],
         }
+    }
+
+    #[test]
+    fn visible_output_digest_is_stable_and_content_bound() {
+        assert_eq!(
+            digest_visible_output("hello"),
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_ne!(
+            digest_visible_output("hello"),
+            digest_visible_output("hello!")
+        );
+        assert_eq!(
+            digest_attempt_outcome(&PromptOutcome::AgentExited),
+            Some(digest_visible_output("agent_exited"))
+        );
+        assert!(digest_attempt_outcome(&PromptOutcome::Ok(StopReason::EndTurn)).is_none());
     }
 
     #[test]
@@ -7572,6 +7889,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
+            capture_visible_final: false,
             session_title: None,
             team_instructions: None,
             heartbeat_prompt: None,
@@ -7598,9 +7916,43 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,
+            semantic_memory: crate::memory::MemoryProvider::disabled(),
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }
+    }
+
+    #[test]
+    fn visible_final_capture_is_default_off_and_bounded() {
+        assert_eq!(capture_visible_final_text(false, "visible"), None);
+        assert_eq!(
+            capture_visible_final_text(true, "  visible  "),
+            Some("visible".into())
+        );
+        assert_eq!(capture_visible_final_text(true, " \n\t "), None);
+
+        let oversized = format!("{}é", "x".repeat(MAX_VISIBLE_FINAL_TEXT_BYTES));
+        let captured = capture_visible_final_text(true, &oversized).expect("captured text");
+        assert_eq!(captured.len(), MAX_VISIBLE_FINAL_TEXT_BYTES);
+        assert!(captured.is_char_boundary(captured.len()));
+        assert!(captured.chars().all(|character| character == 'x'));
+    }
+
+    #[test]
+    fn harness_owned_final_instruction_only_changes_enabled_prompts() {
+        assert_eq!(
+            with_harness_owned_final_reply_instruction(Some("persona".into()), false),
+            Some("persona".into())
+        );
+
+        let enabled = with_harness_owned_final_reply_instruction(Some("persona".into()), true)
+            .expect("enabled prompt");
+        assert!(enabled.starts_with("persona\n\n[Harness-owned final reply]"));
+        assert!(enabled.contains("do not send a duplicate `buzz messages send`"));
+
+        let standalone =
+            with_harness_owned_final_reply_instruction(None, true).expect("standalone instruction");
+        assert!(standalone.starts_with("[Harness-owned final reply]"));
     }
 
     // ── huddle instructions ─────────────────────────────────────────────────

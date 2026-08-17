@@ -1,0 +1,120 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "Namespace",
+      "metadata": {
+        "name": "__NAMESPACE__",
+        "annotations": {
+          "buzz.final-form/agent-id": "__AGENT_ID__",
+          "buzz.final-form/expires-at": "__EXPIRES_AT__"
+        },
+        "labels": {
+          "buzz.final-form/managed": "true",
+          "buzz.final-form/session-id": "__SESSION_ID__",
+          "pod-security.kubernetes.io/enforce": "restricted",
+          "pod-security.kubernetes.io/enforce-version": "latest",
+          "pod-security.kubernetes.io/audit": "restricted",
+          "pod-security.kubernetes.io/warn": "restricted"
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "ServiceAccount",
+      "metadata": {"name": "desktop-worker", "namespace": "__NAMESPACE__"},
+      "automountServiceAccountToken": false
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "Role",
+      "metadata": {"name": "buzz-provider", "namespace": "__NAMESPACE__"},
+      "rules": [
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list"]},
+        {"apiGroups": [""], "resources": ["pods/status"], "verbs": ["get"]},
+        {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete", "get", "list"]}
+      ]
+    },
+    {
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "kind": "RoleBinding",
+      "metadata": {"name": "buzz-provider", "namespace": "__NAMESPACE__"},
+      "subjects": [{"kind": "User", "apiGroup": "rbac.authorization.k8s.io", "name": "__PROVIDER_USER__"}],
+      "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "buzz-provider"}
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {"name": "workspace", "namespace": "__NAMESPACE__"},
+      "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "20Gi"}}}
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {"name": "default-deny", "namespace": "__NAMESPACE__"},
+      "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {"name": "desktop-egress", "namespace": "__NAMESPACE__"},
+      "spec": {
+        "podSelector": {"matchLabels": {"app.kubernetes.io/name": "buzz-desktop"}},
+        "policyTypes": ["Egress"],
+        "egress": [
+          {"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}}}], "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+          {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": ["10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"]}}], "ports": [{"protocol": "TCP", "port": 443}]}
+        ]
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {"name": "desktop", "namespace": "__NAMESPACE__", "labels": {"buzz.final-form/session-id": "__SESSION_ID__"}},
+      "spec": {
+        "backoffLimit": 0,
+        "activeDeadlineSeconds": 7200,
+        "ttlSecondsAfterFinished": 600,
+        "template": {
+          "metadata": {"labels": {"app.kubernetes.io/name": "buzz-desktop", "buzz.final-form/session-id": "__SESSION_ID__"}},
+          "spec": {
+            "serviceAccountName": "desktop-worker",
+            "automountServiceAccountToken": false,
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 60,
+            "securityContext": {"runAsNonRoot": true, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001, "seccompProfile": {"type": "RuntimeDefault"}},
+            "containers": [{
+              "name": "desktop",
+              "image": "__DESKTOP_IMAGE__",
+              "imagePullPolicy": "IfNotPresent",
+              "securityContext": {"allowPrivilegeEscalation": false, "privileged": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL", "NET_RAW"]}},
+              "resources": {"requests": {"cpu": "500m", "memory": "2Gi"}, "limits": {"cpu": "1", "memory": "5Gi"}},
+              "env": [
+                {"name": "DISPLAY", "value": ":99"},
+                {"name": "VNC_LISTEN", "value": "127.0.0.1"},
+                {"name": "NOVNC_LISTEN", "value": "127.0.0.1"},
+                {"name": "BUZZ_EXECUTION_CAPABILITY", "value": "/run/buzz-capability/capability.json"}
+              ],
+              "readinessProbe": {"exec": {"command": ["/usr/local/bin/desktop-healthcheck"]}, "initialDelaySeconds": 10, "periodSeconds": 5, "timeoutSeconds": 2, "failureThreshold": 12},
+              "livenessProbe": {"exec": {"command": ["/usr/local/bin/desktop-healthcheck"]}, "initialDelaySeconds": 30, "periodSeconds": 15, "timeoutSeconds": 2, "failureThreshold": 4},
+              "volumeMounts": [
+                {"name": "workspace", "mountPath": "/home/agent"},
+                {"name": "tmp", "mountPath": "/tmp"},
+                {"name": "run", "mountPath": "/run"},
+                {"name": "capability", "mountPath": "/run/buzz-capability", "readOnly": true}
+              ]
+            }],
+            "volumes": [
+              {"name": "workspace", "persistentVolumeClaim": {"claimName": "workspace"}},
+              {"name": "tmp", "emptyDir": {"sizeLimit": "1Gi"}},
+              {"name": "run", "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"}},
+              {"name": "capability", "secret": {"secretName": "buzz-execution-capability", "optional": false, "defaultMode": 256}}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

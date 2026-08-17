@@ -1,0 +1,30 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - ca-certificates
+  - curl
+  - jq
+  - uidmap
+write_files:
+  - path: /etc/buzz-execution-plane
+    owner: root:root
+    permissions: '0444'
+    content: |
+      authority=${authority}
+      role=disposable-graphical-worker
+      authoritative_state=false
+  - path: /etc/ssh/sshd_config.d/90-buzz-recovery.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+runcmd:
+  - [systemctl, restart, ssh]
+  - [sh, -c, "install -d -m 0755 /opt/buzz-preprovision && printf '%s\\n' 'k3s and Tailscale enrollment remain explicit post-capacity gates' > /opt/buzz-preprovision/README"]
+
+# Deliberately absent: Tailscale auth keys, provider credentials, Hermes or
+# Mem0 configuration, Kubernetes workload credentials, and mutable installer
+# scripts. A short-lived Tailscale enrollment and digest-pinned k3s install are
+# performed only after an approved plan and capacity allocation.

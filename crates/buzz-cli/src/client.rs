@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use buzz_capability_client::{
+    CapabilityClient, HttpMethod, Nip98SignRequest, NostrEventSignRequest, StructuredTag,
+};
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
@@ -518,14 +521,48 @@ fn advance_query_cursor(
     Ok(())
 }
 
+struct LocalCredentials {
+    keys: Keys,
+    auth_tag: Option<Tag>,
+    auth_tag_json: Option<String>,
+}
+
+enum CredentialBackend {
+    Local(Box<LocalCredentials>),
+    Capability(CapabilityClient),
+}
+
+fn count_auth_tags(event: &nostr::Event) -> usize {
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().is_some_and(|name| name == "auth"))
+        .count()
+}
+
+fn capability_error(error: buzz_capability_client::ClientError) -> CliError {
+    CliError::Auth(format!("broker_v1: {error}"))
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
-    keys: Keys,
-    /// Optional NIP-OA auth tag injected into every signed event.
-    auth_tag: Option<Tag>,
-    /// Raw JSON of the auth tag for the `x-auth-tag` HTTP header.
-    auth_tag_json: Option<String>,
+    credentials: CredentialBackend,
+}
+
+struct RequestAuth {
+    authorization: String,
+    auth_tag: Option<String>,
+}
+
+impl RequestAuth {
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header("Authorization", &self.authorization);
+        match &self.auth_tag {
+            Some(auth_tag) => request.header("x-auth-tag", auth_tag),
+            None => request,
+        }
+    }
 }
 
 impl BuzzClient {
@@ -552,15 +589,57 @@ impl BuzzClient {
         Ok(Self {
             http,
             relay_url,
-            keys,
-            auth_tag,
-            auth_tag_json,
+            credentials: CredentialBackend::Local(Box::new(LocalCredentials {
+                keys,
+                auth_tag,
+                auth_tag_json,
+            })),
         })
     }
 
-    /// Get the keypair.
-    pub fn keys(&self) -> &Keys {
-        &self.keys
+    /// Create a broker-backed client after the projection was validated live.
+    pub fn new_capability(
+        relay_url: String,
+        capability: CapabilityClient,
+    ) -> Result<Self, CliError> {
+        let projected_relay = normalize_relay_url(capability.relay().as_str());
+        if relay_url != projected_relay {
+            return Err(CliError::Auth("broker_v1_relay_mismatch".into()));
+        }
+        let http = reqwest::Client::builder()
+            .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
+            .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+            .build()
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        Ok(Self {
+            http,
+            relay_url,
+            credentials: CredentialBackend::Capability(capability),
+        })
+    }
+
+    /// Return the public signing identity for either credential backend.
+    pub fn public_key(&self) -> nostr::PublicKey {
+        match &self.credentials {
+            CredentialBackend::Local(local) => local.keys.public_key(),
+            CredentialBackend::Capability(client) => client.public_key(),
+        }
+    }
+
+    /// Return local keys only for commands excluded from the broker pilot.
+    pub fn local_keys(&self) -> Result<&Keys, CliError> {
+        match &self.credentials {
+            CredentialBackend::Local(local) => Ok(&local.keys),
+            CredentialBackend::Capability(_) => {
+                Err(CliError::Auth("unsupported_in_broker_v1".into()))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> &Keys {
+        self.local_keys()
+            .expect("test client uses local credentials")
     }
 
     /// Get the relay base URL.
@@ -574,8 +653,7 @@ impl BuzzClient {
     /// The auth tag is `["auth", owner_pubkey, conditions, sig]`; the
     /// owner pubkey lives at index 1.
     pub fn auth_tag_owner_hex(&self) -> Option<String> {
-        self.auth_tag
-            .as_ref()
+        self.local_auth_tag()
             .map(|t| t.as_slice())
             .and_then(|slice| slice.get(1).cloned())
     }
@@ -585,38 +663,119 @@ impl BuzzClient {
     /// All event creation should go through this method to ensure consistent
     /// auth tag injection. Callers MUST NOT add `auth` tags to the builder
     /// before calling this method.
-    pub fn sign_event(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
-        let builder = if let Some(ref tag) = self.auth_tag {
-            builder.tags([tag.clone()])
-        } else {
-            builder
-        };
-        let event = builder
-            .sign_with_keys(&self.keys)
-            .map_err(|e| CliError::Other(format!("signing failed: {e}")))?;
-
-        // Enforce: auth tags may only come from self.auth_tag injection.
-        let auth_count = event
-            .tags
-            .iter()
-            .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
-            .count();
-        let expected = if self.auth_tag.is_some() { 1 } else { 0 };
-        if auth_count != expected {
-            return Err(CliError::Other(format!(
-                "event has {auth_count} auth tags — expected {expected}; \
-                 callers must not add auth tags manually"
-            )));
+    pub async fn sign_event(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        match &self.credentials {
+            CredentialBackend::Local(local) => {
+                let builder = if let Some(tag) = &local.auth_tag {
+                    builder.tags([tag.clone()])
+                } else {
+                    builder
+                };
+                let event = builder
+                    .sign_with_keys(&local.keys)
+                    .map_err(|e| CliError::Other(format!("signing failed: {e}")))?;
+                let auth_count = count_auth_tags(&event);
+                let expected = usize::from(local.auth_tag.is_some());
+                if auth_count != expected {
+                    return Err(CliError::Other(format!(
+                        "event has {auth_count} auth tags — expected {expected}; callers must not add auth tags manually"
+                    )));
+                }
+                Ok(event)
+            }
+            CredentialBackend::Capability(client) => {
+                let unsigned = builder.build(client.public_key());
+                if unsigned
+                    .tags
+                    .iter()
+                    .any(|tag| tag.as_slice().first().is_some_and(|name| name == "auth"))
+                {
+                    return Err(CliError::Auth("caller_auth_tag_in_broker_v1".into()));
+                }
+                let expected_tags: Vec<Vec<String>> = unsigned
+                    .tags
+                    .iter()
+                    .map(|tag| tag.as_slice().to_vec())
+                    .collect();
+                let event = client
+                    .sign_nostr_event(NostrEventSignRequest {
+                        relay: client.relay().clone(),
+                        kind: u32::from(unsigned.kind.as_u16()),
+                        content: unsigned.content,
+                        tags: expected_tags.iter().cloned().map(StructuredTag).collect(),
+                        requested_created_at: Some(unsigned.created_at.as_secs()),
+                    })
+                    .await
+                    .map_err(capability_error)?;
+                let returned_tags: Vec<Vec<String>> = event
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.as_slice().first().is_none_or(|name| name != "auth"))
+                    .map(|tag| tag.as_slice().to_vec())
+                    .collect();
+                if count_auth_tags(&event) != 1 || returned_tags != expected_tags {
+                    return Err(CliError::Auth("invalid_broker_signed_event".into()));
+                }
+                Ok(event)
+            }
         }
-
-        Ok(event)
     }
 
     /// Attach the `x-auth-tag` header if configured (NIP-OA relay membership delegation).
     fn with_auth_tag(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.auth_tag_json {
-            Some(ref json) => req.header("x-auth-tag", json),
-            None => req,
+        match &self.credentials {
+            CredentialBackend::Local(local) if local.auth_tag_json.is_some() => req.header(
+                "x-auth-tag",
+                local.auth_tag_json.as_deref().unwrap_or_default(),
+            ),
+            CredentialBackend::Local(_) | CredentialBackend::Capability(_) => req,
+        }
+    }
+
+    fn local_auth_tag(&self) -> Option<&Tag> {
+        match &self.credentials {
+            CredentialBackend::Local(local) => local.auth_tag.as_ref(),
+            CredentialBackend::Capability(_) => None,
+        }
+    }
+
+    async fn request_auth(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<RequestAuth, CliError> {
+        match &self.credentials {
+            CredentialBackend::Local(local) => {
+                let url = format!("{}{path}", self.relay_url);
+                Ok(RequestAuth {
+                    authorization: sign_nip98(&local.keys, method, &url, body)?,
+                    auth_tag: local.auth_tag_json.clone(),
+                })
+            }
+            CredentialBackend::Capability(client) => {
+                let method = match method {
+                    "GET" => HttpMethod::Get,
+                    "POST" => HttpMethod::Post,
+                    "PUT" => HttpMethod::Put,
+                    "DELETE" => HttpMethod::Delete,
+                    _ => return Err(CliError::Auth("unsupported_in_broker_v1".into())),
+                };
+                let payload_sha256 = body.map(|body| hex::encode(Sha256::digest(body)));
+                let authorization = client
+                    .sign_nip98(Nip98SignRequest {
+                        relay: client.relay().clone(),
+                        method,
+                        path: path.to_owned(),
+                        payload_sha256,
+                    })
+                    .await
+                    .map_err(capability_error)?;
+                Ok(RequestAuth {
+                    authorization: authorization.authorization().to_owned(),
+                    auth_tag: authorization.auth_tag().map(str::to_owned),
+                })
+            }
         }
     }
 
@@ -742,7 +901,7 @@ impl BuzzClient {
     /// unrelated tag.
     pub fn sign_event_unchecked(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
         builder
-            .sign_with_keys(&self.keys)
+            .sign_with_keys(self.local_keys()?)
             .map_err(|e| CliError::Other(format!("signing failed: {e}")))
     }
 
@@ -780,12 +939,11 @@ impl BuzzClient {
             let body = body.clone();
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-                let resp = self
-                    .with_auth_tag(
+                let auth = self.request_auth("POST", "/query", Some(&body)).await?;
+                let resp = auth
+                    .apply(
                         self.http
                             .post(&url)
-                            .header("Authorization", auth)
                             .header("Content-Type", "application/json")
                             .body(body),
                     )
@@ -810,12 +968,11 @@ impl BuzzClient {
             let body = body.clone();
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-                let resp = self
-                    .with_auth_tag(
+                let auth = self.request_auth("POST", "/count", Some(&body)).await?;
+                let resp = auth
+                    .apply(
                         self.http
                             .post(&url)
-                            .header("Authorization", auth)
                             .header("Content-Type", "application/json")
                             .body(body),
                     )
@@ -838,11 +995,8 @@ impl BuzzClient {
         self.with_retry_body(|| {
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "GET", &url, None)?;
-                let resp = self
-                    .with_auth_tag(self.http.get(&url).header("Authorization", auth))
-                    .send()
-                    .await?;
+                let auth = self.request_auth("GET", path, None).await?;
+                let resp = auth.apply(self.http.get(&url)).send().await?;
                 self.handle_response(resp).await
             }
         })
@@ -882,12 +1036,11 @@ impl BuzzClient {
 
             // Re-sign NIP-98 each attempt: the nonce tag generates a fresh
             // event ID, keeping retries safe against the relay's replay guard.
-            let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-            let send_result: Result<reqwest::Response, CliError> = self
-                .with_auth_tag(
+            let auth = self.request_auth("POST", "/events", Some(&body)).await?;
+            let send_result: Result<reqwest::Response, CliError> = auth
+                .apply(
                     self.http
                         .post(&url)
-                        .header("Authorization", auth)
                         .header("Content-Type", "application/json")
                         .body(body.clone()),
                 )
@@ -1034,12 +1187,11 @@ impl BuzzClient {
                 async move {
                     // Re-sign NIP-98 each attempt: the nonce tag generates a fresh
                     // event ID, keeping retries safe against the relay's replay guard.
-                    let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-                    let resp = self
-                        .with_auth_tag(
+                    let auth = self.request_auth("POST", "/events", Some(&body)).await?;
+                    let resp = auth
+                        .apply(
                             self.http
                                 .post(&url)
-                                .header("Authorization", auth)
                                 .header("Content-Type", "application/json")
                                 .body(body),
                         )
@@ -1072,14 +1224,15 @@ impl BuzzClient {
     /// EVENT send, OK wait, and graceful close.
     pub async fn publish_ephemeral_event(&self, event: nostr::Event) -> Result<String, CliError> {
         let ws_url = to_ws_url(&self.relay_url);
+        let keys = self.local_keys()?;
+        let auth_tag = self.local_auth_tag();
         // Hard cap — inner wait ceilings sum to 70 s; connect time and network RTT are
         // additional overhead absorbed by this budget.
         // See buzz_ws_client::{AUTH_CHALLENGE_TIMEOUT_SECS, AUTH_OK_TIMEOUT_SECS,
         // PUBLISH_OK_TIMEOUT_SECS} for the inner ceilings.
-        let ok =
-            buzz_ws_client::publish_event(&ws_url, event, &self.keys, self.auth_tag.as_ref(), 75)
-                .await
-                .map_err(|e| CliError::Other(e.to_string()))?;
+        let ok = buzz_ws_client::publish_event(&ws_url, event, keys, auth_tag, 75)
+            .await
+            .map_err(|e| CliError::Other(e.to_string()))?;
 
         if !ok.accepted {
             return Err(CliError::Relay {
@@ -1098,6 +1251,7 @@ impl BuzzClient {
     /// Upload a file to the relay's Blossom endpoint.
     /// Returns a BlobDescriptor on success.
     pub async fn upload_file(&self, file_path: &str) -> Result<BlobDescriptor, CliError> {
+        let keys = self.local_keys()?;
         // 1. Read file — validate it exists and is a regular file
         let metadata = std::fs::metadata(file_path)
             .map_err(|e| CliError::Other(format!("cannot access {file_path}: {e}")))?;
@@ -1154,8 +1308,7 @@ impl BuzzClient {
                 let mime = mime.clone();
                 let sha256 = sha256.clone();
                 async move {
-                    let auth_header =
-                        sign_blossom_upload(&self.keys, &sha256, &mime, &self.relay_url)?;
+                    let auth_header = sign_blossom_upload(keys, &sha256, &mime, &self.relay_url)?;
                     let resp = self
                         .with_auth_tag(
                             self.http
@@ -1201,7 +1354,7 @@ impl BuzzClient {
             let mime = mime.clone();
             let sha256 = sha256.clone();
             async move {
-                let auth_header = sign_blossom_upload(&self.keys, &sha256, &mime, &self.relay_url)?;
+                let auth_header = sign_blossom_upload(keys, &sha256, &mime, &self.relay_url)?;
                 let resp = self
                     .with_auth_tag(
                         self.http
@@ -1227,6 +1380,7 @@ impl BuzzClient {
 
     /// Download a Blossom media blob using BUD-01 `t=get` auth.
     pub async fn download_media(&self, input: &str) -> Result<bytes::Bytes, CliError> {
+        let keys = self.local_keys()?;
         let url = media_url_from_input(&self.relay_url, input)?;
         // Use a dedicated client: 120 s timeout, no redirect forwarding.
         let client = reqwest::Client::builder()
@@ -1239,7 +1393,7 @@ impl BuzzClient {
             let url = url.clone();
             let client = client.clone();
             async move {
-                let auth_header = sign_blossom_get(&self.keys, &url)?;
+                let auth_header = sign_blossom_get(keys, &url)?;
                 let resp = self
                     .with_auth_tag(client.get(&url).header("Authorization", auth_header))
                     .send()
@@ -1283,6 +1437,292 @@ impl BuzzClient {
             });
         }
         Ok(resp.text().await?)
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use std::{
+        ffi::OsString,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use buzz_signing_capability::{
+        IdentityMetadata, Operation, OperationResult, RelayOrigin, RequestEnvelope,
+        ResponseEnvelope,
+    };
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    use uuid::Uuid;
+
+    use super::*;
+
+    const TOKEN_CANARY: &str = "CLI_BROKER_TOKEN_CANARY_0123456789ABCDEF";
+
+    #[derive(Clone, Default)]
+    struct RelayCapture {
+        query_attempts: Arc<AtomicUsize>,
+        authorizations: Arc<Mutex<Vec<String>>>,
+        auth_tags: Arc<Mutex<Vec<String>>>,
+        event_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    fn capture_headers(headers: &HeaderMap, state: &RelayCapture) {
+        state
+            .authorizations
+            .lock()
+            .expect("authorization capture")
+            .push(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        state.auth_tags.lock().expect("auth tag capture").push(
+            headers
+                .get("x-auth-tag")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+
+    async fn retry_query(
+        State(state): State<RelayCapture>,
+        headers: HeaderMap,
+    ) -> (StatusCode, &'static str) {
+        capture_headers(&headers, &state);
+        if state.query_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            (StatusCode::BAD_GATEWAY, "retry")
+        } else {
+            (StatusCode::OK, "[]")
+        }
+    }
+
+    async fn accept_event(
+        State(state): State<RelayCapture>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, &'static str) {
+        capture_headers(&headers, &state);
+        let event = serde_json::from_slice(&body).expect("signed event JSON");
+        state
+            .event_bodies
+            .lock()
+            .expect("event capture")
+            .push(event);
+        (StatusCode::OK, r#"{"accepted":true}"#)
+    }
+
+    async fn spawn_relay(state: RelayCapture) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let app = Router::new()
+            .route("/query", post(retry_query))
+            .route("/events", post(accept_event))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve relay");
+        });
+        format!("http://{address}")
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> RequestEnvelope {
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.expect("read request");
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        serde_json::from_slice(&bytes).expect("request envelope")
+    }
+
+    async fn write_response(stream: &mut TcpStream, response: &ResponseEnvelope) {
+        let mut bytes = serde_json::to_vec(response).expect("response JSON");
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await.expect("write response");
+        stream.shutdown().await.expect("shutdown response");
+    }
+
+    async fn spawn_broker(
+        keys: Keys,
+        relay: RelayOrigin,
+        expiry: i64,
+        connections: usize,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind broker");
+        let address = listener.local_addr().expect("broker address");
+        tokio::spawn(async move {
+            for _ in 0..connections {
+                let (mut stream, _) = listener.accept().await.expect("accept broker request");
+                let request = read_request(&mut stream).await;
+                let result = match &request.operation {
+                    Operation::IdentityMetadata => {
+                        OperationResult::IdentityMetadata(IdentityMetadata {
+                            public_key: keys.public_key().to_hex(),
+                            relay: relay.clone(),
+                            expires_at_unix_ms: expiry,
+                        })
+                    }
+                    Operation::Nip98Sign(_) => OperationResult::Authorization {
+                        authorization: format!("Nostr {}", request.request_id),
+                        auth_tag: Some(test_auth_tag()),
+                    },
+                    Operation::NostrEventSign(payload) => {
+                        let mut tags = payload
+                            .tags
+                            .iter()
+                            .map(|tag| Tag::parse(tag.0.clone()).expect("structured tag"))
+                            .collect::<Vec<_>>();
+                        tags.push(Tag::parse(auth_tag_fields()).expect("auth tag"));
+                        let created_at = payload
+                            .requested_created_at
+                            .map(Timestamp::from_secs)
+                            .unwrap_or_else(Timestamp::now);
+                        let event = EventBuilder::new(
+                            Kind::Custom(u16::try_from(payload.kind).expect("kind")),
+                            &payload.content,
+                        )
+                        .tags(tags)
+                        .custom_created_at(created_at)
+                        .sign_with_keys(&keys)
+                        .expect("sign event");
+                        OperationResult::SignedEvent {
+                            event_json: serde_json::to_string(&event).expect("event JSON"),
+                        }
+                    }
+                    _ => panic!("unexpected broker operation"),
+                };
+                write_response(
+                    &mut stream,
+                    &ResponseEnvelope::success(request.request_id, result),
+                )
+                .await;
+            }
+        });
+        format!("tcp://{address}")
+    }
+
+    fn auth_tag_fields() -> Vec<String> {
+        vec![
+            "auth".into(),
+            "1".repeat(64),
+            String::new(),
+            "2".repeat(128),
+        ]
+    }
+
+    fn test_auth_tag() -> String {
+        serde_json::to_string(&auth_tag_fields()).expect("auth JSON")
+    }
+
+    fn future_expiry() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("milliseconds")
+            + 60_000
+    }
+
+    async fn capability_client(
+        endpoint: &str,
+        relay: &str,
+        keys: &Keys,
+        expiry: i64,
+    ) -> CapabilityClient {
+        CapabilityClient::from_env_iter([
+            ("BUZZ_CAPABILITY_ENDPOINT".into(), endpoint.into()),
+            (
+                "BUZZ_CAPABILITY_ID".into(),
+                Uuid::from_u128(7).to_string().into(),
+            ),
+            ("BUZZ_CAPABILITY_TOKEN".into(), TOKEN_CANARY.into()),
+            ("BUZZ_PUBLIC_KEY".into(), keys.public_key().to_hex().into()),
+            ("BUZZ_RELAY_URL".into(), relay.into()),
+            (
+                "BUZZ_CAPABILITY_EXPIRES_AT".into(),
+                expiry.to_string().into(),
+            ),
+        ] as [(OsString, OsString); 6])
+        .await
+        .expect("capability client")
+    }
+
+    #[tokio::test]
+    async fn broker_query_retry_uses_fresh_authorization_and_no_token() {
+        let capture = RelayCapture::default();
+        let relay = spawn_relay(capture.clone()).await;
+        let relay_origin = RelayOrigin::parse(&relay).expect("relay origin");
+        let keys = Keys::generate();
+        let expiry = future_expiry();
+        let endpoint = spawn_broker(keys.clone(), relay_origin, expiry, 3).await;
+        let capability = capability_client(&endpoint, &relay, &keys, expiry).await;
+        let client = BuzzClient::new_capability(relay, capability).expect("Buzz client");
+
+        assert_eq!(
+            client
+                .query(&serde_json::json!({"kinds":[9]}))
+                .await
+                .expect("query"),
+            "[]"
+        );
+        let authorizations = capture.authorizations.lock().expect("authorizations");
+        assert_eq!(authorizations.len(), 2);
+        assert_ne!(authorizations[0], authorizations[1]);
+        assert!(authorizations
+            .iter()
+            .all(|value| !value.contains(TOKEN_CANARY)));
+        let auth_tags = capture.auth_tags.lock().expect("auth tags");
+        assert_eq!(auth_tags.as_slice(), [test_auth_tag(), test_auth_tag()]);
+    }
+
+    #[tokio::test]
+    async fn broker_plain_message_write_has_one_injected_auth_tag() {
+        let capture = RelayCapture::default();
+        let relay = spawn_relay(capture.clone()).await;
+        let relay_origin = RelayOrigin::parse(&relay).expect("relay origin");
+        let keys = Keys::generate();
+        let expiry = future_expiry();
+        let endpoint = spawn_broker(keys.clone(), relay_origin, expiry, 3).await;
+        let capability = capability_client(&endpoint, &relay, &keys, expiry).await;
+        let client = BuzzClient::new_capability(relay, capability).expect("Buzz client");
+        let event = client
+            .sign_event(EventBuilder::new(Kind::Custom(9), "hello"))
+            .await
+            .expect("broker sign");
+        assert_eq!(count_auth_tags(&event), 1);
+        client.submit_event(event).await.expect("submit");
+
+        let bodies = capture.event_bodies.lock().expect("event bodies");
+        assert_eq!(
+            bodies[0]["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .filter(|tag| tag[0] == "auth")
+                .count(),
+            1
+        );
+        assert!(!bodies[0].to_string().contains(TOKEN_CANARY));
+        assert_eq!(
+            capture.auth_tags.lock().expect("auth tags").as_slice(),
+            [test_auth_tag()]
+        );
     }
 }
 

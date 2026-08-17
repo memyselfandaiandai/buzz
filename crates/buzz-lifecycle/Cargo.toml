@@ -1,0 +1,22 @@
+[package]
+name = "buzz-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider-neutral durable turn lifecycle authority for Buzz"
+
+[dependencies]
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+cards-automations-skills = []

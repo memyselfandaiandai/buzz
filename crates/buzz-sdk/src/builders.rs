@@ -244,6 +244,34 @@ pub fn build_message(
         .allow_self_tagging())
 }
 
+/// Build a stream message (kind 9) with one internal idempotency marker.
+///
+/// The extra tag is restricted to `["client", marker]`; callers cannot use
+/// this API to override channel, thread, or mention metadata.
+pub fn build_message_with_client_marker(
+    channel_id: Uuid,
+    content: &str,
+    thread_ref: Option<&ThreadRef>,
+    mentions: &[&str],
+    marker: &str,
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, 64 * 1024)?;
+    if marker.is_empty() || marker.len() > 512 {
+        return Err(SdkError::InvalidInput(
+            "client marker must be between 1 and 512 bytes".into(),
+        ));
+    }
+    let mut tags = vec![tag(&["h", &channel_id.to_string()])?];
+    if let Some(thread_ref) = thread_ref {
+        thread_tags(thread_ref, &mut tags)?;
+    }
+    mention_tags(mentions, &mut tags)?;
+    tags.push(tag(&["client", marker])?);
+    Ok(EventBuilder::new(Kind::Custom(9), content)
+        .tags(tags)
+        .allow_self_tagging())
+}
+
 /// Build an encrypted agent observer frame (kind 24200).
 ///
 /// `recipient_pubkey` is the cleartext `p` tag used by the relay for owner-only
@@ -2382,6 +2410,19 @@ mod tests {
         assert_eq!(ev.kind.as_u16(), 9);
         assert_eq!(ev.content, "hello");
         assert!(has_tag(&ev, "h", &cid.to_string()));
+    }
+
+    #[test]
+    fn marked_message_only_adds_bounded_client_marker() {
+        let cid = uuid();
+        let marker = "buzz.acp.turn.v1:turn-a:receipt";
+        let ev = sign(build_message_with_client_marker(cid, "On it.", None, &[], marker).unwrap());
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "client", marker));
+        assert!(build_message_with_client_marker(cid, "On it.", None, &[], "").is_err());
+        assert!(
+            build_message_with_client_marker(cid, "On it.", None, &[], &"x".repeat(513)).is_err()
+        );
     }
 
     #[test]

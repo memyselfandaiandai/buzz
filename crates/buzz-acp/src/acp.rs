@@ -9,9 +9,11 @@
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+use zeroize::Zeroizing;
 
 use crate::observer::{ObserverContext, ObserverHandle};
 use crate::usage::{
@@ -21,6 +23,356 @@ use crate::usage::{
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+
+/// Maximum plaintext emitted when the operator explicitly opts into sensitive
+/// ACP diagnostics. Normal logging never includes model text, thoughts, tool
+/// titles/identifiers, or command names.
+const MAX_SENSITIVE_LOG_CHARS: usize = 512;
+
+const MAX_TRANSCRIPT_BLOCKS: usize = 256;
+
+fn transcript_blocks(blocks: &[&str]) -> Vec<String> {
+    if blocks.len() <= MAX_TRANSCRIPT_BLOCKS {
+        return blocks.iter().map(|block| (*block).to_owned()).collect();
+    }
+    // Preserve the final triggering user-event block when the input exceeds
+    // the schema cap; earlier context is less authoritative than the turn.
+    blocks[..MAX_TRANSCRIPT_BLOCKS - 1]
+        .iter()
+        .chain(std::iter::once(&blocks[blocks.len() - 1]))
+        .map(|block| (*block).to_owned())
+        .collect()
+}
+
+fn opaque_transcript_key(value: Option<&serde_json::Value>) -> Option<String> {
+    value.map(|value| {
+        let digest = Sha256::digest(value.to_string().as_bytes());
+        format!("sha256:{}", hex::encode(digest))
+    })
+}
+
+fn safe_transcript_tool_status(status: Option<&str>, update_type: &str) -> &'static str {
+    match status {
+        Some("pending") => "pending",
+        Some("in_progress" | "executing") => "executing",
+        Some("completed") => "completed",
+        Some("failed" | "error") => "failed",
+        Some("cancelled") => "cancelled",
+        _ if update_type == "tool_call" => "executing",
+        _ => "completed",
+    }
+}
+
+fn sensitive_acp_logging_enabled() -> bool {
+    std::env::var("BUZZ_ACP_LOG_SENSITIVE_CONTENT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn bounded_sensitive_log_value(value: &str) -> String {
+    let mut chars = value.chars();
+    let bounded: String = chars.by_ref().take(MAX_SENSITIVE_LOG_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…[truncated]")
+    } else {
+        bounded
+    }
+}
+
+/// Return a structural, content-free description of an outbound ACP message.
+///
+/// The original value is the protocol payload and may contain credentials,
+/// prompts, system instructions, paths, and session identifiers. It must only
+/// be written to the agent's stdin. Observer buffers and debug logs receive
+/// this projection instead, so their longer retention and optional relay do
+/// not become a second secret-bearing transport.
+fn outbound_wire_projection(value: &serde_json::Value) -> serde_json::Value {
+    let method = value.get("method").and_then(serde_json::Value::as_str);
+    let kind = if method.is_some() {
+        if value.get("id").is_some() {
+            "request"
+        } else {
+            "notification"
+        }
+    } else if value.get("error").is_some() {
+        "error_response"
+    } else {
+        "response"
+    };
+
+    let params = value.get("params");
+    let params_projection = match method {
+        Some("session/new") => project_session_new(params),
+        Some("session/prompt" | ACP_STEER_METHOD | GOOSE_STEER_METHOD) => {
+            project_prompt_bearing_params(params)
+        }
+        Some("session/cancel") => serde_json::json!({
+            "sessionIdBytes": string_bytes(params.and_then(|v| v.get("sessionId"))),
+        }),
+        Some(_) => project_generic_params(params),
+        None => project_response(value),
+    };
+
+    serde_json::json!({
+        "direction": "outbound",
+        "kind": kind,
+        "idType": value.get("id").map(json_value_kind),
+        "method": method,
+        "params": params_projection,
+    })
+}
+
+/// Return a structural, content-free description of an inbound ACP message.
+///
+/// Agent output is untrusted and may contain model text, tool results, echoed
+/// credentials, or adversarial strings crafted to reach logs. Protocol parsing
+/// continues to use the original value; only diagnostics and observer replay
+/// receive this projection.
+fn inbound_wire_projection(value: &serde_json::Value) -> serde_json::Value {
+    let raw_method = value.get("method").and_then(serde_json::Value::as_str);
+    let method = raw_method.map(inbound_method_label);
+    let kind = if raw_method.is_some() {
+        if value.get("id").is_some() {
+            "request"
+        } else {
+            "notification"
+        }
+    } else if value.get("error").is_some() {
+        "error_response"
+    } else {
+        "response"
+    };
+    let params = value.get("params");
+    let payload = match raw_method {
+        Some("session/update") => project_session_update(params),
+        Some("_goose/unstable/session/update") => project_goose_update(params),
+        Some("session/request_permission") => project_permission_request(params),
+        Some(_) => project_generic_params(params),
+        None => project_inbound_response(value),
+    };
+
+    serde_json::json!({
+        "direction": "inbound",
+        "kind": kind,
+        "idType": value.get("id").map(json_value_kind),
+        "method": method,
+        "methodBytes": raw_method.map_or(0, str::len),
+        "payload": payload,
+    })
+}
+
+fn inbound_method_label(method: &str) -> &'static str {
+    match method {
+        "session/update" => "session/update",
+        "_goose/unstable/session/update" => "_goose/unstable/session/update",
+        "session/request_permission" => "session/request_permission",
+        _ => "other",
+    }
+}
+
+fn project_session_update(params: Option<&serde_json::Value>) -> serde_json::Value {
+    let update = params.and_then(|value| value.get("update"));
+    let raw_update_type = update
+        .and_then(|value| value.get("sessionUpdate"))
+        .and_then(serde_json::Value::as_str);
+    let commands = update
+        .and_then(|value| value.get("availableCommands"))
+        .and_then(serde_json::Value::as_array);
+    let plan_entries = update
+        .and_then(|value| value.get("entries"))
+        .and_then(serde_json::Value::as_array);
+
+    serde_json::json!({
+        "sessionIdBytes": string_bytes(params.and_then(|value| value.get("sessionId"))),
+        "sessionUpdate": raw_update_type.map(session_update_label),
+        "sessionUpdateBytes": raw_update_type.map_or(0, str::len),
+        "updateFieldCount": update
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        "contentSerializedBytes": update
+            .and_then(|value| value.get("content"))
+            .map_or(0, serialized_json_len),
+        "toolCallIdBytes": string_bytes(
+            update.and_then(|value| value.get("toolCallId"))
+        ),
+        "titleBytes": string_bytes(update.and_then(|value| value.get("title"))),
+        "statusBytes": string_bytes(update.and_then(|value| value.get("status"))),
+        "availableCommandCount": commands.map_or(0, Vec::len),
+        "planEntryCount": plan_entries.map_or(0, Vec::len),
+        "activeRunIdBytes": string_bytes(
+            update.and_then(|value| value.pointer("/_meta/goose/activeRunId"))
+        ),
+        "serializedBytes": update.map_or(0, serialized_json_len),
+    })
+}
+
+fn session_update_label(update_type: &str) -> &'static str {
+    match update_type {
+        "agent_message_chunk" => "agent_message_chunk",
+        "tool_call" => "tool_call",
+        "tool_call_update" => "tool_call_update",
+        "plan" => "plan",
+        "agent_thought_chunk" => "agent_thought_chunk",
+        "available_commands_update" => "available_commands_update",
+        "session_info_update" => "session_info_update",
+        "keepalive" => "keepalive",
+        _ => "other",
+    }
+}
+
+fn project_goose_update(params: Option<&serde_json::Value>) -> serde_json::Value {
+    let update = params.and_then(|value| value.get("update"));
+    serde_json::json!({
+        "sessionIdBytes": string_bytes(params.and_then(|value| value.get("sessionId"))),
+        "updateKind": update.map_or("absent", json_value_kind),
+        "updateFieldCount": update
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        "serializedBytes": update.map_or(0, serialized_json_len),
+    })
+}
+
+fn project_permission_request(params: Option<&serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "sessionIdBytes": string_bytes(params.and_then(|value| value.get("sessionId"))),
+        "toolCallIdBytes": string_bytes(params.and_then(|value| value.get("toolCallId"))),
+        "optionCount": params
+            .and_then(|value| value.get("options"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "serializedBytes": params.map_or(0, serialized_json_len),
+    })
+}
+
+fn project_inbound_response(value: &serde_json::Value) -> serde_json::Value {
+    let result = value.get("result");
+    let error = value.get("error");
+    serde_json::json!({
+        "resultKind": result.map_or("absent", json_value_kind),
+        "resultFieldCount": result
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        "resultSerializedBytes": result.map_or(0, serialized_json_len),
+        "errorCode": error
+            .and_then(|value| value.get("code"))
+            .and_then(serde_json::Value::as_i64),
+        "errorMessageBytes": string_bytes(error.and_then(|value| value.get("message"))),
+        "errorDataSerializedBytes": error
+            .and_then(|value| value.get("data"))
+            .map_or(0, serialized_json_len),
+    })
+}
+
+fn parse_error_projection(line: &str, error: &serde_json::Error) -> serde_json::Value {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    serde_json::json!({
+        "lineBytes": line.len(),
+        "category": category,
+        "line": error.line(),
+        "column": error.column(),
+    })
+}
+
+fn project_session_new(params: Option<&serde_json::Value>) -> serde_json::Value {
+    let mcp_servers = params
+        .and_then(|value| value.get("mcpServers"))
+        .and_then(serde_json::Value::as_array);
+    let server_count = mcp_servers.map_or(0, Vec::len);
+    let argument_count = mcp_servers.map_or(0, |servers| {
+        servers
+            .iter()
+            .filter_map(|server| server.get("args").and_then(serde_json::Value::as_array))
+            .map(Vec::len)
+            .sum()
+    });
+    let environment_variable_count = mcp_servers.map_or(0, |servers| {
+        servers
+            .iter()
+            .filter_map(|server| server.get("env").and_then(serde_json::Value::as_array))
+            .map(Vec::len)
+            .sum()
+    });
+
+    serde_json::json!({
+        "cwdBytes": string_bytes(params.and_then(|value| value.get("cwd"))),
+        "mcpServerCount": server_count,
+        "mcpArgumentCount": argument_count,
+        "mcpEnvironmentVariableCount": environment_variable_count,
+        "systemPromptBytes": string_bytes(
+            params.and_then(|value| value.get("systemPrompt"))
+        ),
+        "metaSystemPromptBytes": string_bytes(
+            params.and_then(|value| value.pointer("/_meta/systemPrompt/append"))
+        ),
+        "sessionTitleBytes": string_bytes(
+            params.and_then(|value| value.pointer("/_meta/sessionTitle"))
+        ),
+    })
+}
+
+fn project_prompt_bearing_params(params: Option<&serde_json::Value>) -> serde_json::Value {
+    let prompt = params.and_then(|value| value.get("prompt"));
+    serde_json::json!({
+        "sessionIdBytes": string_bytes(params.and_then(|value| value.get("sessionId"))),
+        "expectedRunIdBytes": string_bytes(
+            params.and_then(|value| value.get("expectedRunId"))
+        ),
+        "promptBlockCount": prompt
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "promptSerializedBytes": prompt.map_or(0, serialized_json_len),
+    })
+}
+
+fn project_generic_params(params: Option<&serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "kind": params.map_or("absent", json_value_kind),
+        "fieldCount": params
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        "itemCount": params
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "serializedBytes": params.map_or(0, serialized_json_len),
+    })
+}
+
+fn project_response(value: &serde_json::Value) -> serde_json::Value {
+    let payload = value.get("result").or_else(|| value.get("error"));
+    serde_json::json!({
+        "payloadKind": payload.map_or("absent", json_value_kind),
+        "fieldCount": payload
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, serde_json::Map::len),
+        "serializedBytes": payload.map_or(0, serialized_json_len),
+    })
+}
+
+fn string_bytes(value: Option<&serde_json::Value>) -> usize {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map_or(0, str::len)
+}
+
+fn serialized_json_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |serialized| serialized.len())
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -108,6 +460,218 @@ pub enum AcpError {
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
+}
+
+const LONG_LIVED_CREDENTIAL_ENV: [&str; 4] = [
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_ACP_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+];
+const CAPABILITY_ENV_PREFIX: &str = "BUZZ_CAPABILITY_";
+
+fn env_name_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn is_long_lived_credential_env(name: &str) -> bool {
+    LONG_LIVED_CREDENTIAL_ENV
+        .iter()
+        .any(|reserved| env_name_eq(name, reserved))
+}
+
+fn is_capability_env(name: &str) -> bool {
+    name.get(..CAPABILITY_ENV_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(CAPABILITY_ENV_PREFIX))
+}
+
+fn is_credential_mode_env(name: &str) -> bool {
+    env_name_eq(name, "BUZZ_CREDENTIAL_MODE")
+}
+
+#[derive(Clone, Copy)]
+struct LoopbackCapabilityEndpoint {
+    address: std::net::SocketAddrV4,
+}
+
+#[cfg_attr(not(feature = "signing-capability-broker"), allow(dead_code))]
+impl LoopbackCapabilityEndpoint {
+    fn parse(value: &str) -> Result<Self, AcpError> {
+        let endpoint = url::Url::parse(value).map_err(|_| {
+            AcpError::Protocol("broker-v1 endpoint is not a valid TCP URL".to_owned())
+        })?;
+        if endpoint.scheme() != "tcp"
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !endpoint.path().is_empty()
+            || endpoint.host_str() != Some("127.0.0.1")
+        {
+            return Err(AcpError::Protocol(
+                "broker-v1 endpoint must be exactly tcp://127.0.0.1:<nonzero-port>".to_owned(),
+            ));
+        }
+        let port = endpoint.port().filter(|port| *port != 0).ok_or_else(|| {
+            AcpError::Protocol(
+                "broker-v1 endpoint must be exactly tcp://127.0.0.1:<nonzero-port>".to_owned(),
+            )
+        })?;
+        Ok(Self {
+            address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port),
+        })
+    }
+
+    fn canonical(self) -> String {
+        format!("tcp://{}", self.address)
+    }
+}
+
+/// Typed environment projection for a broker-v1 ACP child.
+///
+/// The token is intentionally private and this type does not implement
+/// `Debug`, preventing accidental diagnostic disclosure. Construction
+/// validates the public metadata before any process is configured.
+pub struct AcpChildCredentialProjection {
+    endpoint: LoopbackCapabilityEndpoint,
+    capability_id: uuid::Uuid,
+    token: Zeroizing<String>,
+    public_key: nostr::PublicKey,
+    relay_url: url::Url,
+    expires_at: u64,
+}
+
+#[cfg_attr(not(feature = "signing-capability-broker"), allow(dead_code))]
+impl AcpChildCredentialProjection {
+    /// Build a broker-v1 child projection from its fixed, allowlisted fields.
+    pub fn broker_v1(
+        endpoint: &str,
+        capability_id: uuid::Uuid,
+        token: impl Into<String>,
+        public_key: nostr::PublicKey,
+        relay_url: &str,
+        expires_at: u64,
+    ) -> Result<Self, AcpError> {
+        let projection = Self {
+            endpoint: LoopbackCapabilityEndpoint::parse(endpoint)?,
+            capability_id,
+            token: Zeroizing::new(token.into()),
+            public_key,
+            relay_url: Self::parse_relay_origin(relay_url)?,
+            expires_at,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
+
+    fn validate(&self) -> Result<(), AcpError> {
+        if !(32..=256).contains(&self.token.len()) || self.token.chars().any(char::is_whitespace) {
+            return Err(AcpError::Protocol(
+                "broker-v1 token is malformed".to_owned(),
+            ));
+        }
+        if self.expires_at == 0 {
+            return Err(AcpError::Protocol(
+                "broker-v1 expiry must be a positive Unix timestamp".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_relay_origin(value: &str) -> Result<url::Url, AcpError> {
+        let mut relay = url::Url::parse(value)
+            .map_err(|_| AcpError::Protocol("broker-v1 relay URL is invalid".to_owned()))?;
+        if !matches!(relay.scheme(), "ws" | "wss" | "http" | "https")
+            || relay.host_str().is_none()
+            || !relay.username().is_empty()
+            || relay.password().is_some()
+            || relay.query().is_some()
+            || relay.fragment().is_some()
+            || !matches!(relay.path(), "" | "/")
+        {
+            return Err(AcpError::Protocol(
+                "broker-v1 relay URL must be a canonical relay origin".to_owned(),
+            ));
+        }
+        relay.set_path("");
+        Ok(relay)
+    }
+
+    fn apply(
+        &self,
+        command: &mut tokio::process::Command,
+        extra_env: &[(String, String)],
+    ) -> Result<(), AcpError> {
+        if extra_env.iter().any(|(key, _)| {
+            is_long_lived_credential_env(key)
+                || is_capability_env(key)
+                || is_credential_mode_env(key)
+        }) {
+            return Err(AcpError::Protocol(
+                "broker-v1 extra environment contains reserved credential variables".to_owned(),
+            ));
+        }
+
+        // Apply this after all normal process configuration. Removal therefore
+        // wins over inherited variables, runtime defaults, and persona values.
+        for key in LONG_LIVED_CREDENTIAL_ENV {
+            command.env_remove(key);
+        }
+        // Do not inherit differently-cased credential aliases or
+        // capability-shaped variables outside the fixed v1 allowlist. The
+        // allowlisted values below always come from this typed projection,
+        // never an arbitrary map or parent process.
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(|name| {
+                is_long_lived_credential_env(name)
+                    || is_capability_env(name)
+                    || is_credential_mode_env(name)
+            }) {
+                command.env_remove(key);
+            }
+        }
+        command.env("BUZZ_CREDENTIAL_MODE", "broker-v1");
+        command.env("BUZZ_CAPABILITY_ENDPOINT", self.endpoint.canonical());
+        command.env("BUZZ_CAPABILITY_ID", self.capability_id.to_string());
+        command.env("BUZZ_CAPABILITY_TOKEN", self.token.as_str());
+        command.env("BUZZ_PUBLIC_KEY", self.public_key.to_hex());
+        command.env(
+            "BUZZ_RELAY_URL",
+            self.relay_url.as_str().trim_end_matches('/'),
+        );
+        command.env("BUZZ_CAPABILITY_EXPIRES_AT", self.expires_at.to_string());
+        Ok(())
+    }
+
+    /// Exact broker-v1 environment projected into each configured MCP server.
+    pub(crate) fn mcp_env(&self) -> Vec<EnvVar> {
+        vec![
+            EnvVar {
+                name: "BUZZ_CAPABILITY_ENDPOINT".into(),
+                value: self.endpoint.canonical(),
+            },
+            EnvVar {
+                name: "BUZZ_CAPABILITY_ID".into(),
+                value: self.capability_id.to_string(),
+            },
+            EnvVar {
+                name: "BUZZ_CAPABILITY_TOKEN".into(),
+                value: self.token.as_str().to_owned(),
+            },
+            EnvVar {
+                name: "BUZZ_PUBLIC_KEY".into(),
+                value: self.public_key.to_hex(),
+            },
+            EnvVar {
+                name: "BUZZ_RELAY_URL".into(),
+                value: self.relay_url.as_str().trim_end_matches('/').to_owned(),
+            },
+            EnvVar {
+                name: "BUZZ_CAPABILITY_EXPIRES_AT".into(),
+                value: self.expires_at.to_string(),
+            },
+        ]
+    }
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -210,6 +774,15 @@ pub struct AcpClient {
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
+    /// Concatenated visible assistant message chunks for the current prompt.
+    /// Consumed by the ACP bridge only after a successful turn for memory
+    /// writeback; thoughts and tool payloads are deliberately excluded.
+    turn_agent_message: String,
+    /// Local-v1 signing capability owned by this process generation.
+    #[cfg(feature = "signing-capability-broker")]
+    process_capability: Option<crate::capability_broker::ProcessCapabilityLease>,
+    #[cfg(feature = "signing-capability-broker")]
+    broker_session_created: bool,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
@@ -457,6 +1030,69 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
+        if crate::config::credential_mode_from_env()
+            .map_err(|_| AcpError::Protocol("credential mode is invalid".to_owned()))?
+            == crate::config::CredentialMode::BrokerV1
+        {
+            return Err(AcpError::Protocol(
+                "broker-v1 child spawn requires a capability projection".to_owned(),
+            ));
+        }
+        Self::spawn_configured(command, args, extra_env, has_generated_codex_config, None).await
+    }
+
+    /// Spawn an ACP child that owns one inactive broker capability generation.
+    #[cfg(feature = "signing-capability-broker")]
+    pub(crate) async fn spawn_with_process_capability(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        capability: crate::capability_broker::ProcessCapabilityLease,
+    ) -> Result<Self, AcpError> {
+        let mut client = Self::spawn_configured(
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+            Some(capability.projection()),
+        )
+        .await?;
+        client.process_capability = Some(capability);
+        Ok(client)
+    }
+
+    /// Spawn an ACP child with a broker-v1 credential projection.
+    ///
+    /// The executable local pilot normally uses
+    /// [`spawn_with_process_capability`](Self::spawn_with_process_capability)
+    /// so revocation ownership follows the child generation. This borrowed
+    /// seam remains for projection-level validation.
+    #[allow(dead_code)]
+    pub async fn spawn_with_credential_projection(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        credential_projection: &AcpChildCredentialProjection,
+    ) -> Result<Self, AcpError> {
+        Self::spawn_configured(
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+            Some(credential_projection),
+        )
+        .await
+    }
+
+    async fn spawn_configured(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        credential_projection: Option<&AcpChildCredentialProjection>,
+    ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
         let mut cmd = tokio::process::Command::new(command);
@@ -515,6 +1151,9 @@ impl AcpClient {
         if let Some(merged) = codex_config_value {
             cmd.env("CODEX_CONFIG", merged);
         }
+        if let Some(projection) = credential_projection {
+            projection.apply(&mut cmd, extra_env)?;
+        }
 
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
@@ -561,9 +1200,59 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_agent_message: String::new(),
+            #[cfg(feature = "signing-capability-broker")]
+            process_capability: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_session_created: false,
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
         })
+    }
+
+    /// Fail closed if a brokered process would create a second ACP session.
+    /// The local pilot rotates the whole process generation instead.
+    pub(crate) fn prepare_process_session(&self) -> Result<(), AcpError> {
+        #[cfg(feature = "signing-capability-broker")]
+        if self.process_capability.is_some() && self.broker_session_created {
+            return Err(AcpError::Protocol(
+                "broker-v1 requires ACP process respawn before session recreation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Add the process-generation capability projection to MCP server env.
+    pub(crate) fn apply_process_capability_to_mcp(&self, servers: &mut [McpServer]) {
+        #[cfg(not(feature = "signing-capability-broker"))]
+        let _ = servers;
+        #[cfg(feature = "signing-capability-broker")]
+        if let Some(capability) = &self.process_capability {
+            let env = capability.mcp_env();
+            for server in servers {
+                server.env.extend(env.clone());
+            }
+        }
+    }
+
+    /// Activate the process capability only after session/new succeeded.
+    pub(crate) fn activate_process_capability(&mut self) -> Result<(), AcpError> {
+        #[cfg(feature = "signing-capability-broker")]
+        if let Some(capability) = &mut self.process_capability {
+            capability.activate().map_err(|_| {
+                AcpError::Protocol("broker-v1 capability activation failed".to_owned())
+            })?;
+            self.broker_session_created = true;
+        }
+        Ok(())
+    }
+
+    /// Revoke the process capability after a failed session/new configuration.
+    pub(crate) fn revoke_process_capability(&mut self) {
+        #[cfg(feature = "signing-capability-broker")]
+        if let Some(capability) = &mut self.process_capability {
+            let _ = capability.revoke();
+        }
     }
 
     /// Attach a local observer feed to this ACP client.
@@ -590,12 +1279,136 @@ impl AcpClient {
     /// Emit a semantic event to the local observer feed, if enabled.
     pub fn observe(&self, kind: impl Into<String>, payload: serde_json::Value) {
         if let Some(observer) = &self.observer {
-            observer.emit(
+            observer.emit_fitted(
                 kind,
                 self.observer_agent_index,
                 &self.observer_context,
                 payload,
             );
+        }
+    }
+
+    /// Emit prompt content that the local transcript observer is authorized to
+    /// display, without exposing the surrounding ACP request envelope.
+    fn observe_transcript_prompt(&self, source: &'static str, blocks: &[&str]) {
+        let blocks = transcript_blocks(blocks);
+        self.observe(
+            "transcript_prompt",
+            serde_json::json!({
+                "schemaVersion": 1,
+                "source": source,
+                "blocks": blocks,
+            }),
+        );
+    }
+
+    /// Emit system context that was successfully delivered to the agent while
+    /// excluding cwd, MCP configuration/environment, and other session/new
+    /// fields from the observer contract.
+    pub(crate) fn observe_transcript_system_context(&self, text: &str) {
+        self.observe(
+            "transcript_system_context",
+            serde_json::json!({
+                "schemaVersion": 1,
+                "source": "session/new",
+                "text": text,
+            }),
+        );
+    }
+
+    /// Project an inbound session/update into the smallest UI-semantic shape.
+    /// Agent output is owner-visible content; thoughts and tool details are not.
+    fn observe_transcript_session_update(&self, update: &serde_json::Value) {
+        let update_type = update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let payload = match update_type {
+            "agent_message_chunk" => update
+                .pointer("/content/text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| {
+                    serde_json::json!({
+                        "schemaVersion": 1,
+                        "updateType": "agent_message_chunk",
+                        "messageKey": opaque_transcript_key(update.get("messageId")),
+                        "text": text,
+                    })
+                }),
+            "agent_thought_chunk" => Some(serde_json::json!({
+                "schemaVersion": 1,
+                "updateType": "agent_thought_chunk",
+                "messageKey": opaque_transcript_key(update.get("messageId")),
+                "contentHidden": true,
+            })),
+            "tool_call" | "tool_call_update" => Some(serde_json::json!({
+                "schemaVersion": 1,
+                "updateType": update_type,
+                "toolKey": opaque_transcript_key(update.get("toolCallId")),
+                "status": safe_transcript_tool_status(
+                    update.get("status").and_then(serde_json::Value::as_str),
+                    update_type,
+                ),
+                "detailsHidden": true,
+            })),
+            "plan" => {
+                let entries = update.get("entries").and_then(serde_json::Value::as_array);
+                let completed = entries.map_or(0, |entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.get("status").and_then(serde_json::Value::as_str)
+                                == Some("completed")
+                        })
+                        .count()
+                });
+                Some(serde_json::json!({
+                    "schemaVersion": 1,
+                    "updateType": "plan",
+                    "entryCount": entries.map_or(0, Vec::len),
+                    "completedCount": completed,
+                    "detailsHidden": true,
+                }))
+            }
+            "current_mode_update" => Some(serde_json::json!({
+                "schemaVersion": 1,
+                "updateType": "current_mode_update",
+                "detailsHidden": true,
+            })),
+            "usage_update" => {
+                let used = update.get("used").and_then(serde_json::Value::as_u64);
+                let size = update.get("size").and_then(serde_json::Value::as_u64);
+                match (used, size) {
+                    (Some(used), Some(size)) => Some(serde_json::json!({
+                        "schemaVersion": 1,
+                        "updateType": "usage_update",
+                        "used": used,
+                        "size": size,
+                    })),
+                    _ => None,
+                }
+            }
+            "available_commands_update" => Some(serde_json::json!({
+                "schemaVersion": 1,
+                "updateType": "available_commands_update",
+                "commandCount": update
+                    .get("availableCommands")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+            })),
+            "config_option_update" => Some(serde_json::json!({
+                "schemaVersion": 1,
+                "updateType": "config_option_update",
+                "optionCount": update
+                    .get("configOptions")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+                "detailsHidden": true,
+            })),
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            self.observe("transcript_session_update", payload);
         }
     }
 
@@ -617,7 +1430,13 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        tracing::debug!(target: "acp::init", "initialize response: {result}");
+        tracing::debug!(
+            target: "acp::init",
+            resultKind = json_value_kind(&result),
+            resultFieldCount = result.as_object().map_or(0, serde_json::Map::len),
+            resultSerializedBytes = serialized_json_len(&result),
+            "initialize response received"
+        );
         Ok(result)
     }
 
@@ -789,6 +1608,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.turn_agent_message.clear();
         self.standard_usage.begin_turn(session_id);
 
         self.last_prompt_id = Some(self.next_id);
@@ -802,12 +1622,12 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
             return Err(e);
         }
+        self.observe_transcript_prompt("session/prompt", prompt_blocks);
 
         let result = self
             .read_until_response_with_idle_timeout(
@@ -888,6 +1708,11 @@ impl AcpClient {
         let goose_usage = self.goose_usage.take();
         let standard_usage = self.standard_usage.take();
         goose_usage.or(standard_usage)
+    }
+
+    /// Consume the visible assistant text accumulated during the latest turn.
+    pub fn take_turn_agent_message(&mut self) -> String {
+        std::mem::take(&mut self.turn_agent_message)
     }
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
@@ -1029,9 +1854,17 @@ impl AcpClient {
             if !self.permission_responded {
                 let response = permission_response_cancelled(&perm_id);
                 self.write_ndjson(&response).await?;
+                self.observe(
+                    "transcript_permission",
+                    serde_json::json!({
+                        "schemaVersion": 1,
+                        "outcome": "cancelled",
+                    }),
+                );
                 tracing::debug!(
                     target: "acp::cancel",
-                    "responded cancelled to pending permission id={perm_id}"
+                    permissionIdType = json_value_kind(&perm_id),
+                    "responded cancelled to pending permission"
                 );
             }
             self.pending_permission_id = None;
@@ -1068,6 +1901,8 @@ impl AcpClient {
     async fn write_ndjson(&mut self, value: &serde_json::Value) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
+        let projection = outbound_wire_projection(value);
+        tracing::debug!(target: "acp::wire", payload = %projection, "ACP outbound");
         tokio::time::timeout(WRITE_TIMEOUT, async {
             self.stdin.write_all(line.as_bytes()).await?;
             self.stdin.write_all(b"\n").await?;
@@ -1077,7 +1912,7 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        self.observe("acp_write", projection);
         Ok(())
     }
 
@@ -1107,8 +1942,6 @@ impl AcpClient {
             "method": method,
             "params": params,
         });
-
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1173,7 +2006,6 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
         self.write_ndjson(&msg).await?;
         Ok(())
     }
@@ -1214,27 +2046,22 @@ impl AcpClient {
                 continue;
             }
 
-            // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
-
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.observe(
-                        "acp_parse_error",
-                        serde_json::json!({
-                            "line": trimmed,
-                            "error": e.to_string(),
-                        }),
-                    );
+                    let projection = parse_error_projection(trimmed, &e);
+                    self.observe("acp_parse_error", projection.clone());
                     tracing::warn!(
                         target: "acp::wire",
-                        "failed to parse line as JSON: {e} — skipping"
+                        payload = %projection,
+                        "failed to parse inbound ACP line as JSON — skipping"
                     );
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            let projection = inbound_wire_projection(&msg);
+            tracing::debug!(target: "acp::wire", payload = %projection, "ACP inbound");
+            self.observe("acp_read", projection);
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1274,7 +2101,11 @@ impl AcpClient {
                             // agent process is dead and continuing would hang.
                             self.write_ndjson(&err_resp).await?;
                         }
-                        tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                        tracing::debug!(
+                            target: "acp::wire",
+                            methodBytes = other.len(),
+                            "ignoring unknown inbound method"
+                        );
                     }
                 }
             }
@@ -1459,22 +2290,27 @@ impl AcpClient {
                                 "method": method,
                                 "params": params,
                             });
-                            tracing::debug!(
-                                target: "acp::wire",
-                                "→ {}",
-                                serde_json::to_string(&msg).unwrap_or_default()
-                            );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
+                                    self.observe_transcript_prompt(
+                                        "session/steer",
+                                        &prompt_block_refs,
+                                    );
                                     pending_steer = Some((id, transport, req.ack_tx));
                                 }
                                 Err(e) => {
+                                    let safe = crate::safe_acp_error(&e);
                                     tracing::warn!(
-                                        "steer write failed ({method}): {e} — releasing withheld event"
+                                        errorKind = safe.kind,
+                                        errorCode = ?safe.code,
+                                        "steer write failed ({method}): {} — releasing withheld event",
+                                        safe.operator_copy,
                                     );
-                                    let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
-                                        crate::pool::SteerError::Transport(e.to_string()),
-                                    ));
+                                    let _ = req
+                                        .ack_tx
+                                        .send(crate::pool::SteerAck::Err(
+                                            crate::pool::SteerError::Transport,
+                                        ));
                                 }
                             }
                         }
@@ -1538,26 +2374,22 @@ impl AcpClient {
                         continue;
                     }
 
-                    tracing::debug!(target: "acp::wire", "← {trimmed}");
-
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
                         Err(e) => {
-                            self.observe(
-                                "acp_parse_error",
-                                serde_json::json!({
-                                    "line": trimmed,
-                                    "error": e.to_string(),
-                                }),
-                            );
+                            let projection = parse_error_projection(trimmed, &e);
+                            self.observe("acp_parse_error", projection.clone());
                             tracing::warn!(
                                 target: "acp::wire",
-                                "failed to parse line as JSON: {e} — skipping"
+                                payload = %projection,
+                                "failed to parse inbound ACP line as JSON — skipping"
                             );
                             continue;
                         }
                     };
-                    self.observe("acp_read", msg.clone());
+                    let projection = inbound_wire_projection(&msg);
+                    tracing::debug!(target: "acp::wire", payload = %projection, "ACP inbound");
+                    self.observe("acp_read", projection);
 
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
@@ -1583,9 +2415,8 @@ impl AcpClient {
                                             .get("code")
                                             .and_then(|c| c.as_i64())
                                             .unwrap_or(-1);
-                                        let message = error.to_string();
                                         crate::pool::SteerAck::Err(
-                                            crate::pool::SteerError::AgentError { code, message },
+                                            crate::pool::SteerError::AgentError { code },
                                         )
                                     } else {
                                         // Success result. Whether it counts as
@@ -1658,14 +2489,13 @@ impl AcpClient {
                                                     Some(other) => other.to_string(),
                                                 };
                                                 tracing::warn!(
-                                                    "steer rejected: {ACP_STEER_METHOD} returned \
-                                                     unrecognized outcome {reported} — releasing \
-                                                     withheld event for cancel+merge"
+                                                    outcomeBytes = reported.len(),
+                                                    "steer rejected: {ACP_STEER_METHOD} returned an \
+                                                     unrecognized outcome — releasing withheld event \
+                                                     for cancel+merge"
                                                 );
                                                 crate::pool::SteerAck::Err(
-                                                    crate::pool::SteerError::OutcomeRejected {
-                                                        outcome: reported,
-                                                    },
+                                                    crate::pool::SteerError::OutcomeRejected,
                                                 )
                                             }
                                         }
@@ -1722,7 +2552,11 @@ impl AcpClient {
                                     // agent process is dead and continuing would hang.
                                     self.write_ndjson(&err_resp).await?;
                                 }
-                                tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                                tracing::debug!(
+                                    target: "acp::wire",
+                                    methodBytes = other.len(),
+                                    "ignoring unknown inbound method"
+                                );
                             }
                         }
                     }
@@ -1752,10 +2586,25 @@ impl AcpClient {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
+        self.observe_transcript_session_update(update);
+
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::info!(target: "acp::stream", "{text}");
+                    self.turn_agent_message.push_str(text);
+                    tracing::info!(
+                        target: "acp::stream",
+                        chunkBytes = text.len(),
+                        turnBytes = self.turn_agent_message.len(),
+                        "agent message chunk received"
+                    );
+                    if sensitive_acp_logging_enabled() {
+                        tracing::debug!(
+                            target: "acp::stream_sensitive",
+                            content = %bounded_sensitive_log_value(text),
+                            "agent message chunk content (sensitive diagnostic opt-in)"
+                        );
+                    }
                 }
                 false
             }
@@ -1768,7 +2617,19 @@ impl AcpClient {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                tracing::info!(
+                    target: "acp::tool",
+                    kindBytes = kind.len(),
+                    titleBytes = title.len(),
+                    "tool call started"
+                );
+                if sensitive_acp_logging_enabled() {
+                    tracing::debug!(
+                        target: "acp::tool_sensitive",
+                        title = %bounded_sensitive_log_value(title),
+                        "tool call title (sensitive diagnostic opt-in)"
+                    );
+                }
                 true
             }
             "tool_call_update" => {
@@ -1777,7 +2638,19 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                tracing::info!(
+                    target: "acp::tool",
+                    statusBytes = status.len(),
+                    toolIdBytes = tool_id.len(),
+                    "tool call updated"
+                );
+                if sensitive_acp_logging_enabled() {
+                    tracing::debug!(
+                        target: "acp::tool_sensitive",
+                        toolId = %bounded_sensitive_log_value(tool_id),
+                        "tool call identifier (sensitive diagnostic opt-in)"
+                    );
+                }
                 false
             }
             "plan" => {
@@ -1786,7 +2659,18 @@ impl AcpClient {
             }
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::debug!(target: "acp::thought", "{text}");
+                    tracing::debug!(
+                        target: "acp::thought",
+                        chunkBytes = text.len(),
+                        "agent thought chunk received"
+                    );
+                    if sensitive_acp_logging_enabled() {
+                        tracing::debug!(
+                            target: "acp::thought_sensitive",
+                            content = %bounded_sensitive_log_value(text),
+                            "agent thought content (sensitive diagnostic opt-in)"
+                        );
+                    }
                 }
                 false
             }
@@ -1799,10 +2683,16 @@ impl AcpClient {
                     .unwrap_or_default();
                 tracing::info!(
                     target: "acp::update",
-                    "available_commands_update: {} commands [{}]",
-                    names.len(),
-                    names.join(", ")
+                    commandCount = names.len(),
+                    "available commands updated"
                 );
+                if sensitive_acp_logging_enabled() {
+                    tracing::debug!(
+                        target: "acp::update_sensitive",
+                        names = %bounded_sensitive_log_value(&names.join(", ")),
+                        "available command names (sensitive diagnostic opt-in)"
+                    );
+                }
                 false
             }
             "session_info_update" => {
@@ -1824,7 +2714,8 @@ impl AcpClient {
                         Some(serde_json::Value::String(run_id)) => {
                             tracing::debug!(
                                 target: "acp::update",
-                                "session_info_update: activeRunId={run_id}"
+                                activeRunIdBytes = run_id.len(),
+                                "session_info_update: active run set"
                             );
                             self.active_run_id = Some(run_id.clone());
                         }
@@ -1847,7 +2738,11 @@ impl AcpClient {
             }
             "keepalive" => false,
             other => {
-                tracing::debug!(target: "acp::update", "session/update: {other}");
+                tracing::debug!(
+                    target: "acp::update",
+                    updateTypeBytes = other.len(),
+                    "unknown session/update variant"
+                );
                 false
             }
         }
@@ -1900,7 +2795,7 @@ impl AcpClient {
                 if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
                     tracing::debug!(
                         target: "acp::usage",
-                        session_id = %notif.session_id,
+                        sessionIdBytes = notif.session_id.len(),
                         input = ?payload.accumulated_input_tokens,
                         output = ?payload.accumulated_output_tokens,
                         // A subset of `input`, logged so downstream accounting can
@@ -1913,10 +2808,10 @@ impl AcpClient {
                     self.goose_usage.record(&notif.session_id, payload);
                 }
             }
-            Err(e) => {
+            Err(_) => {
                 tracing::debug!(
                     target: "acp::usage",
-                    "_goose/unstable/session/update: deserialization error: {e}"
+                    "_goose/unstable/session/update: deserialization error"
                 );
             }
         }
@@ -1949,8 +2844,9 @@ impl AcpClient {
 
         tracing::debug!(
             target: "acp::permission",
-            "session/request_permission id={id}, {} options",
-            options.len()
+            permissionIdType = json_value_kind(&id),
+            optionCount = options.len(),
+            "session/request_permission received"
         );
 
         // Find allow_once by kind — NEVER hardcode optionId.
@@ -1958,20 +2854,23 @@ impl AcpClient {
             .iter()
             .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
 
-        let response = if let Some(opt) = allow_once {
+        let (response, transcript_outcome) = if let Some(opt) = allow_once {
             let option_id = opt["optionId"]
                 .as_str()
                 .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
             tracing::info!(
                 target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
+                permissionIdType = json_value_kind(&id),
+                optionIdBytes = option_id.len(),
+                "auto-approving permission with allow_once"
             );
-            permission_response_selected(&id, option_id)
+            (permission_response_selected(&id, option_id), "approved")
         } else {
             // No allow_once — fall back to reject_once.
             tracing::warn!(
                 target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
+                permissionIdType = json_value_kind(&id),
+                "no allow_once option found in permission request; falling back to reject_once"
             );
             let reject = options
                 .iter()
@@ -1979,7 +2878,7 @@ impl AcpClient {
 
             if let Some(opt) = reject {
                 let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
+                (permission_response_selected(&id, option_id), "denied")
             } else {
                 return Err(AcpError::Protocol(
                     "no suitable permission option found (neither allow_once nor reject_once)"
@@ -2005,6 +2904,13 @@ impl AcpClient {
         self.write_ndjson(&response).await?;
         self.permission_responded = true;
         self.pending_permission_id = None;
+        self.observe(
+            "transcript_permission",
+            serde_json::json!({
+                "schemaVersion": 1,
+                "outcome": transcript_outcome,
+            }),
+        );
         Ok(())
     }
 
@@ -2329,6 +3235,391 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_wire_projection_redacts_session_new_and_prompt_secrets() {
+        const PRIVATE_KEY: &str = "PRIVATE_KEY_CANARY_4f5723";
+        const AUTH_TAG: &str = "AUTH_TAG_CANARY_c8320e";
+        const COMMAND: &str = "COMMAND_PATH_CANARY_6f5e28";
+        const ARGUMENT: &str = "ARGUMENT_CANARY_f64844";
+        const CWD: &str = "CWD_CANARY_48e331";
+        const SYSTEM_PROMPT: &str = "SYSTEM_PROMPT_CANARY_6ca867";
+        const META_PROMPT: &str = "META_SYSTEM_PROMPT_CANARY_88a911";
+        const SESSION_TITLE: &str = "SESSION_TITLE_CANARY_a6dd07";
+        const SESSION_ID: &str = "SESSION_ID_CANARY_1a106f";
+        const RUN_ID: &str = "RUN_ID_CANARY_9bf11f";
+        const PROMPT: &str = "USER_PROMPT_CANARY_ba3dc6";
+        const SECOND_BLOCK: &str = "CONTENT_CANARY_098c78";
+
+        let session_new = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "session/new",
+            "params": {
+                "cwd": CWD,
+                "mcpServers": [{
+                    "name": "MCP_NAME_CANARY_fa943d",
+                    "command": COMMAND,
+                    "args": [ARGUMENT, "--stdio"],
+                    "env": [
+                        {"name": "BUZZ_PRIVATE_KEY", "value": PRIVATE_KEY},
+                        {"name": "BUZZ_AUTH_TAG", "value": AUTH_TAG}
+                    ]
+                }],
+                "systemPrompt": SYSTEM_PROMPT,
+                "_meta": {
+                    "systemPrompt": {"append": META_PROMPT},
+                    "sessionTitle": SESSION_TITLE
+                }
+            }
+        });
+        let prompt = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": GOOSE_STEER_METHOD,
+            "params": {
+                "sessionId": SESSION_ID,
+                "expectedRunId": RUN_ID,
+                "prompt": [
+                    {"type": "text", "text": PROMPT},
+                    {"type": "text", "content": SECOND_BLOCK}
+                ]
+            }
+        });
+
+        let raw = format!("{session_new}{prompt}");
+        let new_projection = outbound_wire_projection(&session_new);
+        let prompt_projection = outbound_wire_projection(&prompt);
+        let formatted_projection = format!("{new_projection}{prompt_projection}");
+        for canary in [
+            PRIVATE_KEY,
+            AUTH_TAG,
+            COMMAND,
+            ARGUMENT,
+            CWD,
+            SYSTEM_PROMPT,
+            META_PROMPT,
+            SESSION_TITLE,
+            SESSION_ID,
+            RUN_ID,
+            PROMPT,
+            SECOND_BLOCK,
+            "MCP_NAME_CANARY_fa943d",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+        ] {
+            assert!(raw.contains(canary), "test fixture must contain {canary}");
+            assert!(
+                !formatted_projection.contains(canary),
+                "outbound projection leaked {canary}"
+            );
+        }
+
+        assert_eq!(new_projection["method"], "session/new");
+        assert_eq!(new_projection["params"]["mcpServerCount"], 1);
+        assert_eq!(new_projection["params"]["mcpArgumentCount"], 2);
+        assert_eq!(new_projection["params"]["mcpEnvironmentVariableCount"], 2);
+        assert_eq!(
+            new_projection["params"]["systemPromptBytes"],
+            SYSTEM_PROMPT.len()
+        );
+        assert_eq!(prompt_projection["params"]["promptBlockCount"], 2);
+        assert_eq!(
+            prompt_projection["params"]["expectedRunIdBytes"],
+            RUN_ID.len()
+        );
+    }
+
+    #[test]
+    fn observer_snapshot_separates_wire_projection_from_authorized_transcript() {
+        const PRIVATE_KEY: &str = "OBSERVER_PRIVATE_KEY_CANARY_619033";
+        const AUTH_TAG: &str = "OBSERVER_AUTH_TAG_CANARY_e55df1";
+        const SYSTEM_PROMPT: &str = "OBSERVER_SYSTEM_PROMPT_CANARY_5979f8";
+        const PROMPT: &str = "OBSERVER_USER_PROMPT_CANARY_db78fa";
+        const MCP_COMMAND: &str = "OBSERVER_MCP_COMMAND_CANARY_93847f";
+        const MCP_ARGUMENT: &str = "OBSERVER_MCP_ARGUMENT_CANARY_a86e2c";
+        let observer = ObserverHandle::in_process();
+        let context = ObserverContext::default();
+        let messages = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "session/new",
+                "params": {
+                    "cwd": "C:/observer-secret-workspace",
+                    "mcpServers": [{
+                        "name": "private",
+                        "command": MCP_COMMAND,
+                        "args": [MCP_ARGUMENT],
+                        "env": [
+                            {"name": "BUZZ_PRIVATE_KEY", "value": PRIVATE_KEY},
+                            {"name": "BUZZ_AUTH_TAG", "value": AUTH_TAG}
+                        ]
+                    }],
+                    "systemPrompt": SYSTEM_PROMPT
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "observer-secret-session",
+                    "prompt": [{"type": "text", "text": PROMPT}]
+                }
+            }),
+        ];
+
+        for message in &messages {
+            observer.emit(
+                "acp_write",
+                Some(3),
+                &context,
+                outbound_wire_projection(message),
+            );
+        }
+        observer.emit(
+            "transcript_system_context",
+            Some(3),
+            &context,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "source": "session/new",
+                "text": SYSTEM_PROMPT,
+            }),
+        );
+        observer.emit(
+            "transcript_prompt",
+            Some(3),
+            &context,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "source": "session/prompt",
+                "blocks": [PROMPT],
+            }),
+        );
+        let serialized_snapshot = serde_json::to_string(&observer.snapshot())
+            .expect("observer snapshot should serialize");
+
+        assert_eq!(observer.snapshot().len(), 4);
+        assert!(serialized_snapshot.contains("session/new"));
+        assert!(serialized_snapshot.contains("session/prompt"));
+        assert!(serialized_snapshot.contains(SYSTEM_PROMPT));
+        assert!(serialized_snapshot.contains(PROMPT));
+        for canary in [
+            PRIVATE_KEY,
+            AUTH_TAG,
+            MCP_COMMAND,
+            MCP_ARGUMENT,
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+            "observer-secret-workspace",
+            "observer-secret-session",
+        ] {
+            assert!(
+                !serialized_snapshot.contains(canary),
+                "observer snapshot leaked {canary}"
+            );
+        }
+    }
+
+    #[test]
+    fn inbound_wire_projection_redacts_model_tool_error_and_echoed_secrets() {
+        const MODEL_TEXT: &str = "MODEL_TEXT_CANARY_3c6189";
+        const THOUGHT_TEXT: &str = "THOUGHT_TEXT_CANARY_7f8d11";
+        const TOOL_TITLE: &str = "TOOL_TITLE_CANARY_d398f8";
+        const TOOL_ID: &str = "TOOL_ID_CANARY_57abb9";
+        const TOOL_RESULT: &str = "TOOL_RESULT_CANARY_9e930a";
+        const ECHOED_SECRET: &str = "ECHOED_PRIVATE_KEY_CANARY_8784a1";
+        const ERROR_MESSAGE: &str = "ERROR_MESSAGE_CANARY_e90bc4";
+        const UNKNOWN_METHOD: &str = "UNKNOWN_METHOD_CANARY_087c32";
+
+        let messages = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "PRIVATE_SESSION_CANARY_b6a204",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": MODEL_TEXT}
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"text": THOUGHT_TEXT}
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": TOOL_ID,
+                        "title": TOOL_TITLE,
+                        "status": "completed",
+                        "content": [{"type": "content", "content": TOOL_RESULT}],
+                        "rawOutput": ECHOED_SECRET
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "error": {
+                    "code": -32001,
+                    "message": ERROR_MESSAGE,
+                    "data": {"echo": ECHOED_SECRET}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": UNKNOWN_METHOD,
+                "params": {"echo": ECHOED_SECRET}
+            }),
+        ];
+
+        let raw = messages.iter().map(ToString::to_string).collect::<String>();
+        let projections: Vec<serde_json::Value> =
+            messages.iter().map(inbound_wire_projection).collect();
+        let formatted = projections
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        for canary in [
+            MODEL_TEXT,
+            THOUGHT_TEXT,
+            TOOL_TITLE,
+            TOOL_ID,
+            TOOL_RESULT,
+            ECHOED_SECRET,
+            ERROR_MESSAGE,
+            UNKNOWN_METHOD,
+            "PRIVATE_SESSION_CANARY_b6a204",
+        ] {
+            assert!(raw.contains(canary), "test fixture must contain {canary}");
+            assert!(
+                !formatted.contains(canary),
+                "inbound projection leaked {canary}"
+            );
+        }
+
+        assert_eq!(
+            projections[0]["payload"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(projections[2]["payload"]["toolCallIdBytes"], TOOL_ID.len());
+        assert_eq!(projections[3]["payload"]["errorCode"], -32001);
+        assert_eq!(projections[4]["method"], "other");
+    }
+
+    #[test]
+    fn inbound_observer_and_parse_error_snapshots_never_serialize_raw_lines() {
+        const MODEL_TEXT: &str = "OBSERVER_MODEL_CANARY_c2721d";
+        const TOOL_RESULT: &str = "OBSERVER_TOOL_RESULT_CANARY_e44d95";
+        const ERROR_MESSAGE: &str = "OBSERVER_ERROR_CANARY_53674b";
+        const MALFORMED_LINE_SECRET: &str = "MALFORMED_LINE_SECRET_CANARY_fed58d";
+        let observer = ObserverHandle::in_process();
+        let context = ObserverContext::default();
+        let messages = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": MODEL_TEXT}
+                }}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "OBSERVER_TOOL_ID_CANARY_6aab54",
+                    "content": [{"content": TOOL_RESULT}]
+                }}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "private-response-id",
+                "error": {"code": -32603, "message": ERROR_MESSAGE}
+            }),
+        ];
+        for message in &messages {
+            observer.emit(
+                "acp_read",
+                Some(4),
+                &context,
+                inbound_wire_projection(message),
+            );
+        }
+
+        let malformed = format!(r#"{{"secret":"{MALFORMED_LINE_SECRET}""#);
+        let parse_error = serde_json::from_str::<serde_json::Value>(&malformed)
+            .expect_err("fixture must be malformed JSON");
+        observer.emit(
+            "acp_parse_error",
+            Some(4),
+            &context,
+            parse_error_projection(&malformed, &parse_error),
+        );
+
+        let serialized_snapshot = serde_json::to_string(&observer.snapshot())
+            .expect("observer snapshot should serialize");
+        assert_eq!(observer.snapshot().len(), 4);
+        assert!(serialized_snapshot.contains("agent_message_chunk"));
+        assert!(serialized_snapshot.contains("tool_call_update"));
+        assert!(serialized_snapshot.contains("errorCode"));
+        assert!(serialized_snapshot.contains("lineBytes"));
+        for canary in [
+            MODEL_TEXT,
+            TOOL_RESULT,
+            ERROR_MESSAGE,
+            MALFORMED_LINE_SECRET,
+            "OBSERVER_TOOL_ID_CANARY_6aab54",
+            "private-response-id",
+        ] {
+            assert!(
+                !serialized_snapshot.contains(canary),
+                "inbound observer snapshot leaked {canary}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_diagnostic_values_are_unicode_safe_and_bounded() {
+        assert_eq!(bounded_sensitive_log_value("ordinary"), "ordinary");
+        let oversized = "🧭".repeat(MAX_SENSITIVE_LOG_CHARS + 1);
+        let bounded = bounded_sensitive_log_value(&oversized);
+        assert!(bounded.ends_with("…[truncated]"));
+        assert_eq!(
+            bounded.trim_end_matches("…[truncated]").chars().count(),
+            MAX_SENSITIVE_LOG_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_agent_chunks_are_accumulated_for_successful_turn_writeback() {
+        let mut client = spawn_inert_client().await;
+        for text in ["hello ", "world"] {
+            client.handle_session_update(&serde_json::json!({
+                "params": {"update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": text}
+                }}
+            }));
+        }
+        assert_eq!(client.take_turn_agent_message(), "hello world");
+        assert!(client.take_turn_agent_message().is_empty());
+        client.shutdown().await;
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {
@@ -2960,6 +4251,53 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_session_prompt_emits_projection_and_semantic_content_separately() {
+        let script = "read -r _prompt; \
+                      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"end_turn\"}}'";
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_script(script).await;
+        client.set_observer(Some(observer.clone()), 0);
+
+        client
+            .session_prompt_blocks_with_idle_timeout(
+                "private-session-id",
+                &[
+                    "[Context]\nthread",
+                    "[Buzz event: @mention]\nContent: hello",
+                ],
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("prompt should complete");
+
+        let snapshot = observer.snapshot();
+        let wire = snapshot
+            .iter()
+            .find(|event| event.kind == "acp_write")
+            .expect("structural write projection");
+        assert_eq!(wire.payload["method"], "session/prompt");
+        assert_eq!(wire.payload["params"]["promptBlockCount"], 2);
+        assert!(wire.payload["params"].get("prompt").is_none());
+        assert!(!wire.payload.to_string().contains("private-session-id"));
+
+        let semantic = snapshot
+            .iter()
+            .find(|event| event.kind == "transcript_prompt")
+            .expect("display-authorized semantic prompt");
+        assert_eq!(semantic.payload["schemaVersion"], 1);
+        assert_eq!(semantic.payload["source"], "session/prompt");
+        assert_eq!(
+            semantic.payload["blocks"],
+            serde_json::json!([
+                "[Context]\nthread",
+                "[Buzz event: @mention]\nContent: hello"
+            ])
+        );
+        client.shutdown().await;
+    }
+
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3053,6 +4391,371 @@ mod tests {
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
         );
+    }
+
+    fn test_credential_projection() -> AcpChildCredentialProjection {
+        AcpChildCredentialProjection::broker_v1(
+            "tcp://127.0.0.1:8791",
+            uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                .expect("valid test capability id"),
+            "CAPABILITY_TOKEN_CANARY_2d159f_32bytes",
+            nostr::PublicKey::from_hex(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("valid test public key"),
+            "ws://127.0.0.1:3000",
+            2_000_000_000,
+        )
+        .expect("valid test credential projection")
+    }
+
+    #[test]
+    fn broker_projection_credential_name_checks_are_ascii_case_insensitive() {
+        for key in [
+            "BUZZ_PRIVATE_KEY",
+            "buzz_private_key",
+            "BuZz_AcP_PrIvAtE_KeY",
+            "nostr_private_key",
+            "buzz_auth_tag",
+        ] {
+            assert!(is_long_lived_credential_env(key), "reserved alias: {key}");
+        }
+        for key in [
+            "BUZZ_CAPABILITY_TOKEN",
+            "buzz_capability_token",
+            "BuZz_CaPaBiLiTy_UnLiStEd",
+        ] {
+            assert!(is_capability_env(key), "capability-shaped name: {key}");
+        }
+        assert!(!is_long_lived_credential_env("BUZZ_PUBLIC_KEY"));
+        assert!(!is_capability_env("BUZZ_CAPABLE_TOKEN"));
+    }
+
+    #[test]
+    fn broker_projection_requires_exact_loopback_tcp_endpoint_and_canonical_relay() {
+        let capability_id =
+            uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("valid id");
+        let public_key = nostr::PublicKey::from_hex(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("valid public key");
+        let build = |endpoint: &str, relay: &str| {
+            AcpChildCredentialProjection::broker_v1(
+                endpoint,
+                capability_id,
+                "CAPABILITY_TOKEN_CANARY_2d159f_32bytes",
+                public_key,
+                relay,
+                2_000_000_000,
+            )
+        };
+
+        assert!(build("tcp://127.0.0.1:8791", "wss://RELAY.EXAMPLE/").is_ok());
+        for endpoint in [
+            "http://127.0.0.1:8791",
+            "tcp://10.0.0.1:8791",
+            "tcp://[::1]:8791",
+            "tcp://127.0.0.1",
+            "tcp://127.0.0.1:0",
+            "tcp://user@127.0.0.1:8791",
+            "tcp://127.0.0.1:8791/path",
+            "tcp://127.0.0.1:8791?query=1",
+            "tcp://127.0.0.1:8791#fragment",
+        ] {
+            assert!(
+                build(endpoint, "wss://relay.example").is_err(),
+                "invalid endpoint must fail: {endpoint}"
+            );
+        }
+        for relay in [
+            "wss://user@relay.example",
+            "wss://relay.example/path",
+            "wss://relay.example?query=1",
+            "wss://relay.example#fragment",
+        ] {
+            assert!(
+                build("tcp://127.0.0.1:8791", relay).is_err(),
+                "noncanonical relay must fail: {relay}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_projection_mcp_env_is_exact_and_secret_alias_free() {
+        let projection = test_credential_projection();
+        let env = projection.mcp_env();
+        let names: Vec<&str> = env.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "BUZZ_CAPABILITY_ENDPOINT",
+                "BUZZ_CAPABILITY_ID",
+                "BUZZ_CAPABILITY_TOKEN",
+                "BUZZ_PUBLIC_KEY",
+                "BUZZ_RELAY_URL",
+                "BUZZ_CAPABILITY_EXPIRES_AT",
+            ]
+        );
+        assert!(env
+            .iter()
+            .all(|entry| !is_long_lived_credential_env(&entry.name)));
+    }
+
+    #[test]
+    fn broker_projection_portable_grandchild() {
+        let Some(output_path) = std::env::var_os("BUZZ_CREDENTIAL_PROBE_OUTPUT") else {
+            return;
+        };
+        let value = serde_json::json!({
+            "private": std::env::var_os("BUZZ_PRIVATE_KEY").is_some(),
+            "legacyPrivate": std::env::var_os("BUZZ_ACP_PRIVATE_KEY").is_some(),
+            "nostrPrivate": std::env::var_os("NOSTR_PRIVATE_KEY").is_some(),
+            "authTag": std::env::var_os("BUZZ_AUTH_TAG").is_some(),
+            "unknownCapability": std::env::var_os("BUZZ_CAPABILITY_UNLISTED_CANARY").is_some(),
+            "mode": std::env::var("BUZZ_CREDENTIAL_MODE").ok(),
+            "endpoint": std::env::var("BUZZ_CAPABILITY_ENDPOINT").ok(),
+            "capabilityId": std::env::var("BUZZ_CAPABILITY_ID").ok(),
+            "tokenPresent": std::env::var_os("BUZZ_CAPABILITY_TOKEN").is_some(),
+            "publicKey": std::env::var("BUZZ_PUBLIC_KEY").ok(),
+            "relay": std::env::var("BUZZ_RELAY_URL").ok(),
+            "expiry": std::env::var("BUZZ_CAPABILITY_EXPIRES_AT").ok(),
+        });
+        std::fs::write(
+            output_path,
+            serde_json::to_vec(&value).expect("serialize credential probe"),
+        )
+        .expect("write credential probe");
+    }
+
+    #[tokio::test]
+    async fn broker_projection_portable_child_helper() {
+        let Some(output_path) = std::env::var_os("BUZZ_CREDENTIAL_PROBE_OUTPUT") else {
+            return;
+        };
+        let current_executable = std::env::current_exe().expect("current test executable");
+        let command = current_executable
+            .to_str()
+            .expect("test executable path is UTF-8");
+        let args = vec![
+            "--exact".to_owned(),
+            "acp::tests::broker_projection_portable_grandchild".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let mut client = AcpClient::spawn_with_credential_projection(
+            command,
+            &args,
+            &[(
+                "BUZZ_CREDENTIAL_PROBE_OUTPUT".to_owned(),
+                output_path.to_string_lossy().into_owned(),
+            )],
+            false,
+            &test_credential_projection(),
+        )
+        .await
+        .expect("spawn portable credential probe");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), client.child.wait())
+            .await
+            .expect("portable credential probe timeout")
+            .expect("portable credential probe wait");
+        assert!(status.success(), "portable credential probe failed");
+    }
+
+    #[test]
+    fn broker_projection_fake_child_is_secret_free_on_this_platform() {
+        let directory = tempfile::tempdir().expect("credential probe tempdir");
+        let output_path = directory.path().join("credential-probe.json");
+        let current_executable = std::env::current_exe().expect("current test executable");
+        let output = std::process::Command::new(current_executable)
+            .arg("--exact")
+            .arg("acp::tests::broker_projection_portable_child_helper")
+            .arg("--nocapture")
+            .env("BUZZ_CREDENTIAL_PROBE_OUTPUT", &output_path)
+            .env("BUZZ_PRIVATE_KEY", "PRIVATE_KEY_CANARY_18af6d")
+            .env("BUZZ_ACP_PRIVATE_KEY", "LEGACY_PRIVATE_KEY_CANARY_c3869e")
+            .env("NOSTR_PRIVATE_KEY", "NOSTR_KEY_CANARY_e9cfb3")
+            .env("BUZZ_AUTH_TAG", "AUTH_TAG_CANARY_6968bd")
+            .env("BUZZ_CAPABILITY_UNLISTED_CANARY", "must-not-pass")
+            .output()
+            .expect("run portable credential child test");
+        assert!(output.status.success(), "portable credential child failed");
+        let probe: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output_path).expect("read portable credential probe"),
+        )
+        .expect("parse portable credential probe");
+        for field in [
+            "private",
+            "legacyPrivate",
+            "nostrPrivate",
+            "authTag",
+            "unknownCapability",
+        ] {
+            assert_eq!(probe[field], false, "{field} leaked into broker child");
+        }
+        assert_eq!(probe["mode"], "broker-v1");
+        assert_eq!(probe["endpoint"], "tcp://127.0.0.1:8791");
+        assert_eq!(
+            probe["capabilityId"],
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        );
+        assert_eq!(probe["tokenPresent"], true);
+        assert_eq!(
+            probe["publicKey"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(probe["relay"], "ws://127.0.0.1:3000");
+        assert_eq!(probe["expiry"], "2000000000");
+    }
+
+    #[cfg(unix)]
+    async fn read_credential_probe(mut client: AcpClient) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(line) = client.reader.next().await {
+            lines.push(line.expect("credential probe output is readable"));
+        }
+        client.shutdown().await;
+        lines
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broker_projection_child_helper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("BUZZ_CREDENTIAL_PROJECTION_CHILD_TEST").is_none() {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("credential probe tempdir");
+        let path = directory.path().join("credential-probe");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+printf 'private=%s\n' "${BUZZ_PRIVATE_KEY+set}"
+printf 'legacy_private=%s\n' "${BUZZ_ACP_PRIVATE_KEY+set}"
+printf 'nostr=%s\n' "${NOSTR_PRIVATE_KEY+set}"
+printf 'auth=%s\n' "${BUZZ_AUTH_TAG+set}"
+printf 'unknown=%s\n' "${BUZZ_CAPABILITY_UNLISTED_CANARY+set}"
+printf 'mixed_unknown=%s\n' "${buzz_capability_unlisted_canary+set}"
+printf 'mixed_legacy=%s\n' "${buzz_acp_private_key+set}"
+printf 'mode=%s\n' "${BUZZ_CREDENTIAL_MODE:-<unset>}"
+printf 'endpoint=%s\n' "${BUZZ_CAPABILITY_ENDPOINT:-<unset>}"
+printf 'id=%s\n' "${BUZZ_CAPABILITY_ID:-<unset>}"
+printf 'token=%s\n' "${BUZZ_CAPABILITY_TOKEN+set}"
+printf 'public=%s\n' "${BUZZ_PUBLIC_KEY:-<unset>}"
+printf 'relay=%s\n' "${BUZZ_RELAY_URL:-<unset>}"
+printf 'expires=%s\n' "${BUZZ_CAPABILITY_EXPIRES_AT:-<unset>}"
+"#,
+        )
+        .expect("write credential probe");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("stat credential probe")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).expect("chmod credential probe");
+        let command = path.to_str().expect("credential probe path is UTF-8");
+
+        let legacy = AcpClient::spawn(command, &[], &[], false)
+            .await
+            .expect("legacy child spawn");
+        let legacy_lines = read_credential_probe(legacy).await;
+        for expected in ["private=set", "nostr=set", "auth=set"] {
+            assert!(legacy_lines.iter().any(|line| line == expected));
+        }
+
+        let broker = AcpClient::spawn_with_credential_projection(
+            command,
+            &[],
+            &[],
+            false,
+            &test_credential_projection(),
+        )
+        .await
+        .expect("broker-projected child spawn");
+        let broker_lines = read_credential_probe(broker).await;
+        for expected in [
+            "private=",
+            "legacy_private=",
+            "nostr=",
+            "auth=",
+            "unknown=",
+            "mixed_unknown=",
+            "mixed_legacy=",
+            "mode=broker-v1",
+            "endpoint=tcp://127.0.0.1:8791",
+            "id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "token=set",
+            "public=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "relay=ws://127.0.0.1:3000",
+            "expires=2000000000",
+        ] {
+            assert!(
+                broker_lines.iter().any(|line| line == expected),
+                "credential projection did not produce expected structural probe output"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_projection_fake_child_removes_secrets_and_preserves_legacy_spawn() {
+        let current_executable = std::env::current_exe().expect("current test executable");
+        let mut command = std::process::Command::new(current_executable);
+        command
+            .arg("--exact")
+            .arg("acp::tests::broker_projection_child_helper")
+            .arg("--nocapture")
+            .env("BUZZ_CREDENTIAL_PROJECTION_CHILD_TEST", "1")
+            .env("BUZZ_PRIVATE_KEY", "PRIVATE_KEY_CANARY_18af6d")
+            .env("BUZZ_ACP_PRIVATE_KEY", "LEGACY_PRIVATE_KEY_CANARY_c3869e")
+            .env("NOSTR_PRIVATE_KEY", "NOSTR_KEY_CANARY_e9cfb3")
+            .env("BUZZ_AUTH_TAG", "AUTH_TAG_CANARY_6968bd")
+            .env("BUZZ_CAPABILITY_UNLISTED_CANARY", "must-not-pass")
+            .env("buzz_capability_unlisted_canary", "mixed-must-not-pass")
+            .env("buzz_acp_private_key", "mixed-legacy-must-not-pass");
+        for key in [
+            "BUZZ_CAPABILITY_ENDPOINT",
+            "BUZZ_CAPABILITY_ID",
+            "BUZZ_CAPABILITY_TOKEN",
+            "BUZZ_PUBLIC_KEY",
+            "BUZZ_RELAY_URL",
+            "BUZZ_CAPABILITY_EXPIRES_AT",
+        ] {
+            command.env_remove(key);
+        }
+        let output = command
+            .output()
+            .expect("run isolated credential child test");
+        assert!(
+            output.status.success(),
+            "isolated credential projection child test failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_projection_rejects_reserved_extra_environment_without_spawning() {
+        for (key, canary) in [
+            ("BUZZ_PRIVATE_KEY", "LONG_LIVED_CANARY"),
+            ("buzz_acp_private_key", "LEGACY_ALIAS_CANARY"),
+            ("buzz_Capability_ID", "ARBITRARY_CAPABILITY_CANARY"),
+        ] {
+            let result = AcpClient::spawn_with_credential_projection(
+                "credential-projection-must-not-spawn",
+                &[],
+                &[(key.to_owned(), canary.to_owned())],
+                false,
+                &test_credential_projection(),
+            )
+            .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(mut client) => {
+                    client.shutdown().await;
+                    panic!("mixed credential sources must fail before process spawn");
+                }
+            };
+            assert!(matches!(error, AcpError::Protocol(_)));
+            assert!(!error.to_string().contains(canary));
+        }
     }
 
     #[tokio::test]
@@ -3162,6 +4865,56 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["stopReason"].as_str(), Some("end_turn"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_semantic_event_exposes_outcome_without_request_details() {
+        const TOOL_ID: &str = "PERMISSION_TOOL_ID_CANARY_8ea176";
+        const OPTION_ID: &str = "PERMISSION_OPTION_ID_CANARY_c739c8";
+        const OPTION_NAME: &str = "PERMISSION_OPTION_NAME_CANARY_c59675";
+        let script = format!(
+            "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"session/request_permission\",\"params\":{{\"sessionId\":\"private-session\",\"toolCallId\":\"{TOOL_ID}\",\"options\":[{{\"optionId\":\"{OPTION_ID}\",\"name\":\"{OPTION_NAME}\",\"kind\":\"allow_once\"}}]}}}}'; \
+             read -r _permission_response; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{{\"done\":true}}}}'"
+        );
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_script(&script).await;
+        client.set_observer(Some(observer.clone()), 0);
+        let max_duration = std::time::Duration::from_secs(3);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "private-session",
+                999,
+                std::time::Duration::from_secs(2),
+                tokio::time::Instant::now() + max_duration,
+                max_duration,
+            )
+            .await
+            .expect("final response after permission");
+        assert_eq!(result["done"], true);
+
+        let snapshot = observer.snapshot();
+        let permission = snapshot
+            .iter()
+            .find(|event| event.kind == "transcript_permission")
+            .expect("safe permission outcome");
+        assert_eq!(permission.payload["schemaVersion"], 1);
+        assert_eq!(permission.payload["outcome"], "approved");
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for forbidden in [
+            TOOL_ID,
+            OPTION_ID,
+            OPTION_NAME,
+            "private-session",
+            "allow_once",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "observer permission flow leaked {forbidden}"
+            );
+        }
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -3652,6 +5405,268 @@ mod tests {
             .expect("spawn cat as inert client")
     }
 
+    #[tokio::test]
+    async fn transcript_semantic_events_have_narrow_versioned_payloads() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_inert_client().await;
+        client.set_observer(Some(observer.clone()), 2);
+
+        client.observe_transcript_prompt(
+            "session/prompt",
+            &[
+                "[Context]\nthread",
+                "[Buzz event: @mention]\nContent: hello",
+            ],
+        );
+        client.observe_transcript_system_context("[Base]\nsafe display context");
+
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].kind, "transcript_prompt");
+        assert_eq!(snapshot[0].payload["schemaVersion"], 1);
+        assert_eq!(snapshot[0].payload["source"], "session/prompt");
+        assert_eq!(snapshot[0].payload["blocks"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot[1].kind, "transcript_system_context");
+        assert_eq!(snapshot[1].payload["schemaVersion"], 1);
+        assert_eq!(snapshot[1].payload["source"], "session/new");
+        assert_eq!(snapshot[1].payload["text"], "[Base]\nsafe display context");
+
+        let serialized = serde_json::to_string(
+            &snapshot
+                .iter()
+                .map(|event| &event.payload)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for forbidden in [
+            "mcpServers",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+            "sessionId",
+            "expectedRunId",
+            "cwd",
+            "jsonrpc",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "semantic transcript event exposed wire-only field {forbidden}"
+            );
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_transcript_projection_allows_agent_text_but_redacts_activity_details() {
+        const TOOL_ID: &str = "TOOL_ID_CANARY_55c5f8";
+        const TOOL_TITLE: &str = "TOOL_TITLE_CANARY_a69918";
+        const TOOL_ARG: &str = "BUZZ_PRIVATE_KEY=TOOL_ARG_CANARY_ba21d3";
+        const TOOL_RESULT: &str = "BUZZ_AUTH_TAG=TOOL_RESULT_CANARY_8883ae";
+        const THOUGHT: &str = "THOUGHT_CANARY_8f43e1";
+        const PLAN_TEXT: &str = "PLAN_TEXT_CANARY_15768a";
+        const COMMAND_NAME: &str = "COMMAND_NAME_CANARY_fde9bf";
+        const CONFIG_VALUE: &str = "CONFIG_VALUE_CANARY_53bb2b";
+        const RUN_ID: &str = "RUN_ID_CANARY_a674ca";
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_inert_client().await;
+        client.set_observer(Some(observer.clone()), 0);
+
+        let updates = [
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "MESSAGE_ID_CANARY_36fd7f",
+                "content": {"type": "text", "text": "owner-visible assistant text"},
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "THOUGHT_ID_CANARY_34e9fd",
+                "content": {"type": "text", "text": THOUGHT},
+            }),
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": TOOL_ID,
+                "title": TOOL_TITLE,
+                "status": "executing",
+                "rawInput": {"secret": TOOL_ARG},
+                "rawOutput": TOOL_RESULT,
+            }),
+            serde_json::json!({
+                "sessionUpdate": "plan",
+                "entries": [{"content": PLAN_TEXT, "status": "completed"}],
+            }),
+            serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{"name": COMMAND_NAME}],
+            }),
+            serde_json::json!({
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{"name": "private", "currentValue": CONFIG_VALUE}],
+            }),
+            serde_json::json!({
+                "sessionUpdate": "session_info_update",
+                "_meta": {"goose": {"activeRunId": RUN_ID}},
+            }),
+        ];
+        for update in updates {
+            let _ = client.handle_session_update(&serde_json::json!({
+                "params": {"update": update},
+            }));
+        }
+
+        let transcript_events: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "transcript_session_update")
+            .collect();
+        assert_eq!(transcript_events.len(), 6, "session_info emits no UI event");
+        let serialized = serde_json::to_string(&transcript_events).unwrap();
+        assert!(serialized.contains("owner-visible assistant text"));
+        assert!(serialized.contains("sha256:"));
+        for forbidden in [
+            "MESSAGE_ID_CANARY_36fd7f",
+            "THOUGHT_ID_CANARY_34e9fd",
+            TOOL_ID,
+            TOOL_TITLE,
+            TOOL_ARG,
+            TOOL_RESULT,
+            THOUGHT,
+            PLAN_TEXT,
+            COMMAND_NAME,
+            CONFIG_VALUE,
+            RUN_ID,
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "safe inbound transcript projection leaked {forbidden}"
+            );
+        }
+
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn semantic_transcript_content_is_bounded_before_observer_buffering() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_inert_client().await;
+        client.set_observer(Some(observer.clone()), 0);
+        let oversized = "\"\\\n\u{0001}🦀".repeat(30_000);
+        let _ = client.handle_session_update(&serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": oversized},
+            }},
+        }));
+        let event = observer.snapshot().pop().expect("semantic update");
+        let text = event.payload["text"].as_str().expect("bounded text");
+        assert!(text.contains("…[elided"));
+        assert!(
+            serde_json::to_vec(&event).unwrap().len()
+                <= buzz_core::observer::OBSERVER_MAX_PLAINTEXT_LEN,
+            "complete escape-expanded ObserverEvent must fit the plaintext ceiling"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worst_case_prompt_frame_fits_and_preserves_final_user_event_block() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_inert_client().await;
+        client.set_observer(Some(observer.clone()), 0);
+        client.set_observer_context(ObserverContext {
+            channel_id: Some("11111111-1111-1111-1111-111111111111".into()),
+            session_id: Some("\"\\\n\u{0001}🦀".repeat(200)),
+            turn_id: Some("22222222-2222-2222-2222-222222222222".into()),
+            started_at: Some("2026-08-16T12:34:56.789Z".into()),
+        });
+        let mut blocks: Vec<String> = (0..255)
+            .map(|index| format!("[Context {index}]\n{}", "\"\\\n\u{0001}🦀".repeat(400)))
+            .collect();
+        blocks.push(format!(
+            "[Buzz event: @mention]\nContent: final-user-event {}",
+            "\"\\\n\u{0001}🦀".repeat(8_000)
+        ));
+        let refs: Vec<&str> = blocks.iter().map(String::as_str).collect();
+        client.observe_transcript_prompt("session/prompt", &refs);
+
+        let event = observer.snapshot().pop().expect("semantic prompt");
+        assert!(
+            serde_json::to_vec(&event).unwrap().len()
+                <= buzz_core::observer::OBSERVER_MAX_PLAINTEXT_LEN,
+            "complete 256-block escape-expanded ObserverEvent must fit"
+        );
+        let fitted = event.payload["blocks"].as_array().expect("blocks survive");
+        assert!(
+            fitted.iter().any(|block| {
+                block
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[Buzz event: @mention]"))
+            }),
+            "final triggering user-event block must survive context shedding"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn permission_transcript_payload_contains_only_version_and_outcome() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_inert_client().await;
+        client.set_observer(Some(observer.clone()), 0);
+        client
+            .handle_permission_request(&serde_json::json!({
+                "id": "PERMISSION_REQUEST_ID_CANARY_2b93f0",
+                "params": {
+                    "toolCallId": "PERMISSION_TOOL_ID_CANARY_73a5a8",
+                    "options": [{
+                        "optionId": "PERMISSION_OPTION_ID_CANARY_52f53d",
+                        "name": "PERMISSION_OPTION_NAME_CANARY_41ec7b",
+                        "kind": "allow_once",
+                    }],
+                },
+            }))
+            .await
+            .expect("permission response should be written");
+
+        let event = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "transcript_permission")
+            .expect("semantic permission outcome");
+        assert_eq!(
+            event.payload,
+            serde_json::json!({"schemaVersion": 1, "outcome": "approved"})
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_permission_emits_cancelled_transcript_after_write() {
+        let observer = ObserverHandle::in_process();
+        let mut client = spawn_inert_client().await;
+        client.set_observer(Some(observer.clone()), 0);
+        client.last_prompt_id = Some(999);
+        client.pending_permission_id = Some(serde_json::json!("private-permission-id"));
+        client.permission_responded = false;
+
+        let _ = client
+            .cancel_with_cleanup_until(
+                "private-session-id",
+                tokio::time::Instant::now() + std::time::Duration::from_millis(25),
+            )
+            .await;
+
+        let permission = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "transcript_permission")
+            .expect("cancelled semantic permission outcome");
+        assert_eq!(
+            permission.payload,
+            serde_json::json!({"schemaVersion": 1, "outcome": "cancelled"})
+        );
+        client.shutdown().await;
+    }
+
     /// Build a `session/update` JSON-RPC notification carrying a
     /// `session_info_update` with the given `_meta.goose.activeRunId` value.
     /// Pass `None` to omit the `activeRunId` field entirely.
@@ -4100,11 +6115,13 @@ mod tests {
     #[tokio::test]
     async fn acp_steer_request_omits_expected_run_id_and_carries_session_and_prompt() {
         let capture = capture_path("acp_shape");
+        let observer = ObserverHandle::in_process();
         let mut client = spawn_steer_capture_script(
             &capture,
             r#"{"jsonrpc":"2.0","id":0,"result":{"outcome":"injected"}}"#,
         )
         .await;
+        client.set_observer(Some(observer.clone()), 0);
         set_steering_supported(&mut client);
         assert!(
             client.active_run_id().is_none(),
@@ -4134,6 +6151,17 @@ mod tests {
         assert!(
             matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected outcome must ack Success, got {ack:?}"
+        );
+        let semantic = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "transcript_prompt")
+            .expect("successful steer write must emit semantic prompt content");
+        assert_eq!(semantic.payload["schemaVersion"], 1);
+        assert_eq!(semantic.payload["source"], "session/steer");
+        assert_eq!(
+            semantic.payload["blocks"],
+            serde_json::json!(["steer body"])
         );
     }
 
@@ -4185,12 +6213,7 @@ mod tests {
         let (_written, ack) = run_one_steer(&mut client, &capture).await;
 
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
-                assert_eq!(
-                    outcome, "failed",
-                    "rejected outcome must report what the agent said, unquoted"
-                );
-            }
+            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected) => {}
             other => panic!("expected Err(OutcomeRejected), got {other:?}"),
         }
     }
@@ -4212,12 +6235,7 @@ mod tests {
         let (_written, ack) = run_one_steer(&mut client, &capture).await;
 
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
-                assert_eq!(
-                    outcome, "<absent>",
-                    "a result with no outcome field must be reported as absent"
-                );
-            }
+            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected) => {}
             other => panic!(
                 "expected Err(OutcomeRejected) for a bare {{}} success — \
                  anything else risks dropping the event, got {other:?}"

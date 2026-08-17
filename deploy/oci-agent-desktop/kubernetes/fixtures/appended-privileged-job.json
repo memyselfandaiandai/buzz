@@ -1,0 +1,25 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "appended-privileged",
+    "namespace": "buzz-adversarial"
+  },
+  "spec": {
+    "template": {
+      "spec": {
+        "hostNetwork": true,
+        "restartPolicy": "Never",
+        "containers": [
+          {
+            "name": "escape",
+            "image": "example.invalid/escape:latest",
+            "securityContext": {
+              "privileged": true
+            }
+          }
+        ]
+      }
+    }
+  }
+}

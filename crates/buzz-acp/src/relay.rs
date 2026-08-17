@@ -452,6 +452,78 @@ impl RestClient {
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
     }
+
+    /// Submit a durable event and require an affirmative, identity-matching
+    /// bridge acknowledgement. HTTP success alone is not delivery evidence.
+    #[cfg(feature = "durable-turn-lifecycle")]
+    pub async fn submit_event_verified(&self, event: &Event) -> Result<String, RelayError> {
+        let response = self.submit_event(event).await?;
+        validate_submit_response(event, &response)
+    }
+}
+
+#[cfg(any(test, feature = "durable-turn-lifecycle"))]
+fn validate_submit_response(event: &Event, response: &Value) -> Result<String, RelayError> {
+    let accepted = response
+        .get("accepted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let event_id = response
+        .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !accepted {
+        let message = response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("relay rejected durable event");
+        let bounded: String = message.chars().take(256).collect();
+        return Err(RelayError::Http(format!(
+            "relay rejected durable event: {bounded}"
+        )));
+    }
+    let expected = event.id.to_hex();
+    if event_id != expected {
+        return Err(RelayError::Http(
+            "relay acknowledgement event id did not match submitted event".to_owned(),
+        ));
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
+mod durable_submit_response_tests {
+    use nostr::{EventBuilder, Keys, Kind};
+
+    use super::*;
+
+    #[test]
+    fn durable_submit_requires_acceptance_and_matching_event_id(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event =
+            EventBuilder::new(Kind::Custom(9), "durable").sign_with_keys(&Keys::generate())?;
+        let accepted = json!({
+            "accepted": true,
+            "event_id": event.id.to_hex(),
+            "message": ""
+        });
+        assert_eq!(
+            validate_submit_response(&event, &accepted)?,
+            event.id.to_hex()
+        );
+        assert!(validate_submit_response(
+            &event,
+            &json!({"accepted": false, "event_id": event.id.to_hex(), "message": "blocked"})
+        )
+        .is_err());
+        assert!(validate_submit_response(
+            &event,
+            &json!({"accepted": true, "event_id": nostr::EventId::all_zeros().to_hex()})
+        )
+        .is_err());
+        assert!(validate_submit_response(&event, &Value::Null).is_err());
+        Ok(())
+    }
 }
 
 /// Events the harness cares about.

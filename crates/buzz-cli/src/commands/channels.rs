@@ -32,7 +32,7 @@ pub async fn cmd_list_channels(
     let effective_limit = limit.unwrap_or(500);
     let events = if member == Some(true) {
         // Step 1: find channel IDs where we're a member (kind:39002)
-        let my_pk = client.keys().public_key().to_hex();
+        let my_pk = client.public_key().to_hex();
         let member_filter = serde_json::json!({
             "kinds": [39002],
             "#p": [my_pk],
@@ -322,7 +322,7 @@ pub async fn cmd_create_channel(
         buzz_sdk::build_create_channel(channel_uuid, name, Some(vis), Some(ct), description, ttl)
             .map_err(|e| CliError::Other(format!("build_create_channel failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     print_create_response(&resp, "channel_id", &channel_uuid.to_string());
     Ok(())
@@ -692,7 +692,7 @@ pub async fn cmd_create_channel_from_template(
     // be selected.
     let owner = client
         .auth_tag_owner_hex()
-        .unwrap_or_else(|| client.keys().public_key().to_hex());
+        .unwrap_or_else(|| client.public_key().to_hex());
 
     let resolved = build_roster_resolution(client, &owner, &template.agents).await?;
 
@@ -717,7 +717,7 @@ pub async fn cmd_create_channel_from_template(
         ttl,
     )
     .map_err(|e| CliError::Other(format!("build_create_channel failed: {e}")))?;
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     client.submit_event(event).await?;
 
     let mut canvas_applied = false;
@@ -728,7 +728,7 @@ pub async fn cmd_create_channel_from_template(
         let canvas_result: Result<(), CliError> = async {
             let builder = buzz_sdk::build_set_canvas(channel_uuid, &content)
                 .map_err(|e| CliError::Other(format!("build_set_canvas failed: {e}")))?;
-            let event = client.sign_event(builder)?;
+            let event = client.sign_event(builder).await?;
             client.submit_event(event).await?;
             Ok(())
         }
@@ -750,7 +750,7 @@ pub async fn cmd_create_channel_from_template(
                 Some(buzz_sdk::MemberRole::Bot),
             )
             .map_err(|e| CliError::Other(format!("build_add_member failed: {e}")))?;
-            let event = client.sign_event(builder)?;
+            let event = client.sign_event(builder).await?;
             client.submit_event(event).await?;
             Ok(())
         }
@@ -868,7 +868,7 @@ pub async fn cmd_update_channel(
         buzz_sdk::build_update_channel(channel_uuid, name, description, visibility, ttl_change)
             .map_err(|e| CliError::Other(format!("build_update_channel failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -884,7 +884,7 @@ pub async fn cmd_set_channel_topic(
     let builder = buzz_sdk::build_set_topic(channel_uuid, topic)
         .map_err(|e| CliError::Other(format!("build_set_topic failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -900,7 +900,7 @@ pub async fn cmd_set_channel_purpose(
     let builder = buzz_sdk::build_set_purpose(channel_uuid, purpose)
         .map_err(|e| CliError::Other(format!("build_set_purpose failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -912,7 +912,7 @@ pub async fn cmd_join_channel(client: &BuzzClient, channel_id: &str) -> Result<(
     let builder = buzz_sdk::build_join(channel_uuid)
         .map_err(|e| CliError::Other(format!("build_join failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -924,7 +924,7 @@ pub async fn cmd_leave_channel(client: &BuzzClient, channel_id: &str) -> Result<
     let builder = buzz_sdk::build_leave(channel_uuid)
         .map_err(|e| CliError::Other(format!("build_leave failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -936,7 +936,7 @@ pub async fn cmd_archive_channel(client: &BuzzClient, channel_id: &str) -> Resul
     let builder = buzz_sdk::build_archive(channel_uuid)
         .map_err(|e| CliError::Other(format!("build_archive failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -948,7 +948,7 @@ pub async fn cmd_unarchive_channel(client: &BuzzClient, channel_id: &str) -> Res
     let builder = buzz_sdk::build_unarchive(channel_uuid)
         .map_err(|e| CliError::Other(format!("build_unarchive failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -960,7 +960,7 @@ pub async fn cmd_delete_channel(client: &BuzzClient, channel_id: &str) -> Result
     let builder = buzz_sdk::build_delete_channel(channel_uuid)
         .map_err(|e| CliError::Other(format!("build_delete_channel failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -991,7 +991,7 @@ pub async fn cmd_add_channel_member(
     let builder = buzz_sdk::build_add_member(channel_uuid, pubkey, typed_role)
         .map_err(|e| CliError::Other(format!("build_add_member failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -1008,7 +1008,7 @@ pub async fn cmd_remove_channel_member(
     let builder = buzz_sdk::build_remove_member(channel_uuid, pubkey)
         .map_err(|e| CliError::Other(format!("build_remove_member failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
@@ -1045,14 +1045,40 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
+    let mut content = serde_json::json!({ "channel_add_policy": policy });
+    if let Some(object) = content.as_object_mut() {
+        if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
+            let display_name = display_name.trim();
+            if !display_name.is_empty() {
+                object.insert("display_name".into(), serde_json::json!(display_name));
+                object.insert("name".into(), serde_json::json!(display_name));
+            }
+        }
+        if let Ok(respond_to) = std::env::var("BUZZ_ACP_RESPOND_TO") {
+            let respond_to = respond_to.trim();
+            if matches!(respond_to, "owner-only" | "allowlist" | "anyone" | "nobody") {
+                object.insert("respond_to".into(), serde_json::json!(respond_to));
+            }
+        }
+        if let Ok(raw) = std::env::var("BUZZ_ACP_RESPOND_TO_ALLOWLIST") {
+            let allowlist: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+                .collect();
+            if !allowlist.is_empty() {
+                object.insert("respond_to_allowlist".into(), serde_json::json!(allowlist));
+            }
+        }
+    }
+    let content = content.to_string();
     use nostr::{EventBuilder, Kind};
     let builder = EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
         &content,
     )
     .tags([]);
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
 
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
@@ -1070,7 +1096,7 @@ pub async fn cmd_set_canvas(
     let builder = buzz_sdk::build_set_canvas(channel_uuid, &content)
         .map_err(|e| CliError::Other(format!("build_set_canvas failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())

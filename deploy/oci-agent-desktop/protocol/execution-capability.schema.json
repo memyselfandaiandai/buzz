@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.local/schemas/execution-capability-v1.json",
+  "title": "Buzz bounded execution capability",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "issuer", "audience", "jti", "task_id", "session_id", "agent_id", "issued_at", "not_before", "expires_at", "task", "limits", "cancellation_token_sha256"],
+  "properties": {
+    "version": {"const": 1},
+    "issuer": {"const": "final-form"},
+    "audience": {"type": "string", "pattern": "^buzz-worker:[a-z0-9-]{1,63}$"},
+    "jti": {"type": "string", "format": "uuid"},
+    "task_id": {"type": "string", "format": "uuid"},
+    "session_id": {"type": "string", "format": "uuid"},
+    "agent_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "not_before": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "input_sha256"],
+      "properties": {
+        "operation": {"type": "string", "enum": ["browser_task", "write_fixture"]},
+        "input_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_millicores", "memory_mib", "wall_seconds", "artifact_bytes"],
+      "properties": {
+        "cpu_millicores": {"type": "integer", "minimum": 100, "maximum": 1000},
+        "memory_mib": {"type": "integer", "minimum": 256, "maximum": 5120},
+        "wall_seconds": {"type": "integer", "minimum": 1, "maximum": 7200},
+        "artifact_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}
+      }
+    },
+    "cancellation_token_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

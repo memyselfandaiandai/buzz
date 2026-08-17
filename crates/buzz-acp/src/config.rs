@@ -47,6 +47,61 @@ pub enum ConfigError {
     ConfigFile(String),
 }
 
+/// Credential transport selected for ACP child processes.
+///
+/// `broker-v1` is an explicit, default-off local pilot. It is accepted only in
+/// builds containing the signing-capability broker and never falls back to
+/// inherited long-lived credentials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CredentialMode {
+    /// Preserve the existing inherited environment contract.
+    #[default]
+    LegacyEnv,
+    /// Project a short-lived broker capability into the child environment.
+    BrokerV1,
+}
+
+const CREDENTIAL_MODE_ENV: &str = "BUZZ_CREDENTIAL_MODE";
+
+fn parse_credential_mode(value: Option<&std::ffi::OsStr>) -> Result<CredentialMode, ConfigError> {
+    match value {
+        None => Ok(CredentialMode::LegacyEnv),
+        Some(value) => match value.to_str() {
+            Some("legacy-env") => Ok(CredentialMode::LegacyEnv),
+            Some("broker-v1") => Ok(CredentialMode::BrokerV1),
+            Some(_) | None => Err(ConfigError::ConfigFile(format!(
+                "{CREDENTIAL_MODE_ENV} must be exactly 'legacy-env' or 'broker-v1'"
+            ))),
+        },
+    }
+}
+
+/// Parse the process credential mode without exposing its raw value in errors.
+pub fn credential_mode_from_env() -> Result<CredentialMode, ConfigError> {
+    let value = std::env::var_os(CREDENTIAL_MODE_ENV);
+    parse_credential_mode(value.as_deref())
+}
+
+/// Validate that the selected credential transport is compiled into this build.
+pub fn validate_credential_mode_startup(mode: CredentialMode) -> Result<(), ConfigError> {
+    match mode {
+        CredentialMode::LegacyEnv => Ok(()),
+        CredentialMode::BrokerV1 => {
+            #[cfg(feature = "signing-capability-broker")]
+            {
+                Ok(())
+            }
+            #[cfg(not(feature = "signing-capability-broker"))]
+            {
+                Err(ConfigError::ConfigFile(
+                    "BUZZ_CREDENTIAL_MODE=broker-v1 requires a signing-capability-broker build"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum SubscribeMode {
     Mentions,
@@ -418,6 +473,12 @@ pub struct CliArgs {
     )]
     pub base_prompt_file: Option<PathBuf>,
 
+    /// Experimental: capture the final ACP assistant text for default-off,
+    /// durable harness-owned delivery. Capture alone does not publish; durable
+    /// authority and its outbox must also be enabled.
+    #[arg(long, env = "BUZZ_ACP_CAPTURE_VISIBLE_FINAL", default_value_t = false)]
+    pub capture_visible_final: bool,
+
     /// Desired LLM model ID. Applied to every new ACP session after creation.
     /// Use `buzz-acp models` to discover available model IDs.
     #[arg(long, env = "BUZZ_ACP_MODEL")]
@@ -502,6 +563,11 @@ pub struct ChannelFilter {
 
 #[derive(Debug)]
 pub struct Config {
+    /// Credential transport selected before any child process can spawn.
+    pub credential_mode: CredentialMode,
+    /// Runtime-only local broker process factory, installed after channel discovery.
+    #[cfg(feature = "signing-capability-broker")]
+    pub(crate) broker_spawner: Option<crate::capability_broker::BrokerChildSpawner>,
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
@@ -579,6 +645,10 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Whether successful channel turns retain bounded assistant text for
+    /// experimental, default-off durable harness-owned delivery. Capture alone
+    /// does not publish; durable authority and its outbox must also be enabled.
+    pub capture_visible_final: bool,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -843,14 +913,24 @@ impl Config {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
         // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
+        let credential_mode = credential_mode_from_env()?;
+        validate_credential_mode_startup(credential_mode)?;
         let args = CliArgs::parse();
-        Self::from_args(args)
+        Self::from_args_with_credential_mode(args, credential_mode)
     }
 
     /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
-    pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+    #[cfg(test)]
+    pub fn from_args(args: CliArgs) -> Result<Self, ConfigError> {
+        Self::from_args_with_credential_mode(args, CredentialMode::LegacyEnv)
+    }
+
+    fn from_args_with_credential_mode(
+        mut args: CliArgs,
+        credential_mode: CredentialMode,
+    ) -> Result<Self, ConfigError> {
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -1072,6 +1152,9 @@ impl Config {
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
         let config = Config {
+            credential_mode,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner: None,
             keys,
             relay_url: args.relay_url,
             agent_command,
@@ -1122,8 +1205,10 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            capture_visible_final: args.capture_visible_final,
         };
 
+        validate_broker_pilot_config(&config)?;
         Ok(config)
     }
 
@@ -1143,7 +1228,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} capture_visible_final={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1162,12 +1247,36 @@ impl Config {
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
+            self.capture_visible_final,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
         )
     }
+}
+
+fn validate_broker_pilot_config(config: &Config) -> Result<(), ConfigError> {
+    if config.credential_mode != CredentialMode::BrokerV1 {
+        return Ok(());
+    }
+    let reject = |message: &str| Err(ConfigError::ConfigFile(message.to_owned()));
+    if config.max_turns_per_session != 0 {
+        return reject("broker-v1 local pilot requires max_turns_per_session=0");
+    }
+    if config.heartbeat_interval_secs != 0 {
+        return reject("broker-v1 local pilot requires heartbeat_interval_secs=0");
+    }
+    if config.presence_enabled {
+        return reject("broker-v1 local pilot requires presence_enabled=false");
+    }
+    if config.memory_enabled {
+        return reject("broker-v1 local pilot requires memory_enabled=false");
+    }
+    if config.lazy_pool {
+        return reject("broker-v1 local pilot requires lazy_pool=false");
+    }
+    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1449,9 +1558,80 @@ mod tests {
     use crate::filter::{ChannelScope, SubscriptionRule};
     use clap::{Parser, ValueEnum};
 
+    #[test]
+    fn credential_mode_is_strict_defaulted_and_feature_gated() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            parse_credential_mode(None).expect("default credential mode"),
+            CredentialMode::LegacyEnv
+        );
+        assert_eq!(
+            parse_credential_mode(Some(OsStr::new("legacy-env")))
+                .expect("explicit legacy credential mode"),
+            CredentialMode::LegacyEnv
+        );
+        assert_eq!(
+            parse_credential_mode(Some(OsStr::new("broker-v1")))
+                .expect("recognized broker credential mode"),
+            CredentialMode::BrokerV1
+        );
+        for invalid in ["", "broker", "BROKER-V1", " broker-v1"] {
+            let error = parse_credential_mode(Some(OsStr::new(invalid)))
+                .expect_err("invalid credential mode must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "config file error: BUZZ_CREDENTIAL_MODE must be exactly 'legacy-env' or 'broker-v1'"
+            );
+        }
+        assert!(validate_credential_mode_startup(CredentialMode::LegacyEnv).is_ok());
+        #[cfg(feature = "signing-capability-broker")]
+        assert!(validate_credential_mode_startup(CredentialMode::BrokerV1).is_ok());
+        #[cfg(not(feature = "signing-capability-broker"))]
+        {
+            let broker_error = validate_credential_mode_startup(CredentialMode::BrokerV1)
+                .expect_err("broker mode requires the compiled broker");
+            assert_eq!(
+                broker_error.to_string(),
+                "config file error: BUZZ_CREDENTIAL_MODE=broker-v1 requires a signing-capability-broker build"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_credential_mode_fails_closed() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let invalid = std::ffi::OsStr::from_bytes(b"broker-v1\xff");
+        let error = parse_credential_mode(Some(invalid))
+            .expect_err("a present non-Unicode credential mode must not select legacy mode");
+        assert_eq!(
+            error.to_string(),
+            "config file error: BUZZ_CREDENTIAL_MODE must be exactly 'legacy-env' or 'broker-v1'"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_credential_mode_fails_closed() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let invalid = std::ffi::OsString::from_wide(&[0xd800]);
+        let error = parse_credential_mode(Some(&invalid))
+            .expect_err("a present non-Unicode credential mode must not select legacy mode");
+        assert_eq!(
+            error.to_string(),
+            "config file error: BUZZ_CREDENTIAL_MODE must be exactly 'legacy-env' or 'broker-v1'"
+        );
+    }
+
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
+            credential_mode: CredentialMode::LegacyEnv,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -1494,7 +1674,69 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            capture_visible_final: false,
         }
+    }
+
+    #[test]
+    fn harness_owned_final_capture_flag_defaults_off_and_can_be_enabled() {
+        let default_args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &nostr::Keys::generate().secret_key().to_secret_hex(),
+        ])
+        .expect("default args parse");
+        assert!(!default_args.capture_visible_final);
+
+        let enabled_args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &nostr::Keys::generate().secret_key().to_secret_hex(),
+            "--capture-visible-final",
+        ])
+        .expect("enabled args parse");
+        assert!(enabled_args.capture_visible_final);
+    }
+
+    #[test]
+    fn broker_pilot_envelope_is_strict_and_legacy_is_unchanged() {
+        let mut config = test_config(SubscribeMode::All);
+        assert!(validate_broker_pilot_config(&config).is_ok());
+
+        config.credential_mode = CredentialMode::BrokerV1;
+        config.presence_enabled = false;
+        config.memory_enabled = false;
+        assert!(validate_broker_pilot_config(&config).is_ok());
+
+        config.max_turns_per_session = 1;
+        assert!(validate_broker_pilot_config(&config)
+            .expect_err("session rotation must fail")
+            .to_string()
+            .contains("max_turns_per_session=0"));
+        config.max_turns_per_session = 0;
+        config.heartbeat_interval_secs = 60;
+        assert!(validate_broker_pilot_config(&config)
+            .expect_err("heartbeat must fail")
+            .to_string()
+            .contains("heartbeat_interval_secs=0"));
+        config.heartbeat_interval_secs = 0;
+        config.presence_enabled = true;
+        assert!(validate_broker_pilot_config(&config)
+            .expect_err("presence must fail")
+            .to_string()
+            .contains("presence_enabled=false"));
+        config.presence_enabled = false;
+        config.memory_enabled = true;
+        assert!(validate_broker_pilot_config(&config)
+            .expect_err("memory must fail")
+            .to_string()
+            .contains("memory_enabled=false"));
+        config.memory_enabled = false;
+        config.lazy_pool = true;
+        assert!(validate_broker_pilot_config(&config)
+            .expect_err("lazy pool must fail")
+            .to_string()
+            .contains("lazy_pool=false"));
     }
 
     fn make_rule(

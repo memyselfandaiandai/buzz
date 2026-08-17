@@ -1,7 +1,7 @@
 //! `provider_config` parsing and the `info` config schema
 //! (spec §`provider_config` v1 fields, `docs/remote-agents.md:1384-1389`).
 //!
-//! Nine fields, all optional except `image` (required at parse time; the
+//! Ten fields, all optional except `image` (required at parse time; the
 //! schema offers the published sprig image as a prefill default — §Image).
 //! No credential field exists, by I2: cluster auth comes from ambient
 //! kubeconfig resolution and nothing else (`:196-198`).
@@ -71,6 +71,10 @@ pub struct ProviderConfig {
     /// `None` when `inactivity_seconds` was 0 — refused in v1, see [`parse`].
     pub inactivity_seconds: Option<u64>,
     pub service_account: Option<String>,
+    /// Whether the provider may create a missing namespace. Set false when a
+    /// control plane pre-creates a session namespace and grants only a
+    /// namespace-scoped Role to the provider identity.
+    pub manage_namespace: bool,
 }
 
 /// Read an optional non-empty string field. Rejects non-string scalars rather
@@ -101,6 +105,16 @@ fn optional_u64(cfg: &serde_json::Value, field: &str) -> Result<Option<u64>, Str
         }),
         Some(other) => Err(format!(
             "provider_config.{field} must be a non-negative integer, got {other}"
+        )),
+    }
+}
+
+fn optional_bool(cfg: &serde_json::Value, field: &str) -> Result<Option<bool>, String> {
+    match cfg.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(format!(
+            "provider_config.{field} must be a boolean, got {other}"
         )),
     }
 }
@@ -172,6 +186,7 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
         resources,
         inactivity_seconds,
         service_account: optional_string(cfg, "service_account")?,
+        manage_namespace: optional_bool(cfg, "manage_namespace")?.unwrap_or(true),
     })
 }
 
@@ -236,6 +251,12 @@ pub fn config_schema() -> serde_json::Value {
                 "type": "string",
                 "title": "Service account",
                 "description": "Scheduling/RBAC identity only. No API token is mounted."
+            },
+            "manage_namespace": {
+                "type": "boolean",
+                "title": "Create missing namespace",
+                "description": "Disable when FINAL-FORM pre-creates a session namespace and grants this provider only namespace-scoped permissions.",
+                "default": true
             }
         },
         "required": ["namespace", "image"]
@@ -265,6 +286,7 @@ mod tests {
         assert_eq!(c.inactivity_seconds, Some(DEFAULT_INACTIVITY_SECONDS));
         assert_eq!(c.context, None);
         assert_eq!(c.service_account, None);
+        assert!(c.manage_namespace);
     }
 
     #[test]
@@ -386,6 +408,18 @@ mod tests {
     }
 
     #[test]
+    fn namespace_management_can_be_disabled_but_must_be_boolean() {
+        let mut cfg = minimal();
+        cfg["manage_namespace"] = serde_json::json!(false);
+        assert!(!parse(&cfg).unwrap().manage_namespace);
+
+        cfg["manage_namespace"] = serde_json::json!("false");
+        assert!(parse(&cfg)
+            .unwrap_err()
+            .contains("provider_config.manage_namespace"));
+    }
+
+    #[test]
     fn generated_namespaces_are_fresh_and_valid() {
         let a = generated_namespace();
         let b = generated_namespace();
@@ -423,10 +457,10 @@ mod tests {
         );
     }
 
-    /// Nine fields exactly (§`provider_config` v1 fields). The cap is 20; the
+    /// Ten fields exactly. The cap is 20; the
     /// count is pinned so a field added without a spec change is caught here.
     #[test]
-    fn schema_declares_exactly_the_nine_v1_fields() {
+    fn schema_declares_exactly_the_ten_fields() {
         let schema = config_schema();
         let props = schema["properties"].as_object().unwrap();
         let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
@@ -439,6 +473,7 @@ mod tests {
                 "cpu_request",
                 "image",
                 "inactivity_seconds",
+                "manage_namespace",
                 "memory_limit",
                 "memory_request",
                 "namespace",

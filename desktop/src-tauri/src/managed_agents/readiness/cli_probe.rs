@@ -38,6 +38,25 @@ pub(crate) enum ProbeOutcome {
     },
 }
 
+/// Build a native child command for a resolved CLI path.
+///
+/// Windows npm installs commonly resolve to `.cmd`/`.bat` shims. Those files
+/// cannot be launched directly through `CreateProcess`, so route them through
+/// `cmd.exe`. Keeping this in the shared probe module makes both readiness and
+/// Doctor's auth-status probe use the same launch semantics.
+pub(crate) fn command_for_binary(binary_path: &Path) -> std::process::Command {
+    #[cfg(windows)]
+    if crate::managed_agents::runtime::path::is_batch_shim(binary_path) {
+        let command_processor = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let mut command = std::process::Command::new(command_processor);
+        command.args(["/D", "/S", "/C"]);
+        command.arg(binary_path);
+        return command;
+    }
+
+    std::process::Command::new(binary_path)
+}
+
 /// Signals emitted to stderr by codex (and related CLI tools) when they
 /// fail to parse their config file. We check these to distinguish a
 /// config-parse failure from a genuine "not authenticated" exit.
@@ -58,7 +77,7 @@ pub(crate) fn login_probe(
     probe_args: &[&str],
     augmented_path: Option<&str>,
 ) -> ProbeOutcome {
-    let mut command = std::process::Command::new(binary_path);
+    let mut command = command_for_binary(binary_path);
     command.args(&probe_args[1..]);
     if let Some(path) = augmented_path {
         command.env("PATH", path);
@@ -244,5 +263,24 @@ mod tests {
                 "CONFIG_PARSE_SIGNAL must be lowercase for case-insensitive matching: {sig}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn login_probe_runs_windows_batch_shim_through_command_processor() {
+        use std::fs;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let shim_path = temp.path().join("fake-codex.cmd");
+        fs::write(&shim_path, "@echo off\r\nexit /b 0\r\n").expect("write batch shim");
+
+        assert_eq!(
+            super::login_probe(
+                &shim_path,
+                &["fake-codex", "login", "status"],
+                None,
+            ),
+            ProbeOutcome::LoggedIn,
+        );
     }
 }

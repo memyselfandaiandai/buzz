@@ -91,7 +91,7 @@ async fn cmd_list(client: &BuzzClient) -> Result<(), CliError> {
 /// Fetch the caller's own current custom emoji set (latest kind:30030 under
 /// the d-tag, authored by the caller). Empty when none published yet.
 async fn fetch_own_emoji(client: &BuzzClient) -> Result<Vec<CustomEmoji>, CliError> {
-    let me = client.keys().public_key().to_hex();
+    let me = client.public_key().to_hex();
     let filter = serde_json::json!({
         "kinds": [buzz_sdk::kind::KIND_EMOJI_SET],
         "#d": [CUSTOM_EMOJI_SET_D_TAG],
@@ -118,7 +118,7 @@ async fn fetch_own_emoji(client: &BuzzClient) -> Result<Vec<CustomEmoji>, CliErr
 async fn publish_own_set(client: &BuzzClient, emojis: &[CustomEmoji]) -> Result<(), CliError> {
     let builder = buzz_sdk::build_custom_emoji_set(emojis)
         .map_err(|e| CliError::Other(format!("build_custom_emoji_set failed: {e}")))?;
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
