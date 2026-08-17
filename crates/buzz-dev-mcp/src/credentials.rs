@@ -557,24 +557,39 @@ mod tests {
             .collect();
         for alias in LONG_LIVED_CREDENTIAL_ENV {
             assert!(
-                !configured.iter().any(|(name, value)| name.eq_ignore_ascii_case(alias) && value.is_some()),
+                !configured
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case(alias) && value.is_some()),
                 "long-lived alias must be absent: {alias}"
             );
         }
         for leaked in ["BUZZ_CAPABILITY_SURPRISE", "BUZZ_CAPABILITY_EXTRA"] {
             assert!(
-                configured.iter().any(|(name, value)| name == leaked && value.is_none()),
+                configured
+                    .iter()
+                    .any(|(name, value)| name == leaked && value.is_none()),
                 "unknown capability var must be scrubbed: {leaked}"
             );
         }
-        for git_var in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1"] {
+        for git_var in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_1",
+        ] {
             assert!(
-                configured.iter().any(|(name, value)| name == git_var && value.is_none()),
+                configured
+                    .iter()
+                    .any(|(name, value)| name == git_var && value.is_none()),
                 "ephemeral git-config var must be scrubbed: {git_var}"
             );
         }
         let expected: [&str; 6] = PROJECTION_ENV;
-        assert_eq!(expected.len(), 6, "projection must be exactly the fixed six");
+        assert_eq!(
+            expected.len(),
+            6,
+            "projection must be exactly the fixed six"
+        );
         for required in expected {
             assert!(
                 configured.iter().any(|(name, value)| {
@@ -590,10 +605,17 @@ mod tests {
             "BUZZ_PRIVATE_KEY must never appear in broker-child env"
         );
         let get = |name: &str| {
-            configured.iter().find(|(k, _)| k == name).and_then(|(_, v)| v.clone()).unwrap_or_default()
+            configured
+                .iter()
+                .find(|(k, _)| k == name)
+                .and_then(|(_, v)| v.clone())
+                .unwrap_or_default()
         };
         assert!(get("BUZZ_CAPABILITY_ENDPOINT").starts_with("tcp://127.0.0.1:"));
-        assert_eq!(get("BUZZ_PUBLIC_KEY"), "dcfd242e557282d7a1e2cf2e6877522682f1e5c6156dc92ca7d90eaedd3b0f95");
+        assert_eq!(
+            get("BUZZ_PUBLIC_KEY"),
+            "dcfd242e557282d7a1e2cf2e6877522682f1e5c6156dc92ca7d90eaedd3b0f95"
+        );
         assert!(get("BUZZ_RELAY_URL").starts_with("wss://relay.example.com"));
         assert!(get("BUZZ_CAPABILITY_EXPIRES_AT").parse::<i64>().is_ok());
         assert!(get("BUZZ_CAPABILITY_TOKEN").len() >= 32);

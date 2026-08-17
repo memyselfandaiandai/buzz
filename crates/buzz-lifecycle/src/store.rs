@@ -9,12 +9,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::model::{
-    ActiveTurnCursor, ActiveTurnPage, AdmissionOutcome,
-    AdmissionRequest, DeliveryMode, DispatchIntent, OutboxKind,
-    OutboxRecord, OutboxState, QueueAdmissionOutcome, RecoveryAction, RecoveryItem,
-    RejectionOutcome,
-    RuntimeLease, RuntimeLeaseIdentity, TerminalUpdate, TransitionOutcome, TurnEvent, TurnSnapshot,
-    TurnState,
+    ActiveTurnCursor, ActiveTurnPage, AdmissionOutcome, AdmissionRequest, DeliveryMode,
+    DispatchIntent, OutboxKind, OutboxRecord, OutboxState, QueueAdmissionOutcome, RecoveryAction,
+    RecoveryItem, RejectionOutcome, RuntimeLease, RuntimeLeaseIdentity, TerminalUpdate,
+    TransitionOutcome, TurnEvent, TurnSnapshot, TurnState,
 };
 use crate::scheduler::{
     LaneHeads, RunClaim, RunClaimIdentity, RunClaimPhase, RunLane, RunLaneCapacity,
@@ -2146,56 +2144,165 @@ impl LifecycleStore {
         Ok(())
     }
     pub fn retention_usage(&self, owner_id: &str, agent_id: &str) -> Result<crate::RetentionUsage> {
-        if owner_id.is_empty() || agent_id.is_empty() { return Err(LifecycleError::InvalidRequest("owner/agent must be non-empty")); }
+        if owner_id.is_empty() || agent_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest(
+                "owner/agent must be non-empty",
+            ));
+        }
         let conn = self.connection()?;
         let pruneable: i64 = conn.query_row("SELECT COUNT(*) FROM turns WHERE owner_id=?1 AND agent_id=?2 AND state IN ('completed','failed','cancelled','expired')", params![owner_id, agent_id], |r| r.get(0))?;
-        let tombstone: i64 = conn.query_row("SELECT COUNT(*) FROM turns WHERE owner_id=?1 AND agent_id=?2 AND state='rejected'", params![owner_id, agent_id], |r| r.get(0))?;
-        Ok(crate::RetentionUsage { pruneable_count: pruneable, tombstone_count: tombstone })
+        let tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE owner_id=?1 AND agent_id=?2 AND state='rejected'",
+            params![owner_id, agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(crate::RetentionUsage {
+            pruneable_count: pruneable,
+            tombstone_count: tombstone,
+        })
     }
-    pub fn enforce_retention(&self, owner_id: &str, agent_id: &str, now_ms: i64) -> Result<crate::RetentionEnforceResult> {
-        if owner_id.is_empty() || agent_id.is_empty() { return Err(LifecycleError::InvalidRequest("owner/agent must be non-empty")); }
-        if now_ms < 0 { return Err(LifecycleError::InvalidRequest("now_ms must be non-negative")); }
+    pub fn enforce_retention(
+        &self,
+        owner_id: &str,
+        agent_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::RetentionEnforceResult> {
+        if owner_id.is_empty() || agent_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest(
+                "owner/agent must be non-empty",
+            ));
+        }
+        if now_ms < 0 {
+            return Err(LifecycleError::InvalidRequest(
+                "now_ms must be non-negative",
+            ));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let policy: Option<(i64,i64,i64)> = tx.query_row("SELECT retention_days, soft_bytes, hard_bytes FROM retention_policies WHERE owner_id=?1 AND agent_id=?2", params![owner_id, agent_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).optional()?;
-        let (retention_days, soft_bytes, _hard_bytes) = match policy { None => return Ok(crate::RetentionEnforceResult { pruned: 0, ttl_pruned: 0, size_pruned: 0, vacuumed: false }), Some(v) => v };
+        let (retention_days, soft_bytes, _hard_bytes) = match policy {
+            None => {
+                return Ok(crate::RetentionEnforceResult {
+                    pruned: 0,
+                    ttl_pruned: 0,
+                    size_pruned: 0,
+                    vacuumed: false,
+                })
+            }
+            Some(v) => v,
+        };
         let day_ms: i64 = 24 * 60 * 60 * 1000;
         let cutoff = now_ms - retention_days * day_ms;
         let mut ttl_pruned: i64 = 0;
         {
             let mut stmt = tx.prepare("SELECT turn_id FROM turns WHERE owner_id=?1 AND agent_id=?2 AND state IN ('completed','failed','cancelled','expired') AND updated_at_ms < ?3 ORDER BY updated_at_ms ASC, turn_id ASC")?;
-            let ids: Vec<String> = stmt.query_map(params![owner_id, agent_id, cutoff], |r| r.get(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
-            for tid in ids { tx.execute("DELETE FROM turn_events WHERE turn_id=?1", params![tid])?; tx.execute("DELETE FROM lifecycle_outbox WHERE turn_id=?1", params![tid])?; tx.execute("DELETE FROM turn_dispatch WHERE turn_id=?1", params![tid])?; tx.execute("DELETE FROM turns WHERE turn_id=?1", params![tid])?; ttl_pruned += 1; }
+            let ids: Vec<String> = stmt
+                .query_map(params![owner_id, agent_id, cutoff], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for tid in ids {
+                tx.execute("DELETE FROM turn_events WHERE turn_id=?1", params![tid])?;
+                tx.execute(
+                    "DELETE FROM lifecycle_outbox WHERE turn_id=?1",
+                    params![tid],
+                )?;
+                tx.execute("DELETE FROM turn_dispatch WHERE turn_id=?1", params![tid])?;
+                tx.execute("DELETE FROM turns WHERE turn_id=?1", params![tid])?;
+                ttl_pruned += 1;
+            }
         }
         let mut size_pruned: i64 = 0;
-        let page_count: i64 = tx.query_row("SELECT COALESCE((SELECT page_count FROM pragma_page_count), 0)", [], |r| r.get(0)).unwrap_or(0);
-        let page_size: i64 = tx.query_row("SELECT COALESCE((SELECT page_size FROM pragma_page_size), 4096)", [], |r| r.get(0)).unwrap_or(4096);
+        let page_count: i64 = tx
+            .query_row(
+                "SELECT COALESCE((SELECT page_count FROM pragma_page_count), 0)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let page_size: i64 = tx
+            .query_row(
+                "SELECT COALESCE((SELECT page_size FROM pragma_page_size), 4096)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(4096);
         let mut current_bytes: i64 = page_count.saturating_mul(page_size);
         if current_bytes > soft_bytes && current_bytes != 0 {
             let mut stmt = tx.prepare("SELECT turn_id FROM turns WHERE owner_id=?1 AND agent_id=?2 AND state IN ('completed','failed','cancelled','expired') ORDER BY updated_at_ms ASC, turn_id ASC")?;
-            let ids: Vec<String> = stmt.query_map(params![owner_id, agent_id], |r| r.get(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            let ids: Vec<String> = stmt
+                .query_map(params![owner_id, agent_id], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let approx_row_bytes = page_size.max(4096);
-            for tid in ids { if current_bytes <= soft_bytes { break; } tx.execute("DELETE FROM turn_events WHERE turn_id=?1", params![tid])?; tx.execute("DELETE FROM lifecycle_outbox WHERE turn_id=?1", params![tid])?; tx.execute("DELETE FROM turn_dispatch WHERE turn_id=?1", params![tid])?; tx.execute("DELETE FROM turns WHERE turn_id=?1", params![tid])?; size_pruned += 1; current_bytes = current_bytes.saturating_sub(approx_row_bytes); }
+            for tid in ids {
+                if current_bytes <= soft_bytes {
+                    break;
+                }
+                tx.execute("DELETE FROM turn_events WHERE turn_id=?1", params![tid])?;
+                tx.execute(
+                    "DELETE FROM lifecycle_outbox WHERE turn_id=?1",
+                    params![tid],
+                )?;
+                tx.execute("DELETE FROM turn_dispatch WHERE turn_id=?1", params![tid])?;
+                tx.execute("DELETE FROM turns WHERE turn_id=?1", params![tid])?;
+                size_pruned += 1;
+                current_bytes = current_bytes.saturating_sub(approx_row_bytes);
+            }
         }
         let pruned = ttl_pruned + size_pruned;
         let vacuumed = pruned > 0;
         tx.commit()?;
-        if vacuumed { let vac_conn = self.connection()?; let _ = vac_conn.execute("VACUUM", []); }
-        Ok(crate::RetentionEnforceResult { pruned, ttl_pruned, size_pruned, vacuumed })
+        if vacuumed {
+            let vac_conn = self.connection()?;
+            let _ = vac_conn.execute("VACUUM", []);
+        }
+        Ok(crate::RetentionEnforceResult {
+            pruned,
+            ttl_pruned,
+            size_pruned,
+            vacuumed,
+        })
     }
 
-        // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // Launch fence: inert -> ledger -> epoch -> single-use
     // ------------------------------------------------------------------
     pub fn get_launch_fence(&self, owner_id: &str, agent_id: &str) -> Result<crate::LaunchFence> {
-        if owner_id.is_empty() || agent_id.is_empty() { return Err(LifecycleError::InvalidRequest("owner/agent must be non-empty")); }
+        if owner_id.is_empty() || agent_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest(
+                "owner/agent must be non-empty",
+            ));
+        }
         let conn = self.connection()?;
         let row: Option<(i64,i64)> = conn.query_row("SELECT launch_epoch, updated_at_ms FROM launch_fences WHERE owner_id=?1 AND agent_id=?2", params![owner_id, agent_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        if let Some((epoch, updated)) = row { Ok(crate::LaunchFence { owner_id: owner_id.to_owned(), agent_id: agent_id.to_owned(), launch_epoch: epoch, updated_at_ms: updated }) } else { Ok(crate::LaunchFence { owner_id: owner_id.to_owned(), agent_id: agent_id.to_owned(), launch_epoch: 0, updated_at_ms: 0 }) }
+        if let Some((epoch, updated)) = row {
+            Ok(crate::LaunchFence {
+                owner_id: owner_id.to_owned(),
+                agent_id: agent_id.to_owned(),
+                launch_epoch: epoch,
+                updated_at_ms: updated,
+            })
+        } else {
+            Ok(crate::LaunchFence {
+                owner_id: owner_id.to_owned(),
+                agent_id: agent_id.to_owned(),
+                launch_epoch: 0,
+                updated_at_ms: 0,
+            })
+        }
     }
     fn ensure_launch_fence_tx(tx: &Transaction<'_>, owner_id: &str, agent_id: &str) -> Result<i64> {
-        let row: Option<i64> = tx.query_row("SELECT launch_epoch FROM launch_fences WHERE owner_id=?1 AND agent_id=?2", params![owner_id, agent_id], |r| r.get(0)).optional()?;
-        if let Some(epoch) = row { Ok(epoch) } else { tx.execute("INSERT INTO launch_fences(owner_id,agent_id,launch_epoch,updated_at_ms) VALUES (?1,?2,0,0)", params![owner_id, agent_id])?; Ok(0) }
+        let row: Option<i64> = tx
+            .query_row(
+                "SELECT launch_epoch FROM launch_fences WHERE owner_id=?1 AND agent_id=?2",
+                params![owner_id, agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(epoch) = row {
+            Ok(epoch)
+        } else {
+            tx.execute("INSERT INTO launch_fences(owner_id,agent_id,launch_epoch,updated_at_ms) VALUES (?1,?2,0,0)", params![owner_id, agent_id])?;
+            Ok(0)
+        }
     }
     pub fn create_inert_turn(&self, request: &crate::AdmissionRequest) -> Result<TurnSnapshot> {
         request.validate()?;
@@ -2206,9 +2313,22 @@ impl LifecycleStore {
         tx.commit()?;
         Ok(outcome.turn().clone())
     }
-    pub fn mint_activation_capability(&self, owner_id: &str, agent_id: &str, now_ms: i64) -> Result<crate::ActivationCapability> {
-        if owner_id.is_empty() || agent_id.is_empty() { return Err(LifecycleError::InvalidRequest("owner/agent must be non-empty")); }
-        if now_ms < 0 { return Err(LifecycleError::InvalidRequest("now_ms must be non-negative")); }
+    pub fn mint_activation_capability(
+        &self,
+        owner_id: &str,
+        agent_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::ActivationCapability> {
+        if owner_id.is_empty() || agent_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest(
+                "owner/agent must be non-empty",
+            ));
+        }
+        if now_ms < 0 {
+            return Err(LifecycleError::InvalidRequest(
+                "now_ms must be non-negative",
+            ));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current_epoch = Self::ensure_launch_fence_tx(&tx, owner_id, agent_id)?;
@@ -2217,71 +2337,179 @@ impl LifecycleStore {
         tx.execute("INSERT INTO activation_capabilities(capability_id,owner_id,agent_id,launch_epoch,consumed,created_at_ms) VALUES (?1,?2,?3,?4,0,?5)", params![cap_id, owner_id, agent_id, next_epoch, now_ms])?;
         // Do not bump fence on mint; fence bumps only on cancel/activate (commit point)
         tx.commit()?;
-        Ok(crate::ActivationCapability { capability_id: cap_id, owner_id: owner_id.to_owned(), agent_id: agent_id.to_owned(), launch_epoch: next_epoch, consumed: false, created_at_ms: now_ms })
+        Ok(crate::ActivationCapability {
+            capability_id: cap_id,
+            owner_id: owner_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            launch_epoch: next_epoch,
+            consumed: false,
+            created_at_ms: now_ms,
+        })
     }
-    pub fn cancel_turn_with_fence(&self, turn_id: &str, now_ms: i64) -> Result<crate::CancelOutcome> {
-        if turn_id.is_empty() { return Err(LifecycleError::InvalidRequest("turn_id must be non-empty")); }
-        if now_ms < 0 { return Err(LifecycleError::InvalidRequest("now_ms must be non-negative")); }
+    pub fn cancel_turn_with_fence(
+        &self,
+        turn_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::CancelOutcome> {
+        if turn_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest("turn_id must be non-empty"));
+        }
+        if now_ms < 0 {
+            return Err(LifecycleError::InvalidRequest(
+                "now_ms must be non-negative",
+            ));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: Option<TurnSnapshot> = tx.query_row("SELECT turn_id,owner_id,agent_id,requester_id,channel_id,client_nonce,input_digest,state,execution_id,result_digest,version,accepted_at_ms,updated_at_ms,expires_at_ms FROM turns WHERE turn_id=?1", params![turn_id], turn_from_row).optional().map_err(LifecycleError::Sqlite)?;
-        let snap = match current { None => return Ok(crate::CancelOutcome::NotFound), Some(s) => s };
-        if snap.state.is_terminal() { return Ok(crate::CancelOutcome::AlreadyTerminal(snap)); }
+        let snap = match current {
+            None => return Ok(crate::CancelOutcome::NotFound),
+            Some(s) => s,
+        };
+        if snap.state.is_terminal() {
+            return Ok(crate::CancelOutcome::AlreadyTerminal(snap));
+        }
         let fence_epoch = Self::ensure_launch_fence_tx(&tx, &snap.owner_id, &snap.agent_id)?;
         let next_epoch = fence_epoch + 1;
         tx.execute("UPDATE launch_fences SET launch_epoch=?3, updated_at_ms=?4 WHERE owner_id=?1 AND agent_id=?2", params![snap.owner_id, snap.agent_id, next_epoch, now_ms])?;
         let payload = serde_json::to_string(&serde_json::json!({"cancelledAtMs": now_ms}))?;
-        apply_transition(&tx, &snap, crate::TurnState::Cancelled, None, None, &payload, now_ms)?;
+        apply_transition(
+            &tx,
+            &snap,
+            crate::TurnState::Cancelled,
+            None,
+            None,
+            &payload,
+            now_ms,
+        )?;
         tx.execute("UPDATE activation_capabilities SET consumed=1 WHERE owner_id=?1 AND agent_id=?2 AND launch_epoch<=?3 AND consumed=0", params![snap.owner_id, snap.agent_id, next_epoch])?;
         let updated = turn_from_transaction(&tx, turn_id)?;
         tx.commit()?;
         Ok(crate::CancelOutcome::Cancelled(updated))
     }
-    pub fn activate_with_capability(&self, turn_id: &str, capability_id: &str, _expected_epoch: i64, now_ms: i64) -> Result<crate::ActivationOutcome> {
-        if turn_id.is_empty() || capability_id.is_empty() { return Err(LifecycleError::InvalidRequest("turn/capability must be non-empty")); }
-        if now_ms < 0 { return Err(LifecycleError::InvalidRequest("now_ms must be non-negative")); }
+    pub fn activate_with_capability(
+        &self,
+        turn_id: &str,
+        capability_id: &str,
+        _expected_epoch: i64,
+        now_ms: i64,
+    ) -> Result<crate::ActivationOutcome> {
+        if turn_id.is_empty() || capability_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest(
+                "turn/capability must be non-empty",
+            ));
+        }
+        if now_ms < 0 {
+            return Err(LifecycleError::InvalidRequest(
+                "now_ms must be non-negative",
+            ));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cap: Option<(String,String,i64,i64)> = tx.query_row("SELECT owner_id,agent_id,launch_epoch,consumed FROM activation_capabilities WHERE capability_id=?1", params![capability_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)?))).optional()?;
-        let (cap_owner, cap_agent, _cap_epoch, consumed) = match cap { None => return Err(LifecycleError::CapabilityNotFound), Some(v) => v };
-        if consumed != 0 { return Ok(crate::ActivationOutcome::AlreadyConsumed); }
+        let (cap_owner, cap_agent, _cap_epoch, consumed) = match cap {
+            None => return Err(LifecycleError::CapabilityNotFound),
+            Some(v) => v,
+        };
+        if consumed != 0 {
+            return Ok(crate::ActivationOutcome::AlreadyConsumed);
+        }
         let snap: Option<TurnSnapshot> = tx.query_row("SELECT turn_id,owner_id,agent_id,requester_id,channel_id,client_nonce,input_digest,state,execution_id,result_digest,version,accepted_at_ms,updated_at_ms,expires_at_ms FROM turns WHERE turn_id=?1", params![turn_id], turn_from_row).optional().map_err(LifecycleError::Sqlite)?;
-        let snap = match snap { None => return Ok(crate::ActivationOutcome::NotFound), Some(s) => s };
-        if snap.owner_id != cap_owner || snap.agent_id != cap_agent { return Err(LifecycleError::InvalidRequest("capability scope mismatch")); }
+        let snap = match snap {
+            None => return Ok(crate::ActivationOutcome::NotFound),
+            Some(s) => s,
+        };
+        if snap.owner_id != cap_owner || snap.agent_id != cap_agent {
+            return Err(LifecycleError::InvalidRequest("capability scope mismatch"));
+        }
         if snap.state.is_terminal() {
-            tx.execute("UPDATE activation_capabilities SET consumed=1 WHERE capability_id=?1", params![capability_id])?;
+            tx.execute(
+                "UPDATE activation_capabilities SET consumed=1 WHERE capability_id=?1",
+                params![capability_id],
+            )?;
             let fence_epoch = Self::ensure_launch_fence_tx(&tx, &snap.owner_id, &snap.agent_id)?;
             tx.execute("UPDATE launch_fences SET launch_epoch=?3, updated_at_ms=?4 WHERE owner_id=?1 AND agent_id=?2", params![snap.owner_id, snap.agent_id, fence_epoch + 1, now_ms])?;
             tx.commit()?;
             return Ok(crate::ActivationOutcome::AlreadyConsumed);
         }
-        tx.execute("UPDATE activation_capabilities SET consumed=1 WHERE capability_id=?1", params![capability_id])?;
+        tx.execute(
+            "UPDATE activation_capabilities SET consumed=1 WHERE capability_id=?1",
+            params![capability_id],
+        )?;
         let fence_epoch = Self::ensure_launch_fence_tx(&tx, &snap.owner_id, &snap.agent_id)?;
         tx.execute("UPDATE launch_fences SET launch_epoch=?3, updated_at_ms=?4 WHERE owner_id=?1 AND agent_id=?2", params![snap.owner_id, snap.agent_id, fence_epoch + 1, now_ms])?;
-        if snap.state != crate::TurnState::Accepted { tx.commit()?; return Ok(crate::ActivationOutcome::AlreadyConsumed); }
-        let payload = serde_json::to_string(&serde_json::json!({"activatedAtMs": now_ms, "capabilityId": capability_id}))?;
-        apply_transition(&tx, &snap, crate::TurnState::Queued, None, None, &payload, now_ms)?;
+        if snap.state != crate::TurnState::Accepted {
+            tx.commit()?;
+            return Ok(crate::ActivationOutcome::AlreadyConsumed);
+        }
+        let payload = serde_json::to_string(
+            &serde_json::json!({"activatedAtMs": now_ms, "capabilityId": capability_id}),
+        )?;
+        apply_transition(
+            &tx,
+            &snap,
+            crate::TurnState::Queued,
+            None,
+            None,
+            &payload,
+            now_ms,
+        )?;
         let updated = turn_from_transaction(&tx, turn_id)?;
         tx.commit()?;
         Ok(crate::ActivationOutcome::Activated(Box::new(updated)))
     }
     pub fn reject_admission_by_turn_id(&self, turn_id: &str) -> Result<crate::RejectionOutcome> {
-        if turn_id.is_empty() { return Err(LifecycleError::InvalidRequest("turn_id must be non-empty")); }
+        if turn_id.is_empty() {
+            return Err(LifecycleError::InvalidRequest("turn_id must be non-empty"));
+        }
         let snap = self.turn(turn_id)?;
-        if snap.state == crate::TurnState::Rejected { return Ok(crate::RejectionOutcome::Duplicate(snap)); }
-        if snap.state.is_terminal() { return Err(LifecycleError::InvalidTransition { from: snap.state, to: crate::TurnState::Rejected }); }
+        if snap.state == crate::TurnState::Rejected {
+            return Ok(crate::RejectionOutcome::Duplicate(snap));
+        }
+        if snap.state.is_terminal() {
+            return Err(LifecycleError::InvalidTransition {
+                from: snap.state,
+                to: crate::TurnState::Rejected,
+            });
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = turn_from_transaction(&tx, turn_id)?;
-        if current.state == crate::TurnState::Rejected { return Ok(crate::RejectionOutcome::Duplicate(current)); }
-        if current.state.is_terminal() { return Err(LifecycleError::InvalidTransition { from: current.state, to: crate::TurnState::Rejected }); }
-        let payload = serde_json::to_string(&serde_json::json!({"reasonCode":"rejected","detail":{}}))?;
-        apply_transition(&tx, &current, crate::TurnState::Rejected, None, None, &payload, current.updated_at_ms)?;
+        if current.state == crate::TurnState::Rejected {
+            return Ok(crate::RejectionOutcome::Duplicate(current));
+        }
+        if current.state.is_terminal() {
+            return Err(LifecycleError::InvalidTransition {
+                from: current.state,
+                to: crate::TurnState::Rejected,
+            });
+        }
+        let payload =
+            serde_json::to_string(&serde_json::json!({"reasonCode":"rejected","detail":{}}))?;
+        apply_transition(
+            &tx,
+            &current,
+            crate::TurnState::Rejected,
+            None,
+            None,
+            &payload,
+            current.updated_at_ms,
+        )?;
         let updated = turn_from_transaction(&tx, turn_id)?;
-        let upd = crate::TerminalUpdate { state: crate::TurnState::Rejected, result_digest: None, payload: serde_json::json!({"reasonCode":"rejected"}), occurred_at_ms: updated.updated_at_ms };
+        let upd = crate::TerminalUpdate {
+            state: crate::TurnState::Rejected,
+            result_digest: None,
+            payload: serde_json::json!({"reasonCode":"rejected"}),
+            occurred_at_ms: updated.updated_at_ms,
+        };
         insert_terminal_outbox(&tx, &updated, &upd)?;
         tx.commit()?;
-        Ok(crate::RejectionOutcome::Rejected(turn_from_transaction(&self.connection()?.transaction_with_behavior(TransactionBehavior::Immediate)?, turn_id)?))
+        Ok(crate::RejectionOutcome::Rejected(turn_from_transaction(
+            &self
+                .connection()?
+                .transaction_with_behavior(TransactionBehavior::Immediate)?,
+            turn_id,
+        )?))
     }
 
     fn initialize(&self) -> Result<()> {

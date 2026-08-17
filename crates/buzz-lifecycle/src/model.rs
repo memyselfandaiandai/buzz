@@ -454,18 +454,29 @@ pub struct RetentionPolicy {
 impl RetentionPolicy {
     pub(crate) fn validate(&self) -> crate::Result<()> {
         if self.owner_id.is_empty() || self.agent_id.is_empty() {
-            return Err(crate::LifecycleError::InvalidRequest("retention owner/agent must be non-empty"));
+            return Err(crate::LifecycleError::InvalidRequest(
+                "retention owner/agent must be non-empty",
+            ));
         }
         if !(7..=90).contains(&self.retention_days) {
-            return Err(crate::LifecycleError::InvalidRequest("retention_days must be between 7 and 90"));
+            return Err(crate::LifecycleError::InvalidRequest(
+                "retention_days must be between 7 and 90",
+            ));
         }
         const MIN: i64 = 256 * 1024 * 1024;
         const MAX: i64 = 2 * 1024 * 1024 * 1024;
-        if !(MIN..=MAX).contains(&self.soft_bytes) || !(MIN..=MAX).contains(&self.hard_bytes) || self.hard_bytes < self.soft_bytes {
-            return Err(crate::LifecycleError::InvalidRequest("retention bytes out of range or hard < soft"));
+        if !(MIN..=MAX).contains(&self.soft_bytes)
+            || !(MIN..=MAX).contains(&self.hard_bytes)
+            || self.hard_bytes < self.soft_bytes
+        {
+            return Err(crate::LifecycleError::InvalidRequest(
+                "retention bytes out of range or hard < soft",
+            ));
         }
         if self.updated_at_ms < 0 {
-            return Err(crate::LifecycleError::InvalidRequest("retention updated_at must be non-negative"));
+            return Err(crate::LifecycleError::InvalidRequest(
+                "retention updated_at must be non-negative",
+            ));
         }
         Ok(())
     }
@@ -517,4 +528,3 @@ pub enum ActivationOutcome {
     NotFound,
     CancelledConflict,
 }
-
