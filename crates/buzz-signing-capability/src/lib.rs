@@ -24,7 +24,8 @@ pub use registry::{
     CapabilityDescriptor, CapabilityRegistry, CapabilityState, ClockReading, IssueError,
     IssuedCapability, RegistrySnapshot, MAX_CAPABILITY_IN_FLIGHT, MAX_CAPABILITY_LIFETIME_MS,
     MAX_CAPABILITY_OPERATIONS, MAX_CAPABILITY_PAYLOAD_BYTES, MAX_REGISTRY_CAPABILITIES,
-    MAX_REGISTRY_RESPONSE_BYTES, MAX_REPLAYS_PER_REQUEST,
+    MAX_REGISTRY_RESPONSE_BYTES, MAX_REPLAYS_PER_REQUEST, is_tailscale_endpoint,
+    is_tailscale_ipv4,
 };
 
 #[cfg(test)]

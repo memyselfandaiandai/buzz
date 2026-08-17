@@ -54,6 +54,9 @@ where
     F: FnOnce(TcpStream) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    // Tests bind a real loopback listener; the parser enforces 100.x in
+    // production and the LAN fixture is still checked by
+    // `is_tailscale_endpoint` / `is_tailscale_ipv4` explicitly.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     tokio::spawn(async move {
@@ -186,33 +189,62 @@ async fn fake_loopback_supports_all_three_typed_operations() {
 }
 
 #[test]
-fn endpoint_parser_accepts_only_canonical_ipv4_loopback_tcp() {
+fn endpoint_parser_accepts_only_canonical_tailscale_tcp_and_rejects_non_tailscale() {
     assert_eq!(
-        parse_endpoint("tcp://127.0.0.1:49152").expect("canonical endpoint"),
-        "127.0.0.1:49152".parse().expect("address")
+        parse_endpoint("tcp://100.117.196.100:49152").expect("canonical Tailscale endpoint"),
+        "100.117.196.100:49152".parse().expect("address")
     );
+    assert_eq!(
+        parse_endpoint("tcp://100.64.0.1:8443").expect("lower 100.64 edge"),
+        "100.64.0.1:8443".parse().expect("address")
+    );
+    assert_eq!(
+        parse_endpoint("tcp://100.127.255.255:8443").expect("upper 100.127 edge"),
+        "100.127.255.255:8443".parse().expect("address")
+    );
+    // In test builds `parse_endpoint` also accepts `127.0.0.1` for the
+    // in-process fake brokers (see `is_tailscale_ipv4` cfg(test)). The
+    // *production* contract remains strict, so we prove the allowlist with
+    // the non-test helper instead.
+    assert!(buzz_signing_capability::is_tailscale_endpoint(
+        "tcp://100.117.196.100:49152"
+    ));
+    assert!(!buzz_signing_capability::is_tailscale_endpoint(
+        "tcp://127.0.0.1:49152"
+    ));
+    assert!(!buzz_signing_capability::is_tailscale_endpoint(
+        "tcp://192.168.4.31:8791"
+    ));
+    assert!(!buzz_signing_capability::is_tailscale_endpoint(
+        "tcp://100.63.255.255:8443"
+    ));
+    assert!(!buzz_signing_capability::is_tailscale_endpoint(
+        "tcp://100.128.0.1:8443"
+    ));
     for invalid in [
-        "http://127.0.0.1:49152",
+        "http://100.117.196.100:49152",
         "tcp://localhost:49152",
         "tcp://[::1]:49152",
-        "tcp://127.0.0.1:0",
-        "tcp://127.0.0.1:49152/",
-        "tcp://127.0.0.1:49152/path",
-        "tcp://127.0.0.1:49152?query=1",
-        "tcp://127.0.0.1:49152#fragment",
-        "tcp://user@127.0.0.1:49152",
-        "TCP://127.0.0.1:49152",
-        "tcp://127.0.0.1:049152",
-        "tcp://127.0.0.1",
+        "tcp://10.0.0.1:49152",
+        "tcp://0.0.0.0:8443",
+        "tcp://100.117.196.100:0",
+        "tcp://100.117.196.100:49152/",
+        "tcp://100.117.196.100:49152/path",
+        "tcp://100.117.196.100:49152?query=1",
+        "tcp://100.117.196.100:49152#fragment",
+        "tcp://user@100.117.196.100:49152",
+        "TCP://100.117.196.100:49152",
+        "tcp://100.117.196.100:049152",
+        "tcp://100.117.196.100",
     ] {
-        assert_eq!(parse_endpoint(invalid), Err(ClientError::InvalidEndpoint));
+        assert_eq!(parse_endpoint(invalid), Err(ClientError::InvalidEndpoint), "{invalid}");
     }
 }
 
 #[test]
 fn environment_is_complete_exact_and_never_mixed() {
     let keys = Keys::generate();
-    let endpoint = "tcp://127.0.0.1:49152";
+    let endpoint = "tcp://100.117.196.100:49152";
     assert_eq!(
         CapabilityClient::parse_environment(Vec::<(OsString, OsString)>::new())
             .expect_err("missing projection"),
@@ -265,7 +297,7 @@ fn environment_is_complete_exact_and_never_mixed() {
 #[test]
 fn environment_rejects_invalid_public_projection_fields() {
     let keys = Keys::generate();
-    let endpoint = "tcp://127.0.0.1:49152";
+    let endpoint = "tcp://100.117.196.100:49152";
     let expiry = future_expiry();
     for (name, value, expected) in [
         (
@@ -381,7 +413,7 @@ fn request_deadline_is_capped_by_projection_expiry() {
     let now = 2_000_000_000_000_i64;
     let expiry = now + 250;
     let client = CapabilityClient::parse_environment(projection(
-        "tcp://127.0.0.1:49152",
+        "tcp://100.117.196.100:49152",
         &keys.public_key(),
         expiry,
     ))
@@ -421,7 +453,7 @@ async fn each_operation_uses_a_fresh_request_identifier() {
 async fn oversized_request_fails_before_connecting() {
     let keys = Keys::generate();
     let client = CapabilityClient::parse_environment(projection(
-        "tcp://127.0.0.1:49152",
+        "tcp://100.117.196.100:49152",
         &keys.public_key(),
         future_expiry(),
     ))
@@ -580,7 +612,7 @@ async fn broker_expiry_and_revoke_errors_remain_stable() {
 async fn projected_expiry_fails_before_connecting() {
     let keys = Keys::generate();
     let client = CapabilityClient::parse_environment(projection(
-        "tcp://127.0.0.1:49152",
+        "tcp://100.117.196.100:49152",
         &keys.public_key(),
         unix_now_ms().expect("clock") - 1,
     ))

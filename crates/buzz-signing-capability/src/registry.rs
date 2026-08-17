@@ -89,6 +89,45 @@ pub enum CapabilityState {
     Revoked,
 }
 
+/// Returns true only for the CGNAT `100.64.0.0/10` Tailscale carrier behind `100.x`.
+pub fn is_tailscale_ipv4(addr: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = addr.octets();
+    a == 100 && b >= 64 && b <= 127
+}
+
+/// Returns true only for `tcp://100.x.y.z:<port>` — no DNS, no private LAN, no loopback.
+pub fn is_tailscale_endpoint(value: &str) -> bool {
+    let url = match url::Url::parse(value) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    if url.scheme() != "tcp"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().is_empty()
+    {
+        return false;
+    }
+    let host = match url.host_str() {
+        Some(host) => host,
+        None => return false,
+    };
+    let port = match url.port().filter(|p| *p != 0) {
+        Some(port) => port,
+        None => return false,
+    };
+    let addr: std::net::Ipv4Addr = match host.parse() {
+        Ok(addr) => addr,
+        Err(_) => return false,
+    };
+    if !is_tailscale_ipv4(addr) {
+        return false;
+    }
+    value == format!("tcp://{addr}:{port}")
+}
+
 /// Non-secret capability metadata safe to expose to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityDescriptor {
@@ -100,6 +139,9 @@ pub struct CapabilityDescriptor {
     pub expires_at_unix_ms: i64,
     /// Configured budgets.
     pub budgets: BudgetLimits,
+    /// Unix-millis at which the capability was durably revoked, if any (reused by `capability_revocation` / `replay_ledger`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
 }
 
 /// Newly issued descriptor plus the only copy of its raw bearer token returned by the registry.
@@ -267,6 +309,7 @@ impl CapabilityRegistry {
             scope,
             expires_at_unix_ms,
             budgets,
+            revoked_at_unix_ms: None,
         };
         let record = CapabilityRecord {
             descriptor: descriptor.clone(),
@@ -309,8 +352,8 @@ impl CapabilityRegistry {
 
     /// Permanently revoke a capability.
     ///
-    /// This method linearizes on the same mutex as [`Self::authorize`]. Once it
-    /// returns, every authorization that begins afterward observes `Revoked`.
+    /// Durable reuse: store `revoked_at_unix_ms` equals `now.unix_ms` on the
+    /// d...[truncated]
     pub fn revoke(&self, capability_id: Uuid) -> Result<(), ProtocolError> {
         let mut state = try_lock_registry(&self.inner)
             .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?;

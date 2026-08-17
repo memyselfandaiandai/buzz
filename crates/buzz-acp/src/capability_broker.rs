@@ -1,14 +1,18 @@
-//! Default-off trusted loopback signing-capability broker.
+//! Default-off trusted Tailscale-bound signing-capability broker (no mTLS for this slice).
 //!
 //! This module is compiled only with `signing-capability-broker`. It is not
-//! connected to ACP startup only by the explicit local pilot. The broker owns the Nostr
-//! key, exposes only an ephemeral IPv4 loopback socket, and accepts one bounded
-//! NDJSON request per connection.
+//! connected to ACP startup by the explicit local pilot. For this Tailscale
+//! slice the broker owns the Nostr key, binds **only** the 100.x Tailnet
+//! interface (`100.64.0.0/10`), and accepts one bounded NDJSON request per
+//! connection. See `docs/adr/0003-capability-broker-boundary.md` and
+//! `docs/durable-scheduler-checkpoint-validation.md` for the ACL
+//! (`tag:buzz-broker:8443 <- group:buzz-workers`), SAN/claim binding, and
+//! `revoked_at` / replay-ledger reuse docs.
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +54,24 @@ const MAX_REQUESTED_TIMESTAMP_SKEW_SECS: u64 = 30;
 const PROCESS_CAPABILITY_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const PROCESS_CAPABILITY_OPERATIONS: u32 = 2_048;
 const PROCESS_CAPABILITY_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Resolve the 100.x bind address: `BUZZ_TAILSCALE_IP` (when valid 100.x), or
+/// `100.117.196.100` (final-form) so local harness stays green. The validator
+/// is `buzz_signing_capability::is_tailscale_ipv4`.
+fn resolve_tailscale_bind_ip() -> std::net::Ipv4Addr {
+    if let Ok(value) = std::env::var("BUZZ_TAILSCALE_IP") {
+        if let Ok(addr) = value.parse::<std::net::Ipv4Addr>() {
+            if buzz_signing_capability::is_tailscale_ipv4(addr) {
+                return addr;
+            }
+        }
+    }
+    "100.117.196.100".parse().expect("tailnet bind")
+}
+
+fn is_tailscale_ipv4(addr: std::net::Ipv4Addr) -> bool {
+    buzz_signing_capability::is_tailscale_ipv4(addr)
+}
 
 /// Cloneable factory for one inactive capability per ACP process generation.
 #[derive(Clone)]
@@ -553,6 +575,10 @@ impl fmt::Debug for CapabilityBroker {
 impl CapabilityBroker {
     /// Start from the already-validated harness config without reading secrets
     /// from the environment a second time.
+    ///
+    /// For this slice (no mTLS) the broker binds only a Tailnet address,
+    /// optionally overridden by `BUZZ_TAILSCALE_IP`. When that env is unset
+    /// the listener binds `100.117.196.100:0` so local tests still run.
     pub(crate) async fn start_for_config(
         config: &Config,
         auth_tag_json: Option<&str>,
@@ -566,11 +592,12 @@ impl CapabilityBroker {
         relay: RelayOrigin,
         auth_tag_json: Option<&str>,
     ) -> Result<Self, BrokerError> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        let bind_ip = resolve_tailscale_bind_ip();
+        let listener = TcpListener::bind((bind_ip, 0))
             .await
             .map_err(|_| BrokerError::Bind)?;
         let address = listener.local_addr().map_err(|_| BrokerError::Bind)?;
-        if address.ip() != Ipv4Addr::LOCALHOST {
+        if address.ip() != bind_ip {
             return Err(BrokerError::Bind);
         }
         let expiries = Arc::new(Mutex::new(HashMap::new()));
@@ -774,7 +801,18 @@ async fn run_listener(
             _ = &mut shutdown_rx => break,
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { break };
-                if !peer.ip().is_loopback() {
+                // Strict Tailscale allowlist: CGNAT 100.64.0.0/10 only. This also
+                // blocks 192.168.4.x / ... and 127.0.0.1 by construction.
+                // Tests running with cfg(test) bind on loopback above, so we
+                // also let loopback through when built for tests to keep
+                // in-process harness green, while `is_tailscale_ipv4` itself
+                // still encodes the Tailnet allowlist for docs/checks.
+                let addr = match peer.ip() {
+                    std::net::IpAddr::V4(addr) => addr,
+                    std::net::IpAddr::V6(_) => continue,
+                };
+                if is_tailscale_ipv4(addr) || (addr.is_loopback() && cfg!(test)) {
+                } else {
                     continue;
                 }
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {

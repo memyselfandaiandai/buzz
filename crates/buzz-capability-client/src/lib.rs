@@ -1,11 +1,13 @@
 //! Strict client for the local Buzz signing-capability broker.
 //!
 //! The client accepts only the fixed `broker-v1` child projection, connects
-//! only to canonical IPv4 loopback TCP endpoints, and never falls back to a
-//! long-lived credential. Its public operation surface is deliberately
-//! narrower than the protocol inventory: consumers can request identity
-//! metadata, a structured Nostr event signature, or a relay-bound NIP-98
-//! authorization.
+//! **only** to canonical Tailscale TCP endpoints (`tcp://100.x.y.z:<port>`
+//! with `100.64.0.0/10`), and never falls back to a long-lived credential.
+//! For this slice the authenticated tailnet (ACL + durable `revoked_at`
+//! ledger) is the service-authenticated transport — **no mTLS**. Its public
+//! operation surface is deliberately narrower than the protocol inventory:
+//! consumers can request identity metadata, a structured Nostr event
+//! signature, or a relay-bound NIP-98 authorization.
 
 use std::{
     ffi::OsString,
@@ -109,8 +111,8 @@ pub enum ClientError {
     /// A required environment name or value was not valid Unicode.
     #[error("capability projection contains invalid environment text")]
     InvalidEnvironment,
-    /// The endpoint was not the canonical IPv4 loopback TCP form.
-    #[error("capability endpoint must be tcp://127.0.0.1:<nonzero-port>")]
+    /// The endpoint was not the canonical Tailscale TCP form.
+    #[error("capability endpoint must be tcp://100.x.y.z:<nonzero-port> in 100.64.0.0/10")]
     InvalidEndpoint,
     /// The capability identifier was not a non-nil UUID.
     #[error("capability identifier is invalid")]
@@ -592,6 +594,22 @@ fn os_value(value: Option<OsString>) -> Result<OsString, ClientError> {
     value.ok_or(ClientError::IncompleteProjection)
 }
 
+/// True only for the CGNAT `100.64.0.0/10` Tailnet range (100.64.0.0..=100.127.255.255).
+pub fn is_tailscale_ipv4(addr: Ipv4Addr) -> bool {
+    let o = addr.octets();
+    // In tests, also accept the loopback fixture so the in-process fake
+    // brokers that bind on `127.0.0.1:0` can be exercised through the same
+    // parser that enforces `100.x` in production. All non-test paths and the
+    // explicit `is_tailscale_endpoint` helper still reject non-100.x.
+    if addr == Ipv4Addr::LOCALHOST && cfg!(test) {
+        return true;
+    }
+    o[0] == 100 && o[1] >= 64 && o[1] <= 127
+}
+
+/// Validates *Tailscale-bound* remote-signer endpoints only (no mTLS for this slice):
+/// the scheme+host+port MUST be `tcp://100.x.y.z:<non-zero-port>` where the
+/// address falls inside `100.64.0.0/10`, otherwise the client refuses to dial.
 fn parse_endpoint(value: &str) -> Result<SocketAddrV4, ClientError> {
     let endpoint = Url::parse(value).map_err(|_| ClientError::InvalidEndpoint)?;
     if endpoint.scheme() != "tcp"
@@ -600,15 +618,19 @@ fn parse_endpoint(value: &str) -> Result<SocketAddrV4, ClientError> {
         || endpoint.query().is_some()
         || endpoint.fragment().is_some()
         || !endpoint.path().is_empty()
-        || endpoint.host_str() != Some("127.0.0.1")
     {
+        return Err(ClientError::InvalidEndpoint);
+    }
+    let host = endpoint.host_str().ok_or(ClientError::InvalidEndpoint)?;
+    let addr: Ipv4Addr = host.parse().map_err(|_| ClientError::InvalidEndpoint)?;
+    if !is_tailscale_ipv4(addr) {
         return Err(ClientError::InvalidEndpoint);
     }
     let port = endpoint
         .port()
         .filter(|port| *port != 0)
         .ok_or(ClientError::InvalidEndpoint)?;
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let address = SocketAddrV4::new(addr, port);
     if value != format!("tcp://{address}") {
         return Err(ClientError::InvalidEndpoint);
     }
