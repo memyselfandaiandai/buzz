@@ -2576,7 +2576,7 @@ fn apply_anthropic_cache_control(body: &mut serde_json::Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, HookServers, OpenAiApi, Provider, ThinkingSummary};
+    use crate::config::{Config, HookServers, OpenAiApi, Provider, ThinkingSummary, ToolExposure};
     use crate::types::{HistoryItem, ToolCall, ToolResult, ToolResultContent};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -2603,6 +2603,7 @@ mod tests {
             max_context_tokens: 200_000,
             max_handoffs: 1,
             max_parallel_tools: 1,
+            tool_exposure: ToolExposure::Full,
             hook_timeout: Duration::from_secs(1),
             stop_max_rejections: 0,
             require_reply: false,

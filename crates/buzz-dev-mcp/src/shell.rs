@@ -23,6 +23,12 @@ const TAIL_BYTES: usize = 8 * 1024;
 const ARTIFACT_RING_SIZE: usize = 8;
 const READ_CHUNK: usize = 16 * 1024;
 
+// Shared by every Windows test that either mutates the shell-selection
+// environment or constructs a state from it. Keeping the readers under the
+// same lock makes the full parallel crate suite deterministic.
+#[cfg(all(test, windows))]
+static TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
 pub struct SharedState {
     pub cwd: PathBuf,
     pub shim: Shim,
@@ -50,7 +56,7 @@ impl SharedState {
             Ok((_, name)) => name.as_str(),
             Err(_) => "bash",
         };
-        let bootstrap_instructions = build_bootstrap(&cwd, shell_hint);
+        let bootstrap_instructions = build_bootstrap(&cwd, shell_hint, &shim.credentials);
         Ok(Self {
             cwd,
             shim,
@@ -72,14 +78,19 @@ impl SharedState {
     }
 }
 
-fn build_bootstrap(cwd: &Path, shell_hint: &str) -> String {
+fn build_bootstrap(
+    cwd: &Path,
+    shell_hint: &str,
+    credentials: &crate::credentials::ChildCredentials,
+) -> String {
     let stack = detect_stack(cwd);
-    let buzz_hint =
-        if std::env::var("BUZZ_RELAY_URL").is_ok() && std::env::var("BUZZ_PRIVATE_KEY").is_ok() {
-            "\nBuzz relay configured. Run `buzz --help` to see available commands.\n"
-        } else {
-            ""
-        };
+    let buzz_hint = if credentials.is_broker_v1() {
+        "\nBrokered Buzz CLI available. Run `buzz --help` to see available commands; raw relay credentials are not exposed.\n"
+    } else if std::env::var("BUZZ_RELAY_URL").is_ok() && std::env::var("BUZZ_PRIVATE_KEY").is_ok() {
+        "\nBuzz relay configured. Run `buzz --help` to see available commands.\n"
+    } else {
+        ""
+    };
     format!(
         "Working directory: {}\n\
          Detected stack: {}\n\
@@ -172,6 +183,9 @@ pub async fn run(
     for (k, v) in &state.shim.git_env {
         cmd.env(k, v);
     }
+    // Apply the broker boundary after every ordinary child configuration so
+    // inherited or earlier-configured long-lived aliases cannot win.
+    state.shim.credentials.apply_to_command(&mut cmd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -989,8 +1003,29 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_state(cwd: &std::path::Path) -> SharedState {
+        #[cfg(windows)]
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let shim = Shim::install().expect("shim install");
         SharedState::new(cwd.to_path_buf(), shim).expect("state new")
+    }
+
+    #[test]
+    fn broker_bootstrap_names_brokered_cli_without_raw_credentials() {
+        #[cfg(windows)]
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let shim = Shim::install_with_credentials(
+            crate::credentials::ChildCredentials::broker_for_tests("wss://relay.example.com"),
+        )
+        .expect("broker shim");
+        let state = SharedState::new(dir.path().to_path_buf(), shim).expect("state");
+        assert!(state
+            .bootstrap_instructions
+            .contains("Brokered Buzz CLI available"));
+        assert!(state
+            .bootstrap_instructions
+            .contains("raw relay credentials are not exposed"));
+        assert!(!state.bootstrap_instructions.contains("relay configured"));
     }
 
     /// Pull the JSON body out of a CallToolResult so tests can assert on fields.
@@ -1140,13 +1175,7 @@ mod tests {
 mod windows_resolver_tests {
     use super::*;
     use std::env;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    // Process-global env mutation guard: tests that mutate BUZZ_SHELL,
-    // SystemRoot, or GIT_BASH must hold this lock for the duration of the
-    // test so parallel test threads cannot race on these env vars.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn touch(path: &Path) {
         if let Some(parent) = path.parent() {
@@ -1157,7 +1186,7 @@ mod windows_resolver_tests {
 
     #[test]
     fn buzz_shell_override_wins_over_everything() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // BUZZ_SHELL pointing at a real file must be returned without probing
         // the standard Git-for-Windows locations or PATH.
         let dir = tempdir().expect("tempdir");
@@ -1173,7 +1202,7 @@ mod windows_resolver_tests {
 
     #[test]
     fn buzz_shell_override_skipped_when_path_absent() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // If BUZZ_SHELL points at a non-existent path the resolver must fall
         // through rather than returning a dead path.
         env::set_var("BUZZ_SHELL", r"C:\does\not\exist\bash.exe");
@@ -1195,7 +1224,7 @@ mod windows_resolver_tests {
     /// exclusion — cmd/pwsh live in System32 legitimately.
     #[test]
     fn buzz_shell_explicit_bare_name_resolves_from_system32() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // Simulate cmd.exe living in a dir that would be excluded by the WSL guard.
         // The explicit BUZZ_SHELL branch must NOT skip System32.
         let sys32 = tempdir().expect("sys32");
@@ -1227,7 +1256,7 @@ mod windows_resolver_tests {
     /// Implicit bash.exe scan still skips System32 (WSL guard intact).
     #[test]
     fn implicit_bash_scan_still_skips_system32() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // Same setup: bash.exe is only in a dir that is under SystemRoot.
         // Without an explicit BUZZ_SHELL, the fallback scan must skip it.
         let sys32 = tempdir().expect("sys32");
@@ -1267,7 +1296,7 @@ mod windows_resolver_tests {
     /// resolved_shell whose display name appears in bootstrap_instructions.
     #[test]
     fn shared_state_bootstrap_hint_matches_resolved_shell() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempdir().expect("tempdir");
         let fake_pwsh = dir.path().join("pwsh.exe");
         touch(&fake_pwsh);
@@ -1290,7 +1319,7 @@ mod windows_resolver_tests {
     /// When pwsh.exe is on PATH, resolve_bash must return it and report "pwsh".
     #[test]
     fn buzz_shell_bare_name_resolved_through_path_when_present() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempdir().expect("tempdir");
         let fake_pwsh = dir.path().join("pwsh.exe");
         touch(&fake_pwsh);
@@ -1309,7 +1338,7 @@ mod windows_resolver_tests {
     /// report pwsh as the active shell.
     #[test]
     fn buzz_shell_bare_name_absent_from_path_falls_through() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // Set BUZZ_SHELL to a command that won't be on any real PATH.
         env::set_var("BUZZ_SHELL", "buzz-shell-does-not-exist-xyz");
         let result = resolve_bash("");
@@ -1330,7 +1359,7 @@ mod windows_resolver_tests {
 
     #[test]
     fn git_cmd_on_path_resolves_sibling_git_bash() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempdir().expect("tempdir");
         let git = dir.path().join("Git").join("cmd").join("git.exe");
         let bash = dir.path().join("Git").join("bin").join("bash.exe");

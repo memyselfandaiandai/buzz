@@ -18,7 +18,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
         } => {
             let owner = require_owner(client)?;
             let built = build_create(
-                client.keys(),
+                client.local_keys()?,
                 &owner,
                 CreateAgentDraft {
                     channel_id: channel,
@@ -55,7 +55,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
         } => {
             let owner = require_owner(client)?;
             let built = build_update(
-                client.keys(),
+                client.local_keys()?,
                 &owner,
                 UpdateAgentDraft {
                     channel_id: channel,
@@ -93,7 +93,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             admin,
         } => {
             validate_hex64(&target_pubkey)?;
-            let signer_hex = client.keys().public_key().to_hex();
+            let signer_hex = client.public_key().to_hex();
             let auth = resolve_auth(
                 client,
                 &target_pubkey,
@@ -132,7 +132,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             admin,
         } => {
             validate_hex64(&target_pubkey)?;
-            let signer_hex = client.keys().public_key().to_hex();
+            let signer_hex = client.public_key().to_hex();
             let auth = resolve_auth(
                 client,
                 &target_pubkey,

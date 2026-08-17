@@ -108,7 +108,32 @@ impl ObserverHandle {
         context: &ObserverContext,
         payload: serde_json::Value,
     ) {
-        let event = ObserverEvent {
+        self.emit_inner(kind, agent_index, context, payload, false);
+    }
+
+    /// Emit an event after fitting its complete serialized ObserverEvent frame
+    /// to the relay plaintext ceiling. Use this for content-bearing semantic
+    /// events; the in-process replay buffer must not temporarily retain an
+    /// oversized frame that publication would only trim later.
+    pub fn emit_fitted(
+        &self,
+        kind: impl Into<String>,
+        agent_index: Option<usize>,
+        context: &ObserverContext,
+        payload: serde_json::Value,
+    ) {
+        self.emit_inner(kind, agent_index, context, payload, true);
+    }
+
+    fn emit_inner(
+        &self,
+        kind: impl Into<String>,
+        agent_index: Option<usize>,
+        context: &ObserverContext,
+        payload: serde_json::Value,
+        fit_to_budget: bool,
+    ) {
+        let mut event = ObserverEvent {
             seq: self.inner.seq.fetch_add(1, Ordering::Relaxed),
             timestamp: chrono::Utc::now().to_rfc3339(),
             kind: kind.into(),
@@ -119,6 +144,9 @@ impl ObserverHandle {
             started_at: context.started_at.clone(),
             payload,
         };
+        if fit_to_budget {
+            crate::fit_observer_event_to_budget(&mut event);
+        }
 
         match self.inner.buffer.lock() {
             Ok(mut buffer) => {

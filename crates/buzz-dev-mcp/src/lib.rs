@@ -10,6 +10,7 @@ use rmcp::{
 use std::path::Path;
 use std::sync::Arc;
 
+mod credentials;
 mod paths;
 mod read_file;
 mod rg;

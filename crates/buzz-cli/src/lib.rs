@@ -5,6 +5,7 @@ mod error;
 mod links;
 mod validate;
 
+use buzz_capability_client::CapabilityClient;
 use clap::{Parser, Subcommand};
 use client::BuzzClient;
 use error::CliError;
@@ -1948,6 +1949,53 @@ fn normalize_auth_tag_input(input: &str) -> String {
     trimmed.to_owned()
 }
 
+const BROKER_V1_PREFIX: &str = "BUZZ_CAPABILITY_";
+const BROKER_V1_MARKERS: [&str; 5] = [
+    "BUZZ_CAPABILITY_ENDPOINT",
+    "BUZZ_CAPABILITY_ID",
+    "BUZZ_CAPABILITY_TOKEN",
+    "BUZZ_PUBLIC_KEY",
+    "BUZZ_CAPABILITY_EXPIRES_AT",
+];
+
+fn broker_projection_requested() -> bool {
+    broker_projection_requested_from(std::env::vars_os().map(|(name, _)| name))
+}
+
+fn broker_projection_requested_from<I>(names: I) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    names.into_iter().any(|name| {
+        let name = name.to_string_lossy();
+        let uppercase = name.to_ascii_uppercase();
+        uppercase.starts_with(BROKER_V1_PREFIX) || BROKER_V1_MARKERS.contains(&uppercase.as_str())
+    })
+}
+
+fn validate_broker_v1_command(command: &Cmd) -> Result<(), CliError> {
+    match command {
+        Cmd::Messages(MessagesCmd::Send { files, .. }) if !files.is_empty() => Err(
+            CliError::Usage("unsupported_in_broker_v1: messages send --file".into()),
+        ),
+        Cmd::Messages(
+            MessagesCmd::Send { .. }
+            | MessagesCmd::SendDiff { .. }
+            | MessagesCmd::Edit { .. }
+            | MessagesCmd::Delete { .. }
+            | MessagesCmd::Get { .. }
+            | MessagesCmd::Thread { .. }
+            | MessagesCmd::Search { .. }
+            | MessagesCmd::Vote { .. },
+        )
+        | Cmd::Channels(
+            ChannelsCmd::List { .. } | ChannelsCmd::Get { .. } | ChannelsCmd::Search { .. },
+        )
+        | Cmd::Feed(FeedCmd::Get { .. }) => Ok(()),
+        _ => Err(CliError::Auth("unsupported_in_broker_v1".into())),
+    }
+}
+
 async fn run(cli: Cli) -> Result<(), CliError> {
     let relay_url = client::normalize_relay_url(&cli.relay);
 
@@ -1959,42 +2007,46 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
-    // Auth: private key is required for all relay operations.
-    // The keypair IS the identity — no tokens, no other auth.
-    let private_key_str = cli.private_key.ok_or_else(|| {
-        CliError::Auth("BUZZ_PRIVATE_KEY is required (use --private-key or set env var)".into())
-    })?;
-    let keys = Keys::parse(&private_key_str)
-        .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
-
-    // NIP-OA: parse and verify the auth tag if provided.
-    //
-    // `BUZZ_AUTH_TAG` is hand-authored configuration, so the unquoted raw
-    // shorthand `[auth,hex,,hex]` is normalized to JSON here — at this input
-    // edge only. The SDK grammar and the `x-auth-tag` wire format stay strict
-    // JSON; all validation and signature verification happen on the strict
-    // path below, unchanged.
-    let (auth_tag, auth_tag_json) = match cli.auth_tag {
-        Some(ref input) if !input.is_empty() => {
-            let json = normalize_auth_tag_input(input);
-            let tag = buzz_sdk::nip_oa::parse_auth_tag(&json)
-                .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG is malformed: {e}")))?;
-            buzz_sdk::nip_oa::verify_auth_tag(&json, &keys.public_key()).map_err(|e| {
-                CliError::Auth(format!(
-                    "BUZZ_AUTH_TAG verification failed for pubkey {}: {e}",
-                    keys.public_key().to_hex()
-                ))
-            })?;
-            // Canonical wire form derives from the parsed-and-verified tag
-            // (same shape as buzz-acp's RestClient), never from raw input.
-            let canonical = serde_json::to_string(tag.as_slice())
-                .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG serialization failed: {e}")))?;
-            (Some(tag), Some(canonical))
+    let client = if broker_projection_requested() {
+        // Gate the command before the live identity cross-check, so an excluded
+        // broker-mode command cannot cause broker or relay I/O.
+        validate_broker_v1_command(&cli.command)?;
+        if cli.private_key.is_some() || cli.auth_tag.is_some() {
+            return Err(CliError::Auth("mixed_credentials_in_broker_v1".into()));
         }
-        _ => (None, None),
-    };
+        let capability = CapabilityClient::from_env()
+            .await
+            .map_err(|error| CliError::Auth(format!("broker_v1: {error}")))?;
+        BuzzClient::new_capability(relay_url, capability)?
+    } else {
+        // Legacy mode remains unchanged: the private key is the identity and
+        // an optional owner delegation is attached to every signed event.
+        let private_key_str = cli.private_key.ok_or_else(|| {
+            CliError::Auth("BUZZ_PRIVATE_KEY is required (use --private-key or set env var)".into())
+        })?;
+        let keys = Keys::parse(&private_key_str)
+            .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
 
-    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
+        let (auth_tag, auth_tag_json) = match cli.auth_tag {
+            Some(ref input) if !input.is_empty() => {
+                let json = normalize_auth_tag_input(input);
+                let tag = buzz_sdk::nip_oa::parse_auth_tag(&json)
+                    .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG is malformed: {e}")))?;
+                buzz_sdk::nip_oa::verify_auth_tag(&json, &keys.public_key()).map_err(|e| {
+                    CliError::Auth(format!(
+                        "BUZZ_AUTH_TAG verification failed for pubkey {}: {e}",
+                        keys.public_key().to_hex()
+                    ))
+                })?;
+                let canonical = serde_json::to_string(tag.as_slice()).map_err(|e| {
+                    CliError::Auth(format!("BUZZ_AUTH_TAG serialization failed: {e}"))
+                })?;
+                (Some(tag), Some(canonical))
+            }
+            _ => (None, None),
+        };
+        BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?
+    };
 
     match cli.command {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
@@ -2076,6 +2128,115 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn broker_projection_detection_is_fail_closed_without_claiming_relay_only() {
+        assert!(!broker_projection_requested_from(["BUZZ_RELAY_URL".into()]));
+        for marker in BROKER_V1_MARKERS {
+            assert!(broker_projection_requested_from([marker.into()]));
+        }
+        assert!(broker_projection_requested_from([
+            "buzz_capability_endpoint".into()
+        ]));
+        assert!(broker_projection_requested_from([
+            "BUZZ_CAPABILITY_UNKNOWN".into()
+        ]));
+    }
+
+    #[test]
+    fn broker_v1_command_table_is_explicit_and_file_send_is_rejected() {
+        let supported = [
+            vec!["buzz", "messages", "get", "--channel", "channel"],
+            vec![
+                "buzz",
+                "messages",
+                "thread",
+                "--channel",
+                "channel",
+                "--event",
+                "event",
+            ],
+            vec!["buzz", "messages", "search", "--query", "query"],
+            vec![
+                "buzz",
+                "messages",
+                "send",
+                "--channel",
+                "channel",
+                "--content",
+                "hello",
+            ],
+            vec![
+                "buzz",
+                "messages",
+                "send-diff",
+                "--channel",
+                "channel",
+                "--diff",
+                "diff",
+                "--repo",
+                "repo",
+                "--commit",
+                "commit",
+            ],
+            vec![
+                "buzz",
+                "messages",
+                "edit",
+                "--event",
+                "event",
+                "--content",
+                "text",
+            ],
+            vec!["buzz", "messages", "delete", "--event", "event"],
+            vec![
+                "buzz",
+                "messages",
+                "vote",
+                "--event",
+                "event",
+                "--direction",
+                "up",
+            ],
+            vec!["buzz", "channels", "list"],
+            vec!["buzz", "channels", "get", "--channel", "channel"],
+            vec!["buzz", "channels", "search", "--query", "query"],
+            vec!["buzz", "feed", "get"],
+        ];
+        for args in supported {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|error| {
+                panic!("supported broker command failed to parse {args:?}: {error}")
+            });
+            assert!(
+                validate_broker_v1_command(&cli.command).is_ok(),
+                "supported broker command rejected: {args:?}"
+            );
+        }
+
+        let file_send = Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "send",
+            "--channel",
+            "channel",
+            "--content",
+            "hello",
+            "--file",
+            "secret.txt",
+        ])
+        .expect("file send parses");
+        assert!(matches!(
+            validate_broker_v1_command(&file_send.command),
+            Err(CliError::Usage(message)) if message == "unsupported_in_broker_v1: messages send --file"
+        ));
+
+        let unsupported = Cli::try_parse_from(["buzz", "canvas", "get", "--channel", "channel"])
+            .expect("unsupported command parses");
+        assert!(matches!(
+            validate_broker_v1_command(&unsupported.command),
+            Err(CliError::Auth(message)) if message == "unsupported_in_broker_v1"
+        ));
     }
 
     #[test]

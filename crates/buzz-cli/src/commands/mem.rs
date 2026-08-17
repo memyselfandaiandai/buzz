@@ -64,16 +64,16 @@ fn resolve_reader(
         }
         let agent = PublicKey::from_hex(agent)
             .map_err(|e| CliError::Usage(format!("--agent must be a 64-hex pubkey: {e}")))?;
-        if agent == client.keys().public_key() {
+        if agent == client.public_key() {
             return Err(CliError::Usage(
                 "--agent must differ from the CLI identity; omit --agent for agent-side reads"
                     .into(),
             ));
         }
-        return Ok((agent, client.keys().public_key(), agent));
+        return Ok((agent, client.public_key(), agent));
     }
 
-    let agent = client.keys().public_key();
+    let agent = client.public_key();
     let owner = resolve_owner(client, owner_flag)?;
     Ok((agent, owner, owner))
 }
@@ -139,12 +139,12 @@ async fn fetch_head(
     owner: &PublicKey,
     slug: &str,
 ) -> Result<(Option<nostr::Event>, Option<Body>), CliError> {
-    let their_pubkey = if client.keys().public_key() == *agent {
+    let their_pubkey = if client.public_key() == *agent {
         owner
     } else {
         agent
     };
-    let k_c = conversation_key(client.keys().secret_key(), their_pubkey);
+    let k_c = conversation_key(client.local_keys()?.secret_key(), their_pubkey);
     let d = d_tag(&k_c, slug);
 
     let filter = serde_json::json!({
@@ -164,7 +164,13 @@ async fn fetch_head(
         if ev.verify().is_err() {
             continue;
         }
-        match validate_and_decrypt(&ev, agent, owner, client.keys().secret_key(), their_pubkey) {
+        match validate_and_decrypt(
+            &ev,
+            agent,
+            owner,
+            client.local_keys()?.secret_key(),
+            their_pubkey,
+        ) {
             Ok(body) => valid_with_body.push((ev, body)),
             Err(_) => continue,
         }
@@ -223,7 +229,7 @@ pub async fn cmd_ls(
             &ev,
             &agent,
             &owner,
-            client.keys().secret_key(),
+            client.local_keys()?.secret_key(),
             &their_pubkey,
         ) {
             Ok(b) => b,
@@ -357,12 +363,12 @@ pub async fn cmd_set(
             value: Some(value),
         }
     };
-    let agent_pubkey = client.keys().public_key();
+    let agent_pubkey = client.public_key();
     let (head, _) = fetch_head(client, &agent_pubkey, &owner, &slug).await?;
     let prior_created_at = head.map(|e| e.created_at.as_secs());
     let created_at = engram::monotonic_created_at(now_secs(), prior_created_at);
 
-    let agent = client.keys();
+    let agent = client.local_keys()?;
     let event = engram::build_event(agent, &owner, &body, created_at)
         .map_err(|e| CliError::Other(format!("build event failed: {e}")))?;
     let id = event.id.to_hex();
@@ -598,7 +604,7 @@ pub async fn cmd_patch(
     };
 
     let owner = resolve_owner(client, owner_flag)?;
-    let agent_pubkey = client.keys().public_key();
+    let agent_pubkey = client.public_key();
     let (head, current) = fetch_value(client, &agent_pubkey, &owner, &slug).await?;
 
     // Base-hash gate: concurrent-edit safety.
@@ -688,7 +694,7 @@ pub async fn cmd_patch(
     let prior_created_at = Some(head.created_at.as_secs());
     let created_at = engram::monotonic_created_at(now_secs(), prior_created_at);
 
-    let agent = client.keys();
+    let agent = client.local_keys()?;
     let event = engram::build_event(agent, &owner, &body, created_at)
         .map_err(|e| CliError::Other(format!("build event failed: {e}")))?;
     let id = event.id.to_hex();
@@ -720,12 +726,12 @@ pub async fn cmd_rm(
         slug: slug.clone(),
         value: None,
     };
-    let agent_pubkey = client.keys().public_key();
+    let agent_pubkey = client.public_key();
     let (head, _) = fetch_head(client, &agent_pubkey, &owner, &slug).await?;
     let prior_created_at = head.map(|e| e.created_at.as_secs());
     let created_at = engram::monotonic_created_at(now_secs(), prior_created_at);
 
-    let agent = client.keys();
+    let agent = client.local_keys()?;
     let event = engram::build_event(agent, &owner, &body, created_at)
         .map_err(|e| CliError::Other(format!("build event failed: {e}")))?;
     let id = event.id.to_hex();

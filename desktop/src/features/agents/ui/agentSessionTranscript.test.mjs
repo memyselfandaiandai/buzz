@@ -44,46 +44,39 @@ function activityTitle(item) {
 
 // --- stub-overflow vanish (pins the pre-existing degraded-frame behavior) ---
 
-test("buildTranscript drops a session/prompt turn whose frame was stubbed by the size trimmer", () => {
-  // When fit_observer_event_to_budget cannot shrink a frame below the cap it
-  // replaces the whole payload with {elided, originalBytes} (no `method`), so
-  // the method-keyed acp_write dispatch matches no arm and there is no terminal
-  // else: the turn produces ZERO transcript items. This is worse than a
-  // "1 section" collapse (the item vanishes entirely) and is pre-existing,
-  // outside the format_prompt seam. Pin it so a later change can't silently
-  // regress the vanish-vs-degrade behavior without updating this test.
-  const stubbed = {
+test("buildTranscript ignores a structural session/prompt acp_write projection", () => {
+  // ACP wire observations are intentionally content-free. The semantic
+  // transcript_prompt event below is the only current content source.
+  const projected = {
     ...baseEvent,
     payload: {
-      elided: "acp_write payload too large",
-      originalBytes: 123456,
+      direction: "outbound",
+      kind: "request",
+      method: "session/prompt",
+      params: { promptBlockCount: 3, promptBytes: 256 },
     },
   };
 
-  assert.deepEqual(buildTranscript([stubbed]), []);
+  assert.deepEqual(buildTranscript([projected]), []);
 });
 
 // --- positive control: a well-formed multi-block prompt DOES render ---
 
-test("buildTranscript renders Prompt context + user message for a multi-block session/prompt frame", () => {
-  // Guards the vanish assertion above against a false pass from a broken
-  // import or dispatch: a normal per-section prompt frame must still produce a
+test("buildTranscript renders Prompt context + user message from transcript_prompt", () => {
+  // Guards the projection assertion above against a false pass from a broken
+  // import or dispatch: a normal per-section semantic event must produce a
   // user message and a "Prompt context" metadata item.
   const event = {
     ...baseEvent,
+    kind: "transcript_prompt",
     payload: {
-      method: "session/prompt",
-      params: {
-        sessionId: "sess-1",
-        prompt: [
-          { type: "text", text: "[Agent Memory — core]\nremember this" },
-          { type: "text", text: "[Context]\nScope: thread" },
-          {
-            type: "text",
-            text: `[Buzz event: @mention]\nEvent ID: ${PROMPT_EVENT_ID.toUpperCase()}\nFrom: x (hex: ${"a".repeat(64)})\nContent: hello`,
-          },
-        ],
-      },
+      schemaVersion: 1,
+      source: "session/prompt",
+      blocks: [
+        "[Agent Memory — core]\nremember this",
+        "[Context]\nScope: thread",
+        `[Buzz event: @mention]\nEvent ID: ${PROMPT_EVENT_ID.toUpperCase()}\nFrom: x (hex: ${"a".repeat(64)})\nContent: hello`,
+      ],
     },
   };
 
@@ -107,17 +100,13 @@ test("buildTranscript falls back to a single turn trigger id for older prompt fr
   const promptEvent = {
     ...baseEvent,
     seq: 2,
+    kind: "transcript_prompt",
     payload: {
-      method: "session/prompt",
-      params: {
-        sessionId: "sess-1",
-        prompt: [
-          {
-            type: "text",
-            text: `[Buzz event: @mention]\nFrom: x (hex: ${"a".repeat(64)})\nContent: hello`,
-          },
-        ],
-      },
+      schemaVersion: 1,
+      source: "session/prompt",
+      blocks: [
+        `[Buzz event: @mention]\nFrom: x (hex: ${"a".repeat(64)})\nContent: hello`,
+      ],
     },
   };
   const [userMessage] = buildTranscript([
@@ -133,6 +122,165 @@ test("buildTranscript falls back to a single turn trigger id for older prompt fr
   ]).filter((candidate) => candidate.type === "message");
 
   assert.equal(userMessage.messageId, PROMPT_EVENT_ID);
+});
+
+test("buildTranscript renders system context only from the versioned semantic event", () => {
+  const projectedWrite = {
+    ...baseEvent,
+    seq: 1,
+    payload: {
+      direction: "outbound",
+      kind: "request",
+      method: "session/new",
+      params: {
+        mcpServerCount: 2,
+        systemPromptBytes: 64,
+      },
+    },
+  };
+  const semanticContext = {
+    ...baseEvent,
+    seq: 2,
+    kind: "transcript_system_context",
+    payload: {
+      schemaVersion: 1,
+      source: "session/new",
+      text: "[Base]\nHelpful.\n\n[System]\nCareful.",
+    },
+  };
+
+  const [systemPrompt] = buildTranscript([
+    projectedWrite,
+    semanticContext,
+  ]).filter((item) => item.title === "System prompt");
+  assert.ok(systemPrompt, "semantic context must produce a system prompt card");
+  assert.deepEqual(
+    systemPrompt.sections.map((section) => section.title),
+    ["Base", "System"],
+  );
+  assert.equal(systemPrompt.turnId, null);
+});
+
+test("buildTranscript ignores structural acp_read and renders safe inbound semantic updates", () => {
+  const projectedRead = {
+    ...baseEvent,
+    kind: "acp_read",
+    payload: {
+      direction: "inbound",
+      kind: "notification",
+      method: "session/update",
+      params: {
+        sessionUpdate: "agent_message_chunk",
+        contentSerializedBytes: 42,
+        toolCallIdBytes: 19,
+      },
+    },
+  };
+  assert.deepEqual(buildTranscript([projectedRead]), []);
+
+  const semantic = (seq, updateType, payload = {}) => ({
+    ...baseEvent,
+    seq,
+    kind: "transcript_session_update",
+    payload: { schemaVersion: 1, updateType, ...payload },
+  });
+  const items = buildTranscript([
+    semantic(2, "agent_message_chunk", {
+      messageKey: `sha256:${"a".repeat(64)}`,
+      text: "Visible assistant reply",
+    }),
+    semantic(3, "agent_thought_chunk", {
+      messageKey: `sha256:${"b".repeat(64)}`,
+      contentHidden: true,
+    }),
+    semantic(4, "tool_call", {
+      toolKey: `sha256:${"c".repeat(64)}`,
+      status: "executing",
+      detailsHidden: true,
+    }),
+    semantic(5, "tool_call_update", {
+      toolKey: `sha256:${"c".repeat(64)}`,
+      status: "completed",
+      detailsHidden: true,
+    }),
+    semantic(6, "plan", {
+      entryCount: 3,
+      completedCount: 1,
+      detailsHidden: true,
+    }),
+    semantic(7, "usage_update", { used: 120, size: 1000 }),
+    semantic(8, "available_commands_update", { commandCount: 4 }),
+    semantic(9, "config_option_update", {
+      optionCount: 2,
+      detailsHidden: true,
+    }),
+    semantic(10, "current_mode_update", { detailsHidden: true }),
+  ]);
+
+  assert.equal(
+    items.find((item) => item.type === "message")?.text,
+    "Visible assistant reply",
+  );
+  assert.equal(
+    items.find((item) => item.type === "thought")?.text,
+    "Reasoning activity (content hidden)",
+  );
+  const [tool] = items.filter((item) => item.type === "tool");
+  assert.equal(tool.title, "Tool activity");
+  assert.equal(tool.toolName, "tool_activity");
+  assert.deepEqual(tool.args, {});
+  assert.equal(tool.result, "");
+  assert.equal(tool.status, "completed");
+  assert.match(
+    items.find((item) => item.type === "plan")?.text ?? "",
+    /1\/3 steps complete/,
+  );
+  assert.ok(items.some((item) => item.text === "Tokens: 120/1000"));
+  assert.ok(items.some((item) => item.text === "Commands available: 4"));
+  assert.ok(
+    items.some(
+      (item) =>
+        item.text === "Configuration updated: 2 options (details hidden)",
+    ),
+  );
+  assert.ok(
+    items.some((item) => item.text === "Mode updated (details hidden)"),
+  );
+});
+
+test("buildTranscript renders each safe permission outcome in the same turn", () => {
+  const transcript = buildTranscript([
+    {
+      ...baseEvent,
+      kind: "acp_read",
+      payload: {
+        direction: "inbound",
+        kind: "request",
+        method: "session/request_permission",
+        params: { optionCount: 2, toolCallIdBytes: 32 },
+      },
+    },
+    {
+      ...baseEvent,
+      seq: 2,
+      kind: "transcript_permission",
+      payload: { schemaVersion: 1, outcome: "approved" },
+    },
+    {
+      ...baseEvent,
+      seq: 3,
+      kind: "transcript_permission",
+      payload: { schemaVersion: 1, outcome: "cancelled" },
+    },
+  ]);
+  assert.equal(transcript.length, 2);
+  assert.deepEqual(
+    transcript.map((permission) => permission.text),
+    ["Approved", "Cancelled"],
+  );
+  assert.equal(transcript[0].title, "Permission resolved");
+  assert.equal(transcript[0].acpSource, "permission_result");
+  assert.notEqual(transcript[0].id, transcript[1].id);
 });
 
 test("buildTranscript keeps read_file activity categorized by the actual tool when output names Buzz tools", () => {
@@ -1265,25 +1413,18 @@ test("steer ingress bundles its prompt context into the steer prompt segment, no
     {
       seq: 1,
       timestamp: "2026-07-01T10:00:00.000Z",
-      kind: "acp_write",
+      kind: "transcript_prompt",
       agentIndex: 0,
       channelId: "ch-1",
       sessionId: "sess-1",
       turnId: "turn-1",
       payload: {
-        jsonrpc: "2.0",
-        id: 5,
-        method: "_goose/unstable/session/steer",
-        params: {
-          sessionId: "sess-1",
-          prompt: [
-            {
-              type: "text",
-              text: `[Buzz event: @mention]\nEvent ID: ${"e".repeat(64)}\nFrom: x (hex: ${"f".repeat(64)})\nContent: steer me`,
-            },
-            { type: "text", text: "[Thread context]\nPrior messages here." },
-          ],
-        },
+        schemaVersion: 1,
+        source: "session/steer",
+        blocks: [
+          `[Buzz event: @mention]\nEvent ID: ${"e".repeat(64)}\nFrom: x (hex: ${"f".repeat(64)})\nContent: steer me`,
+          "[Thread context]\nPrior messages here.",
+        ],
       },
     },
   ];

@@ -30,6 +30,9 @@ members = [
     "crates/buzz-voice",
     "crates/buzz-backend-kubernetes",
     "crates/buzz-workspace-controller",
+    "crates/buzz-lifecycle",
+    "crates/buzz-signing-capability",
+    "crates/buzz-capability-client",
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
 ]
@@ -142,12 +145,15 @@ buzz-auth = { path = "crates/buzz-auth" }
 buzz-pubsub = { path = "crates/buzz-pubsub" }
 buzz-search = { path = "crates/buzz-search" }
 buzz-audit = { path = "crates/buzz-audit" }
+buzz-signing-capability = { path = "crates/buzz-signing-capability" }
+buzz-capability-client = { path = "crates/buzz-capability-client" }
 buzz-workflow = { path = "crates/buzz-workflow" }
 buzz-media = { path = "crates/buzz-media" }
 buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
 buzz-datastore-tracing = { path = "crates/buzz-datastore-tracing" }
+buzz-lifecycle = { path = "crates/buzz-lifecycle" }
 
 # CI profile — builds the relay for desktop e2e. Dependencies keep full
 # release optimization (warm from main's cache; they carry the runtime hot

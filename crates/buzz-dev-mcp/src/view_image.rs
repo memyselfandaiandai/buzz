@@ -48,6 +48,8 @@ pub(crate) const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_DECODER_ALLOC: u64 = 256 * 1024 * 1024;
 /// Connect + read timeout for URL fetches.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const BROKER_RELAY_MEDIA_UNSUPPORTED: &str =
+    "unsupported-in-broker-v1: authenticated Buzz relay media is unavailable";
 /// Lifetime of a Blossom `t=get` read token for relay media fetches.
 /// Matches the desktop client's `MEDIA_GET_AUTH_EXPIRY_SECS`.
 const MEDIA_GET_AUTH_EXPIRY_SECS: u64 = 600;
@@ -130,7 +132,7 @@ async fn load_source(
         }
         Ok((bytes, "data:URL".to_string()))
     } else if src.starts_with("http://") || src.starts_with("https://") {
-        let bytes = fetch_url(src).await?;
+        let bytes = fetch_url(src, &state.shim.credentials).await?;
         Ok((bytes, src.to_string()))
     } else if src.contains("://") {
         // Treat any other `scheme://...` form as an explicit reject so
@@ -318,9 +320,22 @@ fn relay_media_get_auth(url: &reqwest::Url) -> Option<String> {
 /// Refuses up-front if `Content-Length` advertises more than the cap.
 /// Relay-hosted `/media/` URLs get a signed Blossom `t=get` header when
 /// `BUZZ_RELAY_URL` + `BUZZ_PRIVATE_KEY` are configured.
-async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
+async fn fetch_url(
+    url: &str,
+    credentials: &crate::credentials::ChildCredentials,
+) -> Result<Vec<u8>, ErrorData> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| invalid_params(format!("invalid URL: {url} ({e})")))?;
+    if credentials
+        .broker_relay()
+        .is_some_and(|relay| is_relay_media_url(&parsed, relay))
+    {
+        // D3 deliberately has no capability-client signing path. A relay
+        // media URL may be protected even when today's deployment happens to
+        // allow anonymous reads, so never probe it unauthenticated in broker
+        // mode and never turn an auth failure into an HTTP fallback.
+        return Err(invalid_params(BROKER_RELAY_MEDIA_UNSUPPORTED.to_owned()));
+    }
     let auth = relay_media_get_auth(&parsed);
     let mut client_builder = reqwest::Client::builder()
         .connect_timeout(FETCH_TIMEOUT)
@@ -686,6 +701,14 @@ mod tests {
         SharedState::new(cwd.to_path_buf(), shim).expect("state new")
     }
 
+    fn make_broker_state(cwd: &std::path::Path, relay: &str) -> SharedState {
+        let shim = crate::shim::Shim::install_with_credentials(
+            crate::credentials::ChildCredentials::broker_for_tests(relay),
+        )
+        .expect("broker shim install");
+        SharedState::new(cwd.to_path_buf(), shim).expect("state new")
+    }
+
     fn write_png_rgba(path: &std::path::Path, w: u32, h: u32) -> Vec<u8> {
         let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
@@ -739,6 +762,131 @@ mod tests {
             .decode(&image_block.data)
             .unwrap();
         assert_eq!(decoded, original, "small PNG must pass through verbatim");
+    }
+
+    #[tokio::test]
+    async fn broker_mode_keeps_local_and_data_images_available() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("local.png");
+        let original = write_png_rgba(&path, 16, 16);
+        let state = make_broker_state(dir.path(), "wss://relay.example.com");
+        let result = run(
+            &state,
+            ViewImageParams {
+                source: path.display().to_string(),
+                max_dim: None,
+                workdir: None,
+            },
+        )
+        .await
+        .expect("local image");
+        let image = result
+            .content
+            .last()
+            .and_then(|content| content.as_image())
+            .expect("image content");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .expect("base64"),
+            original
+        );
+
+        let data_result = run(
+            &state,
+            ViewImageParams {
+                source: format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&original)
+                ),
+                max_dim: None,
+                workdir: None,
+            },
+        )
+        .await
+        .expect("data image");
+        assert!(data_result
+            .content
+            .last()
+            .and_then(|content| content.as_image())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn broker_mode_keeps_public_third_party_images_available() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("served.png");
+        let image = write_png_rgba(&path, 16, 16);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                image.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response headers");
+            stream.write_all(&image).await.expect("response body");
+        });
+
+        let state = make_broker_state(dir.path(), "wss://relay.example.com");
+        let result = run(
+            &state,
+            ViewImageParams {
+                source: format!("http://{address}/public.png"),
+                max_dim: None,
+                workdir: None,
+            },
+        )
+        .await
+        .expect("public image");
+        assert!(result
+            .content
+            .last()
+            .and_then(|content| content.as_image())
+            .is_some());
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn broker_mode_rejects_protected_relay_media_without_http_fallback() {
+        let dir = tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let state = make_broker_state(dir.path(), &format!("http://{address}"));
+
+        let error = run(
+            &state,
+            ViewImageParams {
+                source: format!("http://{address}/media/protected.png"),
+                max_dim: None,
+                workdir: None,
+            },
+        )
+        .await
+        .expect_err("protected relay media must fail closed");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(BROKER_RELAY_MEDIA_UNSUPPORTED),
+            "{message}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "view_image must not attempt an unauthenticated relay request"
+        );
     }
 
     #[tokio::test]

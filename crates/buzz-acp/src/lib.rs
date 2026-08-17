@@ -1,7 +1,11 @@
 #![deny(unsafe_code)]
 
 mod acp;
+#[cfg(feature = "signing-capability-broker")]
+pub(crate) mod capability_broker;
 mod config;
+#[cfg(feature = "durable-turn-lifecycle")]
+pub mod durable_lifecycle;
 mod engram_fetch;
 mod filter;
 mod memory;
@@ -42,11 +46,244 @@ use pool::{
     PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
+#[cfg(feature = "durable-turn-lifecycle")]
+use queue::QueueAdmissionStatus;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+/// Content-free diagnostic projection for an ACP failure.
+///
+/// `AcpError` may preserve an agent-controlled JSON-RPC message or data object
+/// for internal decisions. Normal logs, observer events, user notices, and
+/// stable result digests must use this projection rather than `Display` or
+/// `Debug` formatting the original error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SafeAcpError {
+    pub(crate) kind: &'static str,
+    pub(crate) operator_copy: &'static str,
+    pub(crate) code: Option<i64>,
+}
+
+pub(crate) fn safe_acp_error(error: &acp::AcpError) -> SafeAcpError {
+    match error {
+        acp::AcpError::Io(_) => SafeAcpError {
+            kind: "transport_io",
+            operator_copy: "ACP transport I/O error",
+            code: None,
+        },
+        acp::AcpError::Json(_) => SafeAcpError {
+            kind: "json_error",
+            operator_copy: "ACP JSON processing error",
+            code: None,
+        },
+        acp::AcpError::AgentExited => SafeAcpError {
+            kind: "agent_exited",
+            operator_copy: "Agent process exited unexpectedly",
+            code: None,
+        },
+        acp::AcpError::IdleTimeout(_) => SafeAcpError {
+            kind: "idle_timeout",
+            operator_copy: "Agent session timed out due to inactivity",
+            code: None,
+        },
+        acp::AcpError::HardTimeout { .. } => SafeAcpError {
+            kind: "hard_timeout",
+            operator_copy: "Agent turn exceeded its maximum duration",
+            code: None,
+        },
+        acp::AcpError::CancelDrainTimeout(_) => SafeAcpError {
+            kind: "cancel_drain_timeout",
+            operator_copy: "Agent did not stop within the cancellation grace period",
+            code: None,
+        },
+        acp::AcpError::Timeout(_) => SafeAcpError {
+            kind: "request_timeout",
+            operator_copy: "ACP request timed out",
+            code: None,
+        },
+        acp::AcpError::WriteTimeout(_) => SafeAcpError {
+            kind: "write_timeout",
+            operator_copy: "ACP write timed out",
+            code: None,
+        },
+        acp::AcpError::Protocol(_) => SafeAcpError {
+            kind: "protocol_error",
+            operator_copy: "ACP protocol error",
+            code: None,
+        },
+        acp::AcpError::AgentError { code, .. } => SafeAcpError {
+            kind: "agent_error",
+            operator_copy: "Agent reported an application error",
+            code: Some(*code),
+        },
+    }
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurablePilotMode {
+    Disabled,
+    Shadow,
+    AuthoritativeQueue,
+    Scheduler,
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+fn resolve_durable_pilot_mode(
+    shadow: bool,
+    authoritative: bool,
+    scheduler: bool,
+) -> Result<DurablePilotMode> {
+    if usize::from(shadow) + usize::from(authoritative) + usize::from(scheduler) > 1 {
+        anyhow::bail!(
+            "BUZZ_ACP_LIFECYCLE_SHADOW_DB, BUZZ_ACP_LIFECYCLE_AUTHORITATIVE_DB, and BUZZ_ACP_LIFECYCLE_SCHEDULER_DB are mutually exclusive"
+        );
+    }
+    Ok(if shadow {
+        DurablePilotMode::Shadow
+    } else if authoritative {
+        DurablePilotMode::AuthoritativeQueue
+    } else if scheduler {
+        DurablePilotMode::Scheduler
+    } else {
+        DurablePilotMode::Disabled
+    })
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+fn validate_scheduler_pilot_path(path: &std::path::Path) -> Result<()> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        anyhow::bail!("BUZZ_ACP_LIFECYCLE_SCHEDULER_DB must be a non-empty absolute path");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+fn validate_scheduler_pilot_compatibility(
+    agents: u32,
+    multiple_event_handling: MultipleEventHandling,
+    dedup_mode: DedupMode,
+    heartbeat_interval_secs: u64,
+    lazy_pool: bool,
+) -> Result<()> {
+    if agents != 1 {
+        anyhow::bail!("BUZZ_ACP_LIFECYCLE_SCHEDULER_DB requires BUZZ_ACP_AGENTS=1 (got {agents})");
+    }
+    if multiple_event_handling != MultipleEventHandling::Queue {
+        anyhow::bail!(
+            "BUZZ_ACP_LIFECYCLE_SCHEDULER_DB requires BUZZ_ACP_MULTIPLE_EVENT_HANDLING=queue"
+        );
+    }
+    if !matches!(dedup_mode, DedupMode::Queue) {
+        anyhow::bail!("BUZZ_ACP_LIFECYCLE_SCHEDULER_DB requires BUZZ_ACP_DEDUP=queue");
+    }
+    if heartbeat_interval_secs != 0 {
+        anyhow::bail!(
+            "BUZZ_ACP_LIFECYCLE_SCHEDULER_DB requires BUZZ_ACP_HEARTBEAT_INTERVAL=0 (got {heartbeat_interval_secs})"
+        );
+    }
+    if lazy_pool {
+        anyhow::bail!("BUZZ_ACP_LIFECYCLE_SCHEDULER_DB requires BUZZ_ACP_LAZY_POOL=false");
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "durable-turn-lifecycle"))]
+mod durable_pilot_mode_tests {
+    use super::*;
+
+    #[test]
+    fn modes_are_default_off_and_pairwise_mutually_exclusive() {
+        assert_eq!(
+            resolve_durable_pilot_mode(false, false, false).ok(),
+            Some(DurablePilotMode::Disabled)
+        );
+        assert_eq!(
+            resolve_durable_pilot_mode(false, false, true).ok(),
+            Some(DurablePilotMode::Scheduler)
+        );
+        assert_eq!(
+            resolve_durable_pilot_mode(true, false, false).ok(),
+            Some(DurablePilotMode::Shadow)
+        );
+        assert_eq!(
+            resolve_durable_pilot_mode(false, true, false).ok(),
+            Some(DurablePilotMode::AuthoritativeQueue)
+        );
+        for enabled in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert!(resolve_durable_pilot_mode(enabled.0, enabled.1, enabled.2).is_err());
+        }
+    }
+
+    #[test]
+    fn scheduler_path_must_be_non_empty_and_absolute() {
+        assert!(validate_scheduler_pilot_path(std::path::Path::new("")).is_err());
+        assert!(validate_scheduler_pilot_path(std::path::Path::new("scheduler.sqlite3")).is_err());
+        assert!(validate_scheduler_pilot_path(
+            &std::env::temp_dir().join("buzz-acp-scheduler.sqlite3")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn scheduler_compatibility_accepts_only_the_locked_envelope() {
+        assert!(validate_scheduler_pilot_compatibility(
+            1,
+            MultipleEventHandling::Queue,
+            DedupMode::Queue,
+            0,
+            false,
+        )
+        .is_ok());
+
+        let invalid = [
+            validate_scheduler_pilot_compatibility(
+                2,
+                MultipleEventHandling::Queue,
+                DedupMode::Queue,
+                0,
+                false,
+            ),
+            validate_scheduler_pilot_compatibility(
+                1,
+                MultipleEventHandling::Steer,
+                DedupMode::Queue,
+                0,
+                false,
+            ),
+            validate_scheduler_pilot_compatibility(
+                1,
+                MultipleEventHandling::Queue,
+                DedupMode::Drop,
+                0,
+                false,
+            ),
+            validate_scheduler_pilot_compatibility(
+                1,
+                MultipleEventHandling::Queue,
+                DedupMode::Queue,
+                30,
+                false,
+            ),
+            validate_scheduler_pilot_compatibility(
+                1,
+                MultipleEventHandling::Queue,
+                DedupMode::Queue,
+                0,
+                true,
+            ),
+        ];
+        assert!(invalid.into_iter().all(|result| result.is_err()));
+    }
+}
 
 /// Check if argv[1] matches a subcommand name, before any clap parsing.
 ///
@@ -309,6 +546,35 @@ async fn author_allowed(
                 || is_owner_or_sibling(author, owner_cache, rest_client).await
         }
     }
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+const SCHEDULER_PILOT_CAPACITY: buzz_lifecycle::RunLaneCapacity = buzz_lifecycle::RunLaneCapacity {
+    user: 500,
+    agent: 500,
+    background: 500,
+};
+
+/// Classify an already-authorized signed sender into the scheduler pilot.
+///
+/// External `anyone` senders intentionally receive no scheduler lane: the
+/// pilot admits direct owners, explicit human allowlist entries, and verified
+/// same-owner agents only. Background remains reserved for a future internal
+/// admission surface and is never inferred from a relay sender.
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn scheduler_lane_for_author(
+    author: &str,
+    allowlist: &HashSet<String>,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> Option<(buzz_lifecycle::RunLane, &'static str)> {
+    if owner_cache.get() == Some(author) || allowlist.contains(author) {
+        return Some((buzz_lifecycle::RunLane::User, "human"));
+    }
+    if is_owner_or_sibling(author, owner_cache, rest_client).await {
+        return Some((buzz_lifecycle::RunLane::Agent, "sibling"));
+    }
+    None
 }
 
 /// Resolve whether `channel_id` is a DM, for the inbound author gate.
@@ -943,7 +1209,7 @@ const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 /// `encrypt_observer_payload` signature or adding a parallel encrypt path; both
 /// are out of this change's scope (buzz-core stays untouched). The clean `&mut`
 /// signature with one cheap redundant serialize is the deliberate tradeoff.
-fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
+pub(crate) fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
     if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
         return;
     }
@@ -962,6 +1228,60 @@ fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
         elide_leaf(leaf);
         if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
             return;
+        }
+    }
+
+    // A transcript prompt may contain hundreds of individually modest blocks.
+    // None is shrinkable on its own, but their array/envelope can still exceed
+    // the serialized frame ceiling (especially with JSON escaping). Drop the
+    // largest earlier context blocks until the complete frame fits, while
+    // preserving the final block: format_prompt places the triggering user
+    // event there, and losing it would erase the actual turn from the UI.
+    if event.kind == "transcript_prompt" {
+        loop {
+            let serialized_bytes = serialized_len(event);
+            if serialized_bytes <= OBSERVER_MAX_PLAINTEXT_LEN {
+                return;
+            }
+            let Some(blocks) = event
+                .payload
+                .get_mut("blocks")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                break;
+            };
+            if blocks.len() <= 1 {
+                break;
+            }
+            let mut candidates: Vec<(usize, usize)> = blocks[..blocks.len() - 1]
+                .iter()
+                .enumerate()
+                .map(|(index, block)| {
+                    (
+                        index,
+                        serde_json::to_string(block).map_or(0, |serialized| serialized.len()),
+                    )
+                })
+                .collect();
+            candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.1));
+            let mut recovered = 0usize;
+            let needed = serialized_bytes - OBSERVER_MAX_PLAINTEXT_LEN;
+            let mut drop_indices = Vec::new();
+            for (index, block_bytes) in candidates {
+                drop_indices.push(index);
+                // Removing an array member also removes one separator except
+                // at the edge; counting one byte is exact enough to choose a
+                // minimal candidate set, and the outer loop rechecks the full
+                // serialized frame rather than trusting this estimate.
+                recovered = recovered.saturating_add(block_bytes + 1);
+                if recovered >= needed {
+                    break;
+                }
+            }
+            drop_indices.sort_unstable_by(|left, right| right.cmp(left));
+            for index in drop_indices {
+                blocks.remove(index);
+            }
         }
     }
 
@@ -1767,7 +2087,16 @@ mod idle_pool_sleep_tests {
 }
 
 pub fn run() -> Result<()> {
-    config::propagate_legacy_env_vars();
+    // Resolve the credential authority before any legacy alias propagation,
+    // Tokio worker startup, CLI helper routing, or child-process spawn. A
+    // broker selection must never fall through to a legacy helper path.
+    let credential_mode = config::credential_mode_from_env()
+        .map_err(|error| anyhow::anyhow!("configuration error: {error}"))?;
+    config::validate_credential_mode_startup(credential_mode)
+        .map_err(|error| anyhow::anyhow!("configuration error: {error}"))?;
+    if credential_mode == config::CredentialMode::LegacyEnv {
+        config::propagate_legacy_env_vars();
+    }
     tokio_main()
 }
 
@@ -1777,6 +2106,15 @@ async fn tokio_main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
+    let broker_helper_mode =
+        config::credential_mode_from_env()? == config::CredentialMode::BrokerV1;
+    if broker_helper_mode
+        && (is_subcommand("models")
+            || is_subcommand("auth-methods")
+            || is_subcommand("authenticate"))
+    {
+        anyhow::bail!("broker-v1 local pilot does not support standalone ACP helper processes");
+    }
     if is_subcommand("models") {
         // Strip the subcommand token so clap doesn't reject it as a positional.
         // Keeps argv[0] (binary name) and passes everything after the subcommand.
@@ -1850,12 +2188,15 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    let mut pool = if config.lazy_pool {
+    let broker_mode = config.credential_mode == config::CredentialMode::BrokerV1;
+    #[cfg(feature = "signing-capability-broker")]
+    let mut capability_broker: Option<Arc<capability_broker::CapabilityBroker>> = None;
+    let mut pool = if config.lazy_pool || broker_mode {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
         initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
     };
-    let mut pool_ready = !config.lazy_pool;
+    let mut pool_ready = !config.lazy_pool && !broker_mode;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
 
     // Capture a startup watermark BEFORE connecting to the relay. This timestamp
@@ -1871,10 +2212,12 @@ async fn tokio_main() -> Result<()> {
     let pubkey_hex = config.keys.public_key().to_hex();
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
+    let relay_auth_tag_json = std::env::var("BUZZ_AUTH_TAG")
         .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+        .filter(|value| !value.is_empty());
+    let relay_auth_tag: Option<nostr::Tag> = relay_auth_tag_json
+        .as_deref()
+        .and_then(|value| buzz_sdk::nip_oa::parse_auth_tag(value).ok());
 
     let mut relay = HarnessRelay::connect(
         &config.relay_url,
@@ -1941,6 +2284,98 @@ async fn tokio_main() -> Result<()> {
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
 
+    // Created before durable authority startup so lease-renewal failure can
+    // stop the runtime even while channel discovery or pool startup is active.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let durable_shadow_path = std::env::var_os("BUZZ_ACP_LIFECYCLE_SHADOW_DB");
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let durable_authoritative_path = std::env::var_os("BUZZ_ACP_LIFECYCLE_AUTHORITATIVE_DB");
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let durable_scheduler_path = std::env::var_os("BUZZ_ACP_LIFECYCLE_SCHEDULER_DB");
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let durable_pilot_mode = resolve_durable_pilot_mode(
+        durable_shadow_path.is_some(),
+        durable_authoritative_path.is_some(),
+        durable_scheduler_path.is_some(),
+    )?;
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if durable_pilot_mode == DurablePilotMode::Scheduler {
+        let path = std::path::PathBuf::from(
+            durable_scheduler_path
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("scheduler path is absent"))?,
+        );
+        validate_scheduler_pilot_path(&path)?;
+        validate_scheduler_pilot_compatibility(
+            config.agents,
+            config.multiple_event_handling,
+            config.dedup_mode,
+            config.heartbeat_interval_secs,
+            config.lazy_pool,
+        )?;
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let (durable_shadow, durable_shadow_task) = if let Some(path) = durable_shadow_path {
+        let owner_id = startup_owner.clone().ok_or_else(|| {
+            anyhow::anyhow!("BUZZ_ACP_LIFECYCLE_SHADOW_DB requires an authoritative agent owner")
+        })?;
+        let (handle, task) =
+            start_durable_shadow(path.into(), owner_id, pubkey_hex.clone()).await?;
+        tracing::info!("durable lifecycle shadow enabled");
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let (durable_authority, durable_authority_task) = if let Some(path) = durable_authoritative_path
+    {
+        let owner_id = startup_owner.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "BUZZ_ACP_LIFECYCLE_AUTHORITATIVE_DB requires an authoritative agent owner"
+            )
+        })?;
+        let (handle, task) = start_durable_authority(
+            path.into(),
+            owner_id,
+            pubkey_hex.clone(),
+            shutdown_tx.clone(),
+        )
+        .await?;
+        tracing::info!(
+            instance_id = %handle.instance_id,
+            "durable lifecycle authoritative mode enabled"
+        );
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let (durable_scheduler, durable_scheduler_task) = if let Some(path) = durable_scheduler_path {
+        let owner_id = startup_owner.clone().ok_or_else(|| {
+            anyhow::anyhow!("BUZZ_ACP_LIFECYCLE_SCHEDULER_DB requires an authoritative agent owner")
+        })?;
+        let (handle, task) = start_durable_authority(
+            path.into(),
+            owner_id,
+            pubkey_hex.clone(),
+            shutdown_tx.clone(),
+        )
+        .await?;
+        recover_scheduler_pilot(&handle).await?;
+        tracing::info!(
+            instance_id = %handle.instance_id,
+            "durable lifecycle scheduler pilot enabled"
+        );
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
+
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
     let mut relay_observer_publisher = None;
@@ -1977,10 +2412,28 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    let channel_info_map = relay
-        .discover_channels()
-        .await
-        .map_err(|e| anyhow::anyhow!("channel discovery error: {e}"))?;
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let durable_startup_authoritative = durable_authority.is_some() || durable_scheduler.is_some();
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
+    let durable_startup_authoritative = false;
+    let channel_info_map = if durable_startup_authoritative {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                return Err(anyhow::anyhow!("durable authority stopped during channel discovery"));
+            }
+            result = tokio::time::timeout(Duration::from_secs(30), relay.discover_channels()) => {
+                result
+                    .map_err(|_| anyhow::anyhow!("durable channel discovery timed out"))?
+                    .map_err(|e| anyhow::anyhow!("channel discovery error: {e}"))?
+            }
+        }
+    } else {
+        relay
+            .discover_channels()
+            .await
+            .map_err(|e| anyhow::anyhow!("channel discovery error: {e}"))?
+    };
 
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
@@ -2026,14 +2479,89 @@ async fn tokio_main() -> Result<()> {
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
+    let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    let dedup_mode = config.dedup_mode;
+    let mut queue =
+        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if let Some(authority) = durable_authority.as_ref() {
+        let recovery_rest = relay.rest_client();
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                return Err(anyhow::anyhow!("durable authority stopped during restart recovery"));
+            }
+            result = tokio::time::timeout(
+                Duration::from_secs(60),
+                recover_authoritative_queue(
+                    authority,
+                    &recovery_rest,
+                    &channel_filters,
+                    &mut queue,
+                    true,
+                ),
+            ) => {
+                result
+                    .map_err(|_| anyhow::anyhow!("durable restart recovery timed out"))??;
+            }
+        }
+    }
+
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
     for (channel_id, filter) in &channel_filters {
-        if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
+        let subscribe_result = if durable_startup_authoritative {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    return Err(anyhow::anyhow!("durable authority stopped during channel subscription"));
+                }
+                result = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    relay.subscribe_channel(*channel_id, filter.clone()),
+                ) => {
+                    result.map_err(|_| relay::RelayError::Http(
+                        "durable channel subscription timed out".to_owned()
+                    ))?
+                }
+            }
+        } else {
+            relay.subscribe_channel(*channel_id, filter.clone()).await
+        };
+        if let Err(e) = subscribe_result {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
             subscribed_channel_ids.insert(*channel_id);
             tracing::info!("subscribed to channel {channel_id}");
         }
+    }
+
+    #[cfg(feature = "signing-capability-broker")]
+    if broker_mode {
+        let broker = Arc::new(
+            capability_broker::CapabilityBroker::start_for_config(
+                &config,
+                relay_auth_tag_json.as_deref(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("broker-v1 startup failed: {error}"))?,
+        );
+        let spawner = capability_broker::BrokerChildSpawner::for_channels(
+            Arc::clone(&broker),
+            &config,
+            subscribed_channel_ids.iter().copied(),
+        )
+        .map_err(|error| anyhow::anyhow!("broker-v1 scope construction failed: {error}"))?;
+        config.broker_spawner = Some(spawner);
+        pool = initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None)
+            .await?;
+        pool_ready = true;
+        capability_broker = Some(broker);
+        tracing::info!(
+            agents = config.agents,
+            channels = subscribed_channel_ids.len(),
+            "broker-v1 local pilot ready"
+        );
     }
 
     if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
@@ -2048,11 +2576,6 @@ async fn tokio_main() -> Result<()> {
             owner,
         ));
     }
-
-    let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
-    let dedup_mode = config.dedup_mode;
-    let mut queue =
-        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -2076,10 +2599,27 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if config.capture_visible_final && durable_authority.is_none() && durable_scheduler.is_none() {
+        tracing::warn!(
+            "BUZZ_ACP_CAPTURE_VISIBLE_FINAL requires durable authority; preserving legacy tool-sent replies"
+        );
+        config.capture_visible_final = false;
+    }
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
+    if config.capture_visible_final {
+        tracing::warn!(
+            "BUZZ_ACP_CAPTURE_VISIBLE_FINAL requires a durable-turn-lifecycle build; preserving legacy tool-sent replies"
+        );
+        config.capture_visible_final = false;
+    }
     let semantic_memory = memory::MemoryProvider::from_config(
         memory::MemoryConfig::from_env().map_err(anyhow::Error::msg)?,
     )
     .map_err(anyhow::Error::msg)?;
+    if broker_mode && semantic_memory.enabled() {
+        anyhow::bail!("broker-v1 local pilot requires BUZZ_ACP_MEMORY_PROVIDER=none");
+    }
     if semantic_memory.enabled() {
         tracing::info!(
             target: "memory::mem0",
@@ -2094,7 +2634,11 @@ async fn tokio_main() -> Result<()> {
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
-        system_prompt: config.system_prompt.clone(),
+        system_prompt: pool::with_harness_owned_final_reply_instruction(
+            config.system_prompt.clone(),
+            config.capture_visible_final,
+        ),
+        capture_visible_final: config.capture_visible_final,
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
         base_prompt: if config.no_base_prompt {
@@ -2163,6 +2707,43 @@ async fn tokio_main() -> Result<()> {
     };
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let mut durable_reconciler = durable_authority.as_ref().map(|_| {
+        tokio::time::interval_at(
+            tokio::time::Instant::now() + DURABLE_RECONCILE_INTERVAL,
+            DURABLE_RECONCILE_INTERVAL,
+        )
+    });
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
+    let mut durable_reconciler: Option<tokio::time::Interval> = None;
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let mut durable_outbox_task = durable_authority
+        .as_ref()
+        .or(durable_scheduler.as_ref())
+        .filter(|_| config.capture_visible_final)
+        .map(|authority| {
+            let authority = authority.clone();
+            let rest = relay.rest_client();
+            let mut stop = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(DURABLE_OUTBOX_INTERVAL);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop.changed() => break,
+                        _ = interval.tick() => {
+                            if let Err(error) = publish_authoritative_outbox(&authority, &rest).await {
+                                tracing::error!(%error, "durable lifecycle outbox publisher failed closed");
+                                let _ = authority.shutdown_tx.send(());
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
+    let mut durable_outbox_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
     // self-terminate. The watch interval is capped so small configured bounds
@@ -2204,6 +2785,13 @@ async fn tokio_main() -> Result<()> {
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
     let maintenance_interval = Duration::from_secs(30);
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let mut last_maintenance = if durable_scheduler.is_some() {
+        std::time::Instant::now() - maintenance_interval
+    } else {
+        std::time::Instant::now()
+    };
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
     let mut last_maintenance = std::time::Instant::now();
 
     // Channel for background respawn tasks to return completed agents.
@@ -2227,8 +2815,6 @@ async fn tokio_main() -> Result<()> {
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
 
     // ── Step 7: Shutdown signal ───────────────────────────────────────────────
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(());
-
     let tx = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -2302,6 +2888,11 @@ async fn tokio_main() -> Result<()> {
         Wake(u32, Result<AgentPool, String>),
     }
 
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let scheduler_mode_enabled = durable_scheduler.is_some();
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
+    let scheduler_mode_enabled = false;
+
     loop {
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -2360,9 +2951,21 @@ async fn tokio_main() -> Result<()> {
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
+                #[cfg(feature = "signing-capability-broker")]
+                let broker_spawner = config.broker_spawner.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        idx,
+                        observer,
+                        #[cfg(feature = "signing-capability-broker")]
+                        broker_spawner,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -2372,9 +2975,24 @@ async fn tokio_main() -> Result<()> {
             // indefinitely on quiet channels — dispatch_pending is only
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
-            if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+            if queue.has_flushable_work() || scheduler_mode_enabled {
+                for (channel_id, thread_tags) in dispatch_available(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    SchedulerDispatchContext {
+                        authority: durable_scheduler.as_ref(),
+                        subscribed_channel_ids: &subscribed_channel_ids,
+                        removed_channels: &removed_channels,
+                    },
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_shadow.as_ref(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_authority.as_ref(),
+                )
+                .await
                 {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -2422,8 +3040,23 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in
-                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+            for (channel_id, thread_tags) in dispatch_available(
+                &mut pool,
+                &mut queue,
+                &ctx,
+                &mut last_activity,
+                #[cfg(feature = "durable-turn-lifecycle")]
+                SchedulerDispatchContext {
+                    authority: durable_scheduler.as_ref(),
+                    subscribed_channel_ids: &subscribed_channel_ids,
+                    removed_channels: &removed_channels,
+                },
+                #[cfg(feature = "durable-turn-lifecycle")]
+                durable_shadow.as_ref(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                durable_authority.as_ref(),
+            )
+            .await
             {
                 typing_channels.insert(channel_id, thread_tags);
             }
@@ -2434,6 +3067,64 @@ async fn tokio_main() -> Result<()> {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("shutting down");
+                    break;
+                }
+                _ = async {
+                    match durable_reconciler.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    if let Some(authority) = durable_authority.as_ref() {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        match authority
+                            .adapter
+                            .expire_due_for_runtime_lease(
+                                authority.instance_id.clone(),
+                                now_ms,
+                                DURABLE_RECONCILE_LIMIT,
+                            )
+                            .await
+                        {
+                            Ok(expired) if !expired.is_empty() => {
+                                tracing::info!(count = expired.len(), "durable lifecycle expired overdue turns");
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::error!(%error, "durable lifecycle expiry reconciliation failed closed");
+                                let _ = authority.shutdown_tx.send(());
+                            }
+                        }
+                        let recovery_rest = relay.rest_client();
+                        match tokio::time::timeout(
+                            Duration::from_secs(30),
+                            recover_authoritative_queue(
+                                authority,
+                                &recovery_rest,
+                                &channel_filters,
+                                &mut queue,
+                                false,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::error!(%error, "durable lifecycle queue reconciliation failed closed");
+                                let _ = authority.shutdown_tx.send(());
+                            }
+                            Err(_) => {
+                                tracing::error!("durable lifecycle queue reconciliation timed out");
+                                let _ = authority.shutdown_tx.send(());
+                            }
+                        }
+                    }
+                    None
+                }
                 // recv() returning None means all senders dropped (pool was torn down).
                 // Break cleanly instead of panicking.
                 r = result_rx.recv(), if pool_ready => match r {
@@ -2524,6 +3215,14 @@ async fn tokio_main() -> Result<()> {
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
                                 || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION
                             {
+                                if broker_mode {
+                                    tracing::warn!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "broker-v1 startup channel scope changed; restarting harness to rotate all process capabilities"
+                                    );
+                                    let _ = shutdown_tx.send(());
+                                    continue;
+                                }
                                 let ch = buzz_event.channel_id;
                                 let ts = buzz_event.event.created_at.as_secs();
                                 let eid = buzz_event.event.id.to_hex();
@@ -2721,6 +3420,14 @@ async fn tokio_main() -> Result<()> {
                             if is_rotate {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        if broker_mode {
+                                            tracing::info!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "broker-v1 rotate requires process-capability rotation; restarting harness"
+                                            );
+                                            let _ = shutdown_tx.send(());
+                                            continue;
+                                        }
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2808,12 +3515,136 @@ async fn tokio_main() -> Result<()> {
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
-                            let accepted = queue.push(QueuedEvent {
+                            let queued_event = QueuedEvent {
                                 channel_id: buzz_event.channel_id,
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
-                            });
+                            };
+                            #[cfg(feature = "durable-turn-lifecycle")]
+                            let accepted = if let Some(scheduler) = durable_scheduler.as_ref() {
+                                let classification = scheduler_lane_for_author(
+                                    &author_hex,
+                                    &config.respond_to_allowlist,
+                                    &owner_cache,
+                                    &ctx.rest_client,
+                                )
+                                .await;
+                                if let Some((lane, source)) = classification {
+                                    match scheduler
+                                        .adapter
+                                        .admit_scheduled_event_for_runtime_lease(
+                                            scheduler.instance_id.clone(),
+                                            queued_event.channel_id,
+                                            &queued_event.event,
+                                            queued_event.prompt_tag.clone(),
+                                            lane,
+                                            source,
+                                            SCHEDULER_PILOT_CAPACITY,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(outcome) => outcome.should_enqueue(),
+                                        Err(error) => {
+                                            tracing::error!(%error, "scheduler admission failed closed");
+                                            let _ = scheduler.shutdown_tx.send(());
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    if let Err(error) = scheduler
+                                        .adapter
+                                        .reject_scheduled_event_for_runtime_lease(
+                                            scheduler.instance_id.clone(),
+                                            queued_event.channel_id,
+                                            &queued_event.event,
+                                            "scheduler_sender_unclassified",
+                                            serde_json::json!({"policy": "owner_allowlist_or_sibling"}),
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(%error, "scheduler sender rejection tombstone failed");
+                                        let _ = scheduler.shutdown_tx.send(());
+                                    }
+                                    false
+                                }
+                            } else if let Some(authority) = durable_authority.as_ref() {
+                                match queue.admission_status(queued_event.channel_id) {
+                                    QueueAdmissionStatus::Accept => {
+                                        match authority
+                                            .adapter
+                                            .admit_queued_event_for_runtime_lease(
+                                                authority.instance_id.clone(),
+                                                queued_event.channel_id,
+                                                &queued_event.event,
+                                                queued_event.prompt_tag.clone(),
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(outcome) if outcome.should_enqueue() => {
+                                                let accepted = queue.push(queued_event);
+                                                if !accepted {
+                                                    tracing::error!("authoritative queue push failed after capacity admission; stopping ACP runtime");
+                                                    let _ = authority.shutdown_tx.send(());
+                                                }
+                                                accepted
+                                            }
+                                            Ok(_) => false,
+                                            Err(error) => {
+                                                tracing::error!(%error, "durable lifecycle admission failed closed");
+                                                let _ = authority.shutdown_tx.send(());
+                                                false
+                                            }
+                                        }
+                                    }
+                                    status => {
+                                        let (reason_code, detail) = match status {
+                                            QueueAdmissionStatus::WouldDropInFlight => (
+                                                "in_flight_drop_policy",
+                                                serde_json::json!({"policy": "drop"}),
+                                            ),
+                                            QueueAdmissionStatus::AtCapacity => (
+                                                "queue_capacity",
+                                                serde_json::json!({"scope": "channel"}),
+                                            ),
+                                            QueueAdmissionStatus::Accept => unreachable!(),
+                                        };
+                                        if let Err(error) = authority
+                                            .adapter
+                                            .reject_event_for_runtime_lease(
+                                                authority.instance_id.clone(),
+                                                queued_event.channel_id,
+                                                &queued_event.event,
+                                                reason_code,
+                                                detail,
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(%error, %reason_code, "durable lifecycle rejection tombstone failed");
+                                            let _ = authority.shutdown_tx.send(());
+                                        }
+                                        false
+                                    }
+                                }
+                            } else {
+                                queue.push(queued_event)
+                            };
+                            #[cfg(not(feature = "durable-turn-lifecycle"))]
+                            let accepted = queue.push(queued_event);
+                            #[cfg(feature = "durable-turn-lifecycle")]
+                            if accepted {
+                                if let Some(shadow) = durable_shadow.as_ref() {
+                                    shadow.submit(DurableShadowCommand::Admit {
+                                        channel_id: buzz_event.channel_id,
+                                        event: event_for_steer.clone(),
+                                        prompt_tag: prompt_tag_for_steer.clone(),
+                                    });
+                                }
+                            }
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -2872,7 +3703,23 @@ async fn tokio_main() -> Result<()> {
                             }
                             if pool_ready {
                                 for (channel_id, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                    dispatch_available(
+                                        &mut pool,
+                                        &mut queue,
+                                        &ctx,
+                                        &mut last_activity,
+                                        #[cfg(feature = "durable-turn-lifecycle")]
+                                        SchedulerDispatchContext {
+                                            authority: durable_scheduler.as_ref(),
+                                            subscribed_channel_ids: &subscribed_channel_ids,
+                                            removed_channels: &removed_channels,
+                                        },
+                                        #[cfg(feature = "durable-turn-lifecycle")]
+                                        durable_shadow.as_ref(),
+                                        #[cfg(feature = "durable-turn-lifecycle")]
+                                        durable_authority.as_ref(),
+                                    )
+                                    .await
                                 {
                                     typing_channels.insert(channel_id, thread_tags);
                                 }
@@ -2900,7 +3747,9 @@ async fn tokio_main() -> Result<()> {
                         last_activity,
                         tokio::time::Instant::now(),
                         inactivity_bound,
-                        queue.has_in_flight() || heartbeat_in_flight,
+                        queue.has_in_flight()
+                            || heartbeat_in_flight
+                            || (scheduler_mode_enabled && !join_set.is_empty()),
                     ) {
                         tracing::info!(
                             inactivity_seconds = config.exit_after_inactivity_secs,
@@ -2972,7 +3821,23 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                            dispatch_available(
+                                &mut pool,
+                                &mut queue,
+                                &ctx,
+                                &mut last_activity,
+                                #[cfg(feature = "durable-turn-lifecycle")]
+                                SchedulerDispatchContext {
+                                    authority: durable_scheduler.as_ref(),
+                                    subscribed_channel_ids: &subscribed_channel_ids,
+                                    removed_channels: &removed_channels,
+                                },
+                                #[cfg(feature = "durable-turn-lifecycle")]
+                                durable_shadow.as_ref(),
+                                #[cfg(feature = "durable-turn-lifecycle")]
+                                durable_authority.as_ref(),
+                            )
+                            .await
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -3026,10 +3891,6 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("shutting down");
-                    break;
-                }
             }
         };
 
@@ -3039,7 +3900,7 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                let report = handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3051,8 +3912,42 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
-                {
+                );
+                let should_exit = report == LoopAction::Exit;
+                #[cfg(feature = "durable-turn-lifecycle")]
+                if let Some(scheduler) = durable_scheduler.as_ref() {
+                    if let Err(error) = apply_scheduler_result(
+                        scheduler,
+                        &report,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, "scheduler durable result failed; stopping ACP runtime");
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
+                } else if let Some(authority) = durable_authority.as_ref() {
+                    if let Err(error) = apply_authoritative_result(
+                        authority,
+                        &report,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            %error,
+                            "authoritative durable result failed; stopping ACP runtime"
+                        );
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
+                }
+                #[cfg(feature = "durable-turn-lifecycle")]
+                if let Some(shadow) = durable_shadow.as_ref() {
+                    shadow.submit(DurableShadowCommand::Result(report));
+                }
+                if should_exit {
                     break;
                 }
                 if drain_ready_join_results(
@@ -3066,19 +3961,48 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                ) == LoopAction::Exit
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_authority.as_ref(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_scheduler.as_ref(),
+                )
+                .await
+                    == LoopAction::Exit
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                for (channel_id, thread_tags) in dispatch_available(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    SchedulerDispatchContext {
+                        authority: durable_scheduler.as_ref(),
+                        subscribed_channel_ids: &subscribed_channel_ids,
+                        removed_channels: &removed_channels,
+                    },
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_shadow.as_ref(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_authority.as_ref(),
+                )
+                .await
                 {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
-                tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                tracing::error!(
+                    taskCancelled = join_error.is_cancelled(),
+                    "agent task failed"
+                );
+                #[cfg(feature = "durable-turn-lifecycle")]
+                let scheduler_panic_claim = pool
+                    .task_map()
+                    .get(&join_error.id())
+                    .and_then(|meta| meta.scheduler_claim.clone());
+                let _panic_execution_id = recover_panicked_agent(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3091,12 +4015,58 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                #[cfg(feature = "durable-turn-lifecycle")]
+                if let Some(scheduler) = durable_scheduler.as_ref() {
+                    if let Some(claim) = scheduler_panic_claim.as_ref() {
+                        if let Err(error) = fail_scheduler_panic(scheduler, claim).await {
+                            tracing::error!(%error, "scheduler prompt panic could not be durably failed");
+                        }
+                    }
+                    tracing::error!(
+                        instance_id = %scheduler.instance_id,
+                        "prompt panic under durable scheduler; stopping after fenced failure"
+                    );
+                    let _ = scheduler.shutdown_tx.send(());
+                    break;
+                } else if let Some(authority) = durable_authority.as_ref() {
+                    if let Some(execution_id) = _panic_execution_id.as_deref() {
+                        if let Err(error) = fail_authoritative_panic(authority, execution_id).await
+                        {
+                            tracing::error!(
+                                %error,
+                                %execution_id,
+                                "prompt panic could not be durably failed"
+                            );
+                        }
+                    }
+                    tracing::error!(
+                        instance_id = %authority.instance_id,
+                        "prompt panic under durable authority; stopping after durable failure"
+                    );
+                    let _ = authority.shutdown_tx.send(());
+                    break;
+                }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                for (channel_id, thread_tags) in dispatch_available(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    SchedulerDispatchContext {
+                        authority: durable_scheduler.as_ref(),
+                        subscribed_channel_ids: &subscribed_channel_ids,
+                        removed_channels: &removed_channels,
+                    },
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_shadow.as_ref(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_authority.as_ref(),
+                )
+                .await
                 {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -3206,10 +4176,33 @@ async fn tokio_main() -> Result<()> {
                     Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
                     Err(_recv_err) => (true, false, false),
                 };
+                let (ack_kind, agent_error_code) = match &ack {
+                    Ok(pool::SteerAck::Success { .. }) => ("success", None),
+                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { code })) => {
+                        ("agent_error", Some(*code))
+                    }
+                    Ok(pool::SteerAck::Err(pool::SteerError::Transport)) => {
+                        ("transport_error", None)
+                    }
+                    Ok(pool::SteerAck::Err(pool::SteerError::ExpectedRunIdMissing)) => {
+                        ("expected_run_id_missing", None)
+                    }
+                    Ok(pool::SteerAck::Err(pool::SteerError::OutcomeRejected)) => {
+                        ("outcome_rejected", None)
+                    }
+                    Ok(pool::SteerAck::Err(pool::SteerError::PromptCompleted)) => {
+                        ("prompt_completed", None)
+                    }
+                    Ok(pool::SteerAck::PromptCompletedNeutral) => {
+                        ("prompt_completed_neutral", None)
+                    }
+                    Err(_) => ("ack_channel_closed", None),
+                };
                 tracing::info!(
                     channel = %channel_id,
                     event_id = %event_id,
-                    ?ack,
+                    ackKind = ack_kind,
+                    agentErrorCode = ?agent_error_code,
                     release_withheld,
                     drop_withheld,
                     signal_fallback,
@@ -3250,8 +4243,23 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                for (channel_id, thread_tags) in dispatch_available(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    SchedulerDispatchContext {
+                        authority: durable_scheduler.as_ref(),
+                        subscribed_channel_ids: &subscribed_channel_ids,
+                        removed_channels: &removed_channels,
+                    },
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_shadow.as_ref(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_authority.as_ref(),
+                )
+                .await
                 {
                     typing_channels.insert(channel_id, thread_tags);
                 }
@@ -3278,8 +4286,23 @@ async fn tokio_main() -> Result<()> {
                             "ready",
                             None,
                         );
-                        for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                        for (channel_id, thread_tags) in dispatch_available(
+                            &mut pool,
+                            &mut queue,
+                            &ctx,
+                            &mut last_activity,
+                            #[cfg(feature = "durable-turn-lifecycle")]
+                            SchedulerDispatchContext {
+                                authority: durable_scheduler.as_ref(),
+                                subscribed_channel_ids: &subscribed_channel_ids,
+                                removed_channels: &removed_channels,
+                            },
+                            #[cfg(feature = "durable-turn-lifecycle")]
+                            durable_shadow.as_ref(),
+                            #[cfg(feature = "durable-turn-lifecycle")]
+                            durable_authority.as_ref(),
+                        )
+                        .await
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -3311,6 +4334,15 @@ async fn tokio_main() -> Result<()> {
     // just as promptly. Timeout is a backstop for a slot stuck outside the
     // select (e.g. in spawn); only then do we fall back to aborting.
     let _ = shutdown_tx.send(());
+    if let Some(mut task) = durable_outbox_task.take() {
+        if tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("durable outbox worker did not stop within grace period — aborting");
+            task.abort();
+        }
+    }
     let wake_drain = tokio::time::timeout(Duration::from_secs(30), async {
         while wake_tasks.join_next().await.is_some() {}
     })
@@ -3325,6 +4357,15 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if durable_scheduler.is_some() {
+        let signalled = signal_scheduler_tasks_for_shutdown(&mut pool);
+        tracing::info!(
+            signalled,
+            "shutdown: requested cancellation of launched scheduler prompts"
+        );
+    }
+
     tracing::info!("shutdown: waiting for in-flight prompts");
     // 30 s is generous for in-flight prompts to be cancelled; using
     // max_turn_duration here would cause Ctrl+C to hang for up to an hour.
@@ -3334,25 +4375,65 @@ async fn tokio_main() -> Result<()> {
     // explicitly shut them down here to reap child processes. If the grace
     // period expires, remaining tasks are aborted and fall back to
     // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
-    let (rx_ref, js_ref) = pool.rx_and_join_set();
     let shutdown_result = tokio::time::timeout(grace, async {
+        let mut result_channel_open = true;
         loop {
-            tokio::select! {
-                result = js_ref.join_next() => {
-                    match result {
-                        Some(Err(e)) => tracing::warn!("task error during shutdown: {e}"),
-                        Some(Ok(())) => {}
-                        None => break, // join_set empty
+            enum ShutdownDrainEvent {
+                Join(Option<std::result::Result<(), tokio::task::JoinError>>),
+                Prompt(Option<Box<PromptResult>>),
+            }
+
+            let event = {
+                let (rx_ref, js_ref) = pool.rx_and_join_set();
+                tokio::select! {
+                    result = js_ref.join_next() => ShutdownDrainEvent::Join(result),
+                    maybe_result = rx_ref.recv(), if result_channel_open => {
+                        ShutdownDrainEvent::Prompt(maybe_result.map(Box::new))
                     }
                 }
-                maybe_result = rx_ref.recv() => {
-                    if let Some(mut pr) = maybe_result {
+            };
+
+            match event {
+                ShutdownDrainEvent::Join(Some(Err(error))) => {
+                    tracing::warn!("task error during shutdown: {error}");
+                }
+                ShutdownDrainEvent::Join(Some(Ok(()))) => {}
+                ShutdownDrainEvent::Join(None) => break,
+                ShutdownDrainEvent::Prompt(Some(pr)) => {
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    if let Some(scheduler) = durable_scheduler.as_ref() {
+                        if let Err(error) = settle_scheduler_shutdown_result(
+                            &mut pool,
+                            &mut queue,
+                            &config,
+                            *pr,
+                            &mut heartbeat_in_flight,
+                            &removed_channels,
+                            &mut typing_channels,
+                            &mut crash_history,
+                            &respawn_tx,
+                            &mut respawn_tasks,
+                            observer.clone(),
+                            Some(&ctx.rest_client),
+                            scheduler,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                "scheduler result could not be settled during shutdown"
+                            );
+                        }
+                        continue;
+                    }
+                    {
+                        let mut pr = *pr;
                         let idx = pr.agent.index;
                         pr.agent.acp.shutdown().await;
                         tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
                     }
-                    // If None, channel closed — tasks are done.
                 }
+                ShutdownDrainEvent::Prompt(None) => result_channel_open = false,
             }
         }
     })
@@ -3363,7 +4444,34 @@ async fn tokio_main() -> Result<()> {
     }
     // Drain any remaining results that arrived after join_set drained but
     // before tasks were aborted.
-    while let Ok(mut pr) = pool.result_rx_try_recv() {
+    while let Ok(pr) = pool.result_rx_try_recv() {
+        #[cfg(feature = "durable-turn-lifecycle")]
+        if let Some(scheduler) = durable_scheduler.as_ref() {
+            if let Err(error) = settle_scheduler_shutdown_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                pr,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut typing_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                observer.clone(),
+                Some(&ctx.rest_client),
+                scheduler,
+            )
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    "late scheduler result could not be settled during shutdown"
+                );
+            }
+            continue;
+        }
+        let mut pr = pr;
         let idx = pr.agent.index;
         pr.agent.acp.shutdown().await;
         tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
@@ -3417,6 +4525,77 @@ async fn tokio_main() -> Result<()> {
         handle.abort();
     }
 
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if let Some(mut task) = durable_shadow_task {
+        drop(durable_shadow);
+        if tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("durable lifecycle shadow drain timed out; aborting worker");
+            task.abort();
+        }
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if let Some(mut task) = durable_authority_task {
+        if let Some(authority) = durable_authority.as_ref() {
+            authority.stop_renewal();
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!("durable lease renewal task did not stop; aborting");
+                task.abort();
+            }
+            if let Err(error) = authority
+                .adapter
+                .release_runtime_lease(authority.instance_id.clone())
+                .await
+            {
+                tracing::debug!(%error, "durable runtime lease was already released or lost");
+            }
+        }
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if let Some(mut task) = durable_scheduler_task {
+        if let Some(authority) = durable_scheduler.as_ref() {
+            authority.stop_renewal();
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!("durable scheduler lease renewal task did not stop; aborting");
+                task.abort();
+            }
+            if let Err(error) = authority
+                .adapter
+                .release_runtime_lease(authority.instance_id.clone())
+                .await
+            {
+                tracing::debug!(%error, "durable scheduler lease was already released or lost");
+            }
+        }
+    }
+
+    #[cfg(feature = "signing-capability-broker")]
+    if let Some(broker) = capability_broker.take() {
+        // All child/respawn owners are gone above. Drop the factory's Arc before
+        // requiring sole ownership for bounded listener shutdown.
+        config.broker_spawner.take();
+        match Arc::try_unwrap(broker) {
+            Ok(broker) => {
+                if let Err(error) = broker.shutdown().await {
+                    tracing::warn!(%error, "broker-v1 shutdown did not complete cleanly");
+                }
+            }
+            Err(_) => tracing::warn!(
+                "broker-v1 shutdown retained an unexpected owner; listener stop was signalled on drop"
+            ),
+        }
+    }
+
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
     // for the background task to finish, rather than aborting immediately (#40).
     relay.shutdown().await;
@@ -3425,10 +4604,1865 @@ async fn tokio_main() -> Result<()> {
     Ok(())
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 enum LoopAction {
     Continue,
     Exit,
+}
+
+/// Durable meaning of one completed ACP attempt after the legacy queue has
+/// made its retry/dead-letter decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnAttemptDisposition {
+    Completed,
+    RetryScheduled,
+    AwaitingMergedRetry,
+    Failed,
+    Cancelled,
+    Dropped,
+    Heartbeat,
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableRetryMode {
+    Retry,
+    MergedSteer,
+    MergedInterrupt,
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableRetryPlan {
+    prompt_tag: String,
+    mode: DurableRetryMode,
+    retry_count: u32,
+    delay: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PromptResultReport {
+    action: LoopAction,
+    execution_id: String,
+    triggering_event_ids: Vec<String>,
+    result_digest: Option<String>,
+    disposition: TurnAttemptDisposition,
+    #[cfg(feature = "durable-turn-lifecycle")]
+    retry_plan: Option<DurableRetryPlan>,
+    #[cfg(feature = "durable-turn-lifecycle")]
+    visible_final_text: Option<String>,
+    #[cfg(feature = "durable-turn-lifecycle")]
+    harness_owns_final_reply: bool,
+    #[cfg(feature = "durable-turn-lifecycle")]
+    scheduler_claim: Option<pool::SchedulerTaskClaim>,
+}
+
+impl PromptResultReport {
+    fn new(
+        action: LoopAction,
+        execution_id: String,
+        triggering_event_ids: Vec<String>,
+        result_digest: Option<String>,
+        disposition: TurnAttemptDisposition,
+    ) -> Self {
+        Self {
+            action,
+            execution_id,
+            triggering_event_ids,
+            result_digest,
+            disposition,
+            #[cfg(feature = "durable-turn-lifecycle")]
+            retry_plan: None,
+            #[cfg(feature = "durable-turn-lifecycle")]
+            visible_final_text: None,
+            #[cfg(feature = "durable-turn-lifecycle")]
+            harness_owns_final_reply: false,
+            #[cfg(feature = "durable-turn-lifecycle")]
+            scheduler_claim: None,
+        }
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    fn with_retry_plan(mut self, retry_plan: Option<DurableRetryPlan>) -> Self {
+        self.retry_plan = retry_plan;
+        self
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    fn with_visible_final(
+        mut self,
+        visible_final_text: Option<String>,
+        harness_owns_final_reply: bool,
+    ) -> Self {
+        self.visible_final_text = visible_final_text;
+        self.harness_owns_final_reply = harness_owns_final_reply;
+        self
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    fn with_scheduler_claim(mut self, claim: Option<pool::SchedulerTaskClaim>) -> Self {
+        self.scheduler_claim = claim;
+        self
+    }
+}
+
+fn attach_retry_plan(
+    report: PromptResultReport,
+    #[cfg(feature = "durable-turn-lifecycle")] retry_plan: Option<DurableRetryPlan>,
+    #[cfg(feature = "durable-turn-lifecycle")] visible_final_text: Option<String>,
+    #[cfg(feature = "durable-turn-lifecycle")] harness_owns_final_reply: bool,
+    #[cfg(feature = "durable-turn-lifecycle")] scheduler_claim: Option<pool::SchedulerTaskClaim>,
+) -> PromptResultReport {
+    #[cfg(feature = "durable-turn-lifecycle")]
+    {
+        report
+            .with_retry_plan(retry_plan)
+            .with_visible_final(visible_final_text, harness_owns_final_reply)
+            .with_scheduler_claim(scheduler_claim)
+    }
+    #[cfg(not(feature = "durable-turn-lifecycle"))]
+    {
+        report
+    }
+}
+
+impl PartialEq<LoopAction> for PromptResultReport {
+    fn eq(&self, other: &LoopAction) -> bool {
+        self.action == *other
+    }
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn bind_durable_attempt(
+    adapter: &durable_lifecycle::DurableLifecycleAdapter,
+    execution_id: &str,
+    triggering_event_ids: Vec<String>,
+    occurred_at_ms: i64,
+) -> Result<()> {
+    adapter
+        .mark_events_running(
+            triggering_event_ids,
+            execution_id,
+            serde_json::json!({"executionId": execution_id, "adapter": "buzz-acp"}),
+            occurred_at_ms,
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn apply_durable_result(
+    adapter: &durable_lifecycle::DurableLifecycleAdapter,
+    report: &PromptResultReport,
+    occurred_at_ms: i64,
+) -> Result<()> {
+    use buzz_lifecycle::{TerminalUpdate, TurnState};
+
+    if report.disposition == TurnAttemptDisposition::Heartbeat {
+        return Ok(());
+    }
+    if report.triggering_event_ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "durable channel result has no triggering event identities"
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "executionId": report.execution_id,
+        "disposition": format!("{:?}", report.disposition),
+    });
+    if report.harness_owns_final_reply {
+        payload["harnessOwnsFinalReply"] = serde_json::Value::Bool(true);
+        if let Some(content) = report.visible_final_text.as_ref() {
+            payload["visibleFinalText"] = serde_json::Value::String(content.clone());
+        } else if report.disposition == TurnAttemptDisposition::Completed {
+            payload["reason"] = serde_json::Value::String("no_visible_reply".to_owned());
+        }
+    }
+    match report.disposition {
+        TurnAttemptDisposition::Completed | TurnAttemptDisposition::Failed => {
+            let result_digest = report.result_digest.clone().ok_or_else(|| {
+                anyhow::anyhow!("terminal durable result is missing its result digest")
+            })?;
+            let state = if report.disposition == TurnAttemptDisposition::Completed
+                && (!report.harness_owns_final_reply || report.visible_final_text.is_some())
+            {
+                TurnState::Completed
+            } else {
+                TurnState::Failed
+            };
+            adapter
+                .mark_events_terminal_for_execution(
+                    report.triggering_event_ids.clone(),
+                    report.execution_id.clone(),
+                    TerminalUpdate {
+                        state,
+                        result_digest: Some(result_digest),
+                        payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::RetryScheduled | TurnAttemptDisposition::AwaitingMergedRetry => {
+            adapter
+                .mark_events_waiting_for_execution(
+                    report.triggering_event_ids.clone(),
+                    report.execution_id.clone(),
+                    payload,
+                    occurred_at_ms,
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Cancelled | TurnAttemptDisposition::Dropped => {
+            adapter
+                .mark_events_terminal_for_execution(
+                    report.triggering_event_ids.clone(),
+                    report.execution_id.clone(),
+                    TerminalUpdate {
+                        state: TurnState::Cancelled,
+                        result_digest: None,
+                        payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Heartbeat => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn apply_authoritative_result(
+    authority: &DurableAuthorityHandle,
+    report: &PromptResultReport,
+    occurred_at_ms: i64,
+) -> Result<()> {
+    use buzz_lifecycle::{DeliveryMode, DispatchIntent, TerminalUpdate, TurnState};
+
+    if report.disposition == TurnAttemptDisposition::Heartbeat {
+        return Ok(());
+    }
+    if report.triggering_event_ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "authoritative durable result has no triggering event identities"
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "executionId": report.execution_id,
+        "disposition": format!("{:?}", report.disposition),
+        "adapter": "buzz-acp-authoritative",
+    });
+    if report.harness_owns_final_reply {
+        payload["harnessOwnsFinalReply"] = serde_json::Value::Bool(true);
+        if let Some(content) = report.visible_final_text.as_ref() {
+            payload["visibleFinalText"] = serde_json::Value::String(content.clone());
+        } else if report.disposition == TurnAttemptDisposition::Completed {
+            payload["reason"] = serde_json::Value::String("no_visible_reply".to_owned());
+        }
+    }
+    match report.disposition {
+        TurnAttemptDisposition::Completed | TurnAttemptDisposition::Failed => {
+            let result_digest = report.result_digest.clone().ok_or_else(|| {
+                anyhow::anyhow!("terminal durable result is missing its result digest")
+            })?;
+            let state = if report.disposition == TurnAttemptDisposition::Completed
+                && (!report.harness_owns_final_reply || report.visible_final_text.is_some())
+            {
+                TurnState::Completed
+            } else {
+                TurnState::Failed
+            };
+            authority
+                .adapter
+                .mark_events_terminal_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    report.triggering_event_ids.clone(),
+                    report.execution_id.clone(),
+                    TerminalUpdate {
+                        state,
+                        result_digest: Some(result_digest),
+                        payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::RetryScheduled | TurnAttemptDisposition::AwaitingMergedRetry => {
+            let plan = report.retry_plan.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("durable retry disposition is missing its persisted schedule")
+            })?;
+            let delay_ms = i64::try_from(plan.delay.as_millis())
+                .map_err(|_| anyhow::anyhow!("durable retry delay is out of range"))?;
+            let not_before_ms = occurred_at_ms
+                .checked_add(delay_ms)
+                .ok_or_else(|| anyhow::anyhow!("durable retry timestamp is out of range"))?;
+            let delivery_mode = match plan.mode {
+                DurableRetryMode::Retry => DeliveryMode::Retry,
+                DurableRetryMode::MergedSteer => DeliveryMode::MergedSteer,
+                DurableRetryMode::MergedInterrupt => DeliveryMode::MergedInterrupt,
+            };
+            authority
+                .adapter
+                .mark_events_waiting_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    report.triggering_event_ids.clone(),
+                    report.execution_id.clone(),
+                    DispatchIntent {
+                        prompt_tag: plan.prompt_tag.clone(),
+                        delivery_mode,
+                        retry_count: plan.retry_count,
+                        not_before_ms,
+                        rule_fingerprint: None,
+                    },
+                    payload,
+                    occurred_at_ms,
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Cancelled | TurnAttemptDisposition::Dropped => {
+            authority
+                .adapter
+                .mark_events_terminal_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    report.triggering_event_ids.clone(),
+                    report.execution_id.clone(),
+                    TerminalUpdate {
+                        state: TurnState::Cancelled,
+                        result_digest: None,
+                        payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Heartbeat => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+const SCHEDULER_PILOT_MAX_RETRIES: u32 = 3;
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn apply_scheduler_result(
+    authority: &DurableAuthorityHandle,
+    report: &PromptResultReport,
+    occurred_at_ms: i64,
+) -> Result<()> {
+    use buzz_lifecycle::{DeliveryMode, TerminalUpdate, TurnState};
+    use sha2::{Digest, Sha256};
+
+    let claim = report
+        .scheduler_claim
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("scheduler result is missing its fenced claim identity"))?;
+    if claim.phase != buzz_lifecycle::RunClaimPhase::Launched
+        || claim.identity.execution_id != report.execution_id
+    {
+        anyhow::bail!("scheduler result does not match its launched claim");
+    }
+    let payload = serde_json::json!({
+        "executionId": report.execution_id,
+        "disposition": format!("{:?}", report.disposition),
+        "adapter": "buzz-acp-scheduler",
+    });
+
+    match report.disposition {
+        TurnAttemptDisposition::Completed => {
+            let completed = !report.harness_owns_final_reply || report.visible_final_text.is_some();
+            let digest = report.result_digest.clone().ok_or_else(|| {
+                anyhow::anyhow!("terminal scheduler result is missing its result digest")
+            })?;
+            let mut terminal_payload = payload;
+            if report.harness_owns_final_reply {
+                terminal_payload["harnessOwnsFinalReply"] = serde_json::Value::Bool(true);
+                if let Some(content) = report.visible_final_text.as_ref() {
+                    terminal_payload["visibleFinalText"] =
+                        serde_json::Value::String(content.clone());
+                }
+            }
+            authority
+                .adapter
+                .finish_claim_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    claim.identity.clone(),
+                    TerminalUpdate {
+                        state: if completed {
+                            TurnState::Completed
+                        } else {
+                            TurnState::Failed
+                        },
+                        result_digest: Some(digest),
+                        payload: terminal_payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Failed
+        | TurnAttemptDisposition::RetryScheduled
+        | TurnAttemptDisposition::AwaitingMergedRetry
+            if claim.dispatch.retry_count < SCHEDULER_PILOT_MAX_RETRIES =>
+        {
+            let next_retry = claim.dispatch.retry_count + 1;
+            let delay_ms = 1_000_i64 << next_retry.min(8);
+            let mut dispatch = claim.dispatch.clone();
+            dispatch.delivery_mode = DeliveryMode::Retry;
+            dispatch.retry_count = next_retry;
+            dispatch.not_before_ms = occurred_at_ms
+                .checked_add(delay_ms)
+                .ok_or_else(|| anyhow::anyhow!("scheduler retry timestamp is out of range"))?;
+            authority
+                .adapter
+                .release_claim_to_waiting_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    claim.identity.clone(),
+                    dispatch,
+                    payload,
+                    occurred_at_ms,
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Failed
+        | TurnAttemptDisposition::RetryScheduled
+        | TurnAttemptDisposition::AwaitingMergedRetry => {
+            let digest = report.result_digest.clone().unwrap_or_else(|| {
+                format!(
+                    "sha256:{}",
+                    hex::encode(Sha256::digest(
+                        format!("buzz-acp:scheduler-failed:{}", report.execution_id).as_bytes()
+                    ))
+                )
+            });
+            authority
+                .adapter
+                .finish_claim_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    claim.identity.clone(),
+                    TerminalUpdate {
+                        state: TurnState::Failed,
+                        result_digest: Some(digest),
+                        payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Cancelled | TurnAttemptDisposition::Dropped => {
+            authority
+                .adapter
+                .finish_claim_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    claim.identity.clone(),
+                    TerminalUpdate {
+                        state: TurnState::Cancelled,
+                        result_digest: None,
+                        payload,
+                        occurred_at_ms,
+                    },
+                )
+                .await?;
+        }
+        TurnAttemptDisposition::Heartbeat => {
+            anyhow::bail!("scheduler claim cannot settle a heartbeat")
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_SHADOW_QUEUE_CAPACITY: usize = 256;
+
+#[cfg(feature = "durable-turn-lifecycle")]
+enum DurableShadowCommand {
+    Admit {
+        channel_id: Uuid,
+        event: nostr::Event,
+        prompt_tag: String,
+    },
+    Bind {
+        execution_id: String,
+        event_ids: Vec<String>,
+    },
+    Result(PromptResultReport),
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+#[derive(Clone)]
+struct DurableShadowHandle {
+    sender: mpsc::Sender<DurableShadowCommand>,
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+impl DurableShadowHandle {
+    fn submit(&self, command: DurableShadowCommand) {
+        if let Err(error) = self.sender.try_send(command) {
+            tracing::error!(%error, "durable lifecycle shadow queue rejected an update");
+        }
+    }
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn start_durable_shadow(
+    path: std::path::PathBuf,
+    owner_id: String,
+    agent_id: String,
+) -> Result<(DurableShadowHandle, tokio::task::JoinHandle<()>)> {
+    let adapter =
+        durable_lifecycle::DurableLifecycleAdapter::open(path, owner_id, agent_id).await?;
+    let (sender, mut receiver) = mpsc::channel(DURABLE_SHADOW_QUEUE_CAPACITY);
+    let task = tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            let occurred_at_ms = chrono::Utc::now().timestamp_millis();
+            let result: Result<()> = match command {
+                DurableShadowCommand::Admit {
+                    channel_id,
+                    event,
+                    prompt_tag,
+                } => adapter
+                    .admit_queued_event(channel_id, &event, prompt_tag, occurred_at_ms)
+                    .await
+                    .map(|_| ())
+                    .map_err(Into::into),
+                DurableShadowCommand::Bind {
+                    execution_id,
+                    event_ids,
+                } => bind_durable_attempt(&adapter, &execution_id, event_ids, occurred_at_ms).await,
+                DurableShadowCommand::Result(report) => {
+                    apply_durable_result(&adapter, &report, occurred_at_ms).await
+                }
+            };
+            if let Err(error) = result {
+                tracing::error!(%error, "durable lifecycle shadow update failed");
+            }
+        }
+    });
+    Ok((DurableShadowHandle { sender }, task))
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_LEASE_DURATION_MS: i64 = 30_000;
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_RECOVERY_LIMIT: usize = 1_000;
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_RECONCILE_LIMIT: usize = 256;
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_OUTBOX_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_OUTBOX_LIMIT: usize = 32;
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_OUTBOX_CLAIM_MS: i64 = 300_000;
+#[cfg(feature = "durable-turn-lifecycle")]
+const DURABLE_OUTBOX_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(feature = "durable-turn-lifecycle")]
+#[derive(Clone)]
+struct DurableAuthorityHandle {
+    adapter: durable_lifecycle::DurableLifecycleAdapter,
+    instance_id: String,
+    shutdown_tx: watch::Sender<()>,
+    renewal_stop_tx: watch::Sender<()>,
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+impl DurableAuthorityHandle {
+    fn stop_renewal(&self) {
+        let _ = self.renewal_stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn start_durable_authority(
+    path: std::path::PathBuf,
+    owner_id: String,
+    agent_id: String,
+    shutdown_tx: watch::Sender<()>,
+) -> Result<(DurableAuthorityHandle, tokio::task::JoinHandle<()>)> {
+    let adapter =
+        durable_lifecycle::DurableLifecycleAdapter::open(path, owner_id, agent_id).await?;
+    let instance_id = Uuid::new_v4().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    adapter
+        .acquire_runtime_lease(
+            instance_id.clone(),
+            now_ms,
+            now_ms + DURABLE_LEASE_DURATION_MS,
+        )
+        .await?;
+
+    let renewal_adapter = adapter.clone();
+    let renewal_instance_id = instance_id.clone();
+    let handle_shutdown_tx = shutdown_tx.clone();
+    let (renewal_stop_tx, mut renewal_stop_rx) = watch::channel(());
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DURABLE_LEASE_RENEW_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                stop = renewal_stop_rx.changed() => {
+                    let _ = renewal_adapter
+                        .release_runtime_lease(renewal_instance_id.clone())
+                        .await;
+                    if stop.is_err() {
+                        tracing::debug!(
+                            instance_id = %renewal_instance_id,
+                            "durable lease renewal owner dropped during startup"
+                        );
+                    }
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Err(error) = renewal_adapter
+                .renew_runtime_lease(
+                    renewal_instance_id.clone(),
+                    now_ms,
+                    now_ms + DURABLE_LEASE_DURATION_MS,
+                )
+                .await
+            {
+                tracing::error!(
+                    %error,
+                    instance_id = %renewal_instance_id,
+                    "durable lifecycle authority lease lost; stopping ACP runtime"
+                );
+                let _ = shutdown_tx.send(());
+                break;
+            }
+        }
+    });
+    Ok((
+        DurableAuthorityHandle {
+            adapter,
+            instance_id,
+            shutdown_tx: handle_shutdown_tx,
+            renewal_stop_tx,
+        },
+        task,
+    ))
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn recover_authoritative_queue(
+    authority: &DurableAuthorityHandle,
+    rest: &relay::RestClient,
+    channel_filters: &HashMap<Uuid, config::ChannelFilter>,
+    queue: &mut EventQueue,
+    classify_restart: bool,
+) -> Result<()> {
+    use buzz_lifecycle::RecoveryAction;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let recovery = if classify_restart {
+        authority
+            .adapter
+            .recover_for_restart(
+                authority.instance_id.clone(),
+                now_ms,
+                DURABLE_RECOVERY_LIMIT,
+            )
+            .await?
+    } else {
+        authority
+            .adapter
+            .reconcile_pending_recovery_for_runtime_lease(
+                authority.instance_id.clone(),
+                now_ms,
+                DURABLE_RECOVERY_LIMIT,
+            )
+            .await?
+    };
+    for item in recovery {
+        if item.action != RecoveryAction::Rehydrate {
+            tracing::warn!(
+                turn_id = %item.turn.turn_id,
+                action = ?item.action,
+                "durable restart item requires explicit reconciliation"
+            );
+            continue;
+        }
+        let input = match authority
+            .adapter
+            .rehydrate_recovery_input(rest, &item)
+            .await
+        {
+            Ok(input) => input,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    turn_id = %item.turn.turn_id,
+                    "durable restart input could not be rehydrated"
+                );
+                continue;
+            }
+        };
+        if !channel_filters.contains_key(&input.channel_id) {
+            tracing::warn!(
+                turn_id = %input.turn_id,
+                channel_id = %input.channel_id,
+                "durable restart item is outside current channel subscriptions"
+            );
+            continue;
+        }
+        if queue.admission_status(input.channel_id) != QueueAdmissionStatus::Accept {
+            tracing::warn!(
+                turn_id = %input.turn_id,
+                channel_id = %input.channel_id,
+                "durable restart queue is at capacity; item remains recoverable"
+            );
+            continue;
+        }
+        let accepted = queue.push(QueuedEvent {
+            channel_id: input.channel_id,
+            event: input.event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: input.prompt_tag,
+        });
+        if !accepted {
+            anyhow::bail!(
+                "durable restart queue push failed after capacity admission for turn {}",
+                input.turn_id
+            );
+        }
+        authority
+            .adapter
+            .acknowledge_recovery_enqueued_for_runtime_lease(
+                authority.instance_id.clone(),
+                input.turn_id,
+                item.turn.version,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn recover_scheduler_pilot(authority: &DurableAuthorityHandle) -> Result<()> {
+    recover_scheduler_pilot_at(authority, chrono::Utc::now().timestamp_millis()).await
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn recover_scheduler_pilot_at(authority: &DurableAuthorityHandle, now_ms: i64) -> Result<()> {
+    use buzz_lifecycle::RecoveryAction;
+
+    let active = authority
+        .adapter
+        .recover_scheduler_active_for_runtime_lease(authority.instance_id.clone(), now_ms)
+        .await?;
+    let recovery = authority
+        .adapter
+        .recover_for_restart(
+            authority.instance_id.clone(),
+            now_ms,
+            DURABLE_RECOVERY_LIMIT,
+        )
+        .await?;
+    let mut seen = HashSet::new();
+    for item in active.into_iter().chain(recovery) {
+        if !seen.insert(item.turn.turn_id.clone()) {
+            continue;
+        }
+        match item.action {
+            RecoveryAction::Rehydrate | RecoveryAction::WaitUntilDue => {
+                tracing::info!(
+                    turn_id = %item.turn.turn_id,
+                    action = ?item.action,
+                    "scheduler turn recovered for durable re-claim"
+                );
+            }
+            RecoveryAction::HoldUncertain | RecoveryAction::MissingDispatchIntent => {
+                tracing::warn!(
+                    turn_id = %item.turn.turn_id,
+                    action = ?item.action,
+                    "scheduler recovery requires explicit reconciliation"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn publish_authoritative_outbox(
+    authority: &DurableAuthorityHandle,
+    rest: &relay::RestClient,
+) -> Result<()> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let claim_token = Uuid::new_v4().to_string();
+    let records = authority
+        .adapter
+        .claim_pending_outbox(
+            authority.instance_id.clone(),
+            now_ms,
+            DURABLE_OUTBOX_LIMIT,
+            claim_token.clone(),
+            now_ms + DURABLE_OUTBOX_CLAIM_MS,
+        )
+        .await?;
+    for record in records {
+        let delivery = tokio::time::timeout(
+            DURABLE_OUTBOX_DELIVERY_TIMEOUT,
+            authority.adapter.deliver_claimed_outbox(
+                authority.instance_id.clone(),
+                rest,
+                &record,
+                claim_token.clone(),
+            ),
+        )
+        .await;
+        let delivery_error = match delivery {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("delivery attempt timed out".to_owned()),
+        };
+        if let Some(error) = delivery_error {
+            let retry_now_ms = chrono::Utc::now().timestamp_millis();
+            let exponent = record.attempts.min(8);
+            let delay_ms = 1_000_i64 << exponent;
+            authority
+                .adapter
+                .retry_claimed_outbox(
+                    authority.instance_id.clone(),
+                    record.outbox_id.clone(),
+                    claim_token.clone(),
+                    retry_now_ms,
+                    retry_now_ms + delay_ms,
+                )
+                .await?;
+            tracing::warn!(
+                %error,
+                outbox_id = %record.outbox_id,
+                attempts = record.attempts + 1,
+                delay_ms,
+                "durable lifecycle outbox publication deferred"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "durable-turn-lifecycle"))]
+mod durable_result_bridge_tests {
+    use buzz_lifecycle::TurnState;
+    use nostr::{EventBuilder, Keys, Kind, Timestamp};
+
+    use super::*;
+
+    fn signed_event(
+        created_at_secs: u64,
+    ) -> std::result::Result<nostr::Event, nostr::event::builder::Error> {
+        EventBuilder::new(Kind::Custom(9), "bridge test")
+            .custom_created_at(Timestamp::from(created_at_secs))
+            .sign_with_keys(&Keys::generate())
+    }
+
+    #[tokio::test]
+    async fn typed_result_disposition_drives_execution_fenced_lifecycle(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            directory.path().join("lifecycle.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        let channel_id = Uuid::new_v4();
+        let completed_event = signed_event(1_700_000_000)?;
+        let retry_event = signed_event(1_700_000_001)?;
+        adapter.admit_event(channel_id, &completed_event).await?;
+        adapter.admit_event(channel_id, &retry_event).await?;
+
+        bind_durable_attempt(
+            &adapter,
+            "execution-a",
+            vec![completed_event.id.to_hex()],
+            1_700_000_001_100,
+        )
+        .await?;
+        let completed = PromptResultReport::new(
+            LoopAction::Continue,
+            "execution-a".to_owned(),
+            vec![completed_event.id.to_hex()],
+            Some("sha256:result-a".to_owned()),
+            TurnAttemptDisposition::Completed,
+        );
+        apply_durable_result(&adapter, &completed, 1_700_000_001_200).await?;
+        assert_eq!(
+            adapter
+                .turn_for_event_id(completed_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Completed)
+        );
+
+        bind_durable_attempt(
+            &adapter,
+            "execution-b",
+            vec![retry_event.id.to_hex()],
+            1_700_000_001_300,
+        )
+        .await?;
+        let retry = PromptResultReport::new(
+            LoopAction::Continue,
+            "execution-b".to_owned(),
+            vec![retry_event.id.to_hex()],
+            Some("sha256:attempt-b".to_owned()),
+            TurnAttemptDisposition::RetryScheduled,
+        );
+        apply_durable_result(&adapter, &retry, 1_700_000_001_400).await?;
+        assert_eq!(
+            adapter
+                .turn_for_event_id(retry_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Waiting)
+        );
+
+        let stale = PromptResultReport::new(
+            LoopAction::Continue,
+            "stale-execution".to_owned(),
+            vec![retry_event.id.to_hex()],
+            Some("sha256:stale".to_owned()),
+            TurnAttemptDisposition::Failed,
+        );
+        assert!(apply_durable_result(&adapter, &stale, 1_700_000_001_500)
+            .await
+            .is_err());
+        assert_eq!(
+            adapter
+                .turn_for_event_id(retry_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Waiting)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_owned_final_is_transactional_and_empty_final_fails_closed(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("visible-final.sqlite3");
+        let adapter =
+            durable_lifecycle::DurableLifecycleAdapter::open(path.clone(), "owner-a", "agent-a")
+                .await?;
+        let channel_id = Uuid::new_v4();
+        let visible_event = signed_event(1_700_000_000)?;
+        let empty_event = signed_event(1_700_000_001)?;
+        adapter.admit_event(channel_id, &visible_event).await?;
+        adapter.admit_event(channel_id, &empty_event).await?;
+
+        for (execution_id, event) in [
+            ("execution-visible", &visible_event),
+            ("execution-empty", &empty_event),
+        ] {
+            bind_durable_attempt(
+                &adapter,
+                execution_id,
+                vec![event.id.to_hex()],
+                1_700_000_001_100,
+            )
+            .await?;
+        }
+        let visible = PromptResultReport::new(
+            LoopAction::Continue,
+            "execution-visible".to_owned(),
+            vec![visible_event.id.to_hex()],
+            Some("sha256:visible".to_owned()),
+            TurnAttemptDisposition::Completed,
+        )
+        .with_visible_final(Some("The durable final".to_owned()), true);
+        apply_durable_result(&adapter, &visible, 1_700_000_001_200).await?;
+
+        let empty = PromptResultReport::new(
+            LoopAction::Continue,
+            "execution-empty".to_owned(),
+            vec![empty_event.id.to_hex()],
+            Some("sha256:empty".to_owned()),
+            TurnAttemptDisposition::Completed,
+        )
+        .with_visible_final(None, true);
+        apply_durable_result(&adapter, &empty, 1_700_000_001_300).await?;
+
+        assert_eq!(
+            adapter
+                .turn_for_event_id(visible_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Completed)
+        );
+        assert_eq!(
+            adapter
+                .turn_for_event_id(empty_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Failed)
+        );
+        let store = buzz_lifecycle::LifecycleStore::open(path)?;
+        let terminal = store
+            .pending_outbox(1_700_000_002_000, 10)?
+            .into_iter()
+            .filter(|record| record.kind == buzz_lifecycle::OutboxKind::Terminal)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 2);
+        assert!(terminal
+            .iter()
+            .any(|record| { record.payload["detail"]["visibleFinalText"] == "The durable final" }));
+        assert!(terminal
+            .iter()
+            .any(|record| record.payload["detail"]["reason"] == "no_visible_reply"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_shadow_worker_preserves_admit_bind_result_order(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("shadow.sqlite3");
+        let event = signed_event(1_700_000_000)?;
+        let event_id = event.id.to_hex();
+        let channel_id = Uuid::new_v4();
+        let (shadow, task) =
+            start_durable_shadow(path.clone(), "owner-a".to_owned(), "agent-a".to_owned()).await?;
+
+        shadow.submit(DurableShadowCommand::Admit {
+            channel_id,
+            event,
+            prompt_tag: "test".to_owned(),
+        });
+        shadow.submit(DurableShadowCommand::Bind {
+            execution_id: "execution-a".to_owned(),
+            event_ids: vec![event_id.clone()],
+        });
+        shadow.submit(DurableShadowCommand::Result(PromptResultReport::new(
+            LoopAction::Continue,
+            "execution-a".to_owned(),
+            vec![event_id.clone()],
+            Some("sha256:result-a".to_owned()),
+            TurnAttemptDisposition::Completed,
+        )));
+        drop(shadow);
+        task.await?;
+
+        let adapter =
+            durable_lifecycle::DurableLifecycleAdapter::open(path, "owner-a", "agent-a").await?;
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event_id)
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Completed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authoritative_result_persists_retry_schedule_under_the_runtime_lease(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use buzz_lifecycle::{DeliveryMode, RecoveryAction};
+
+        let directory = tempfile::tempdir()?;
+        let adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            directory.path().join("authoritative.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        let event = signed_event(1_700_000_000)?;
+        let event_id = event.id.to_hex();
+        let channel_id = Uuid::new_v4();
+        adapter
+            .admit_queued_event_decision(channel_id, &event, "@mention", 1_700_000_000_100)
+            .await?;
+        adapter
+            .acquire_runtime_lease("instance-a", 1_700_000_000_200, 1_700_000_030_000)
+            .await?;
+        adapter
+            .bind_events_for_runtime_lease(
+                "instance-a",
+                vec![event_id.clone()],
+                "execution-a",
+                serde_json::json!({}),
+                1_700_000_000_300,
+            )
+            .await?;
+        let report = PromptResultReport::new(
+            LoopAction::Continue,
+            "execution-a".to_owned(),
+            vec![event_id],
+            Some("sha256:attempt-a".to_owned()),
+            TurnAttemptDisposition::RetryScheduled,
+        )
+        .with_retry_plan(Some(DurableRetryPlan {
+            prompt_tag: "@mention".to_owned(),
+            mode: DurableRetryMode::Retry,
+            retry_count: 2,
+            delay: Duration::from_secs(5),
+        }));
+        let authority = DurableAuthorityHandle {
+            adapter: adapter.clone(),
+            instance_id: "instance-a".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        apply_authoritative_result(&authority, &report, 1_700_000_000_400).await?;
+
+        let waiting = adapter.active_turns_page(None, 1_000).await?.turns;
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].state, TurnState::Waiting);
+        assert_eq!(waiting[0].execution_id, None);
+        let recovered = adapter
+            .recover_for_restart("instance-a", 1_700_000_001_000, 10)
+            .await?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].action, RecoveryAction::WaitUntilDue);
+        let dispatch = recovered[0].dispatch.as_ref().expect("dispatch intent");
+        assert_eq!(dispatch.delivery_mode, DeliveryMode::Retry);
+        assert_eq!(dispatch.retry_count, 2);
+        assert_eq!(dispatch.not_before_ms, 1_700_000_005_400);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_result_retries_then_cancels_by_claim_fence(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use buzz_lifecycle::{RunClaimPhase, RunLane, RunLaneCapacity};
+
+        let directory = tempfile::tempdir()?;
+        let adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            directory.path().join("scheduler.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        let now_ms = 1_700_000_000_100;
+        adapter
+            .acquire_runtime_lease("instance-a", now_ms, now_ms + 60_000)
+            .await?;
+        let channel_id = Uuid::new_v4();
+        let channel_tag = nostr::Tag::parse(["h", &channel_id.to_string()])?;
+        let event = EventBuilder::new(Kind::Custom(9), "scheduled bridge test")
+            .tags([channel_tag])
+            .custom_created_at(Timestamp::from(u64::try_from(now_ms / 1_000)?))
+            .sign_with_keys(&Keys::generate())?;
+        adapter
+            .admit_scheduled_event_for_runtime_lease(
+                "instance-a",
+                channel_id,
+                &event,
+                "@mention",
+                RunLane::User,
+                "human",
+                RunLaneCapacity {
+                    user: 8,
+                    agent: 8,
+                    background: 8,
+                },
+                now_ms + 1,
+            )
+            .await?;
+        let first = adapter
+            .claim_next_for_runtime_lease("instance-a", "execution-first", now_ms + 2)
+            .await?
+            .ok_or("expected first claim")?;
+        adapter
+            .mark_claim_launched_for_runtime_lease("instance-a", first.identity.clone(), now_ms + 3)
+            .await?;
+        let authority = DurableAuthorityHandle {
+            adapter: adapter.clone(),
+            instance_id: "instance-a".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        let failed = PromptResultReport::new(
+            LoopAction::Continue,
+            first.identity.execution_id.clone(),
+            vec![event.id.to_hex()],
+            Some("sha256:attempt-one".to_owned()),
+            TurnAttemptDisposition::Failed,
+        )
+        .with_scheduler_claim(Some(pool::SchedulerTaskClaim {
+            identity: first.identity.clone(),
+            dispatch: first.dispatch.clone(),
+            phase: RunClaimPhase::Launched,
+        }));
+        apply_scheduler_result(&authority, &failed, now_ms + 4).await?;
+
+        let second = adapter
+            .claim_next_for_runtime_lease("instance-a", "execution-second", now_ms + 2_100)
+            .await?
+            .ok_or("expected durable retry claim")?;
+        assert_eq!(second.turn.turn_id, first.turn.turn_id);
+        assert_eq!(second.dispatch.retry_count, 1);
+        adapter
+            .mark_claim_launched_for_runtime_lease(
+                "instance-a",
+                second.identity.clone(),
+                now_ms + 2_101,
+            )
+            .await?;
+        let cancelled = PromptResultReport::new(
+            LoopAction::Continue,
+            second.identity.execution_id.clone(),
+            vec![event.id.to_hex()],
+            None,
+            TurnAttemptDisposition::Cancelled,
+        )
+        .with_scheduler_claim(Some(pool::SchedulerTaskClaim {
+            identity: second.identity,
+            dispatch: second.dispatch,
+            phase: RunClaimPhase::Launched,
+        }));
+        apply_scheduler_result(&authority, &cancelled, now_ms + 2_102).await?;
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Cancelled)
+        );
+        assert!(apply_scheduler_result(&authority, &failed, now_ms + 2_103)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_removed_channel_is_cancelled_while_reserved_before_launch(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use buzz_lifecycle::{RunLane, RunLaneCapacity};
+
+        let directory = tempfile::tempdir()?;
+        let adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            directory.path().join("scheduler-revoked-channel.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        let now_ms = 1_700_000_000_100;
+        adapter
+            .acquire_runtime_lease("instance-a", now_ms, now_ms + 60_000)
+            .await?;
+        let channel_id = Uuid::new_v4();
+        let channel_tag = nostr::Tag::parse(["h", &channel_id.to_string()])?;
+        let event = EventBuilder::new(Kind::Custom(9), "revoked before scheduler launch")
+            .tags([channel_tag])
+            .custom_created_at(Timestamp::from(1_700_000_000))
+            .sign_with_keys(&Keys::generate())?;
+        adapter
+            .admit_scheduled_event_for_runtime_lease(
+                "instance-a",
+                channel_id,
+                &event,
+                "@mention",
+                RunLane::User,
+                "human",
+                RunLaneCapacity {
+                    user: 8,
+                    agent: 8,
+                    background: 8,
+                },
+                now_ms + 1,
+            )
+            .await?;
+        let claim = adapter
+            .claim_next_for_runtime_lease("instance-a", "must-not-launch", now_ms + 2)
+            .await?
+            .ok_or("expected reserved claim")?;
+        let authority = DurableAuthorityHandle {
+            adapter: adapter.clone(),
+            instance_id: "instance-a".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        let subscribed = HashSet::from([channel_id]);
+        let removed = HashSet::from([channel_id]);
+        let reason = scheduler_channel_block_reason(channel_id, &subscribed, &removed)
+            .ok_or("removed channel must be blocked")?;
+
+        cancel_scheduler_claim_for_inactive_channel(
+            &authority,
+            &claim,
+            channel_id,
+            reason,
+            now_ms + 3,
+        )
+        .await?;
+
+        assert_eq!(reason, "channel_removed_before_launch");
+        assert_eq!(
+            scheduler_channel_block_reason(channel_id, &HashSet::new(), &HashSet::new()),
+            Some("channel_not_subscribed_before_launch")
+        );
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Cancelled)
+        );
+        assert!(adapter
+            .claim_next_for_runtime_lease("instance-a", "must-stay-cancelled", now_ms + 4)
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    async fn launched_scheduler_shutdown_fixture() -> std::result::Result<
+        (
+            tempfile::TempDir,
+            durable_lifecycle::DurableLifecycleAdapter,
+            nostr::Event,
+            buzz_lifecycle::RunClaim,
+            DurableAuthorityHandle,
+            i64,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use buzz_lifecycle::{RunLane, RunLaneCapacity};
+
+        let directory = tempfile::tempdir()?;
+        let adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            directory.path().join("scheduler-shutdown.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        let now_ms = 1_700_000_000_100;
+        adapter
+            .acquire_runtime_lease("instance-a", now_ms, now_ms + 60_000)
+            .await?;
+        let channel_id = Uuid::new_v4();
+        let channel_tag = nostr::Tag::parse(["h", &channel_id.to_string()])?;
+        let event = EventBuilder::new(Kind::Custom(9), "scheduler shutdown test")
+            .tags([channel_tag])
+            .custom_created_at(Timestamp::from(u64::try_from(now_ms / 1_000)?))
+            .sign_with_keys(&Keys::generate())?;
+        adapter
+            .admit_scheduled_event_for_runtime_lease(
+                "instance-a",
+                channel_id,
+                &event,
+                "@mention",
+                RunLane::User,
+                "human",
+                RunLaneCapacity {
+                    user: 8,
+                    agent: 8,
+                    background: 8,
+                },
+                now_ms + 1,
+            )
+            .await?;
+        let claim = adapter
+            .claim_next_for_runtime_lease("instance-a", "shutdown-execution", now_ms + 2)
+            .await?
+            .ok_or("expected shutdown claim")?;
+        adapter
+            .mark_claim_launched_for_runtime_lease("instance-a", claim.identity.clone(), now_ms + 3)
+            .await?;
+        let authority = DurableAuthorityHandle {
+            adapter: adapter.clone(),
+            instance_id: "instance-a".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        Ok((directory, adapter, event, claim, authority, now_ms))
+    }
+
+    fn scheduler_shutdown_report(
+        event: &nostr::Event,
+        claim: &buzz_lifecycle::RunClaim,
+        disposition: TurnAttemptDisposition,
+        result_digest: Option<&str>,
+    ) -> PromptResultReport {
+        use buzz_lifecycle::RunClaimPhase;
+
+        PromptResultReport::new(
+            LoopAction::Continue,
+            claim.identity.execution_id.clone(),
+            vec![event.id.to_hex()],
+            result_digest.map(str::to_owned),
+            disposition,
+        )
+        .with_scheduler_claim(Some(pool::SchedulerTaskClaim {
+            identity: claim.identity.clone(),
+            dispatch: claim.dispatch.clone(),
+            phase: RunClaimPhase::Launched,
+        }))
+    }
+
+    #[tokio::test]
+    async fn scheduler_startup_recovers_active_claim_ahead_of_large_backlog(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (directory, adapter, event, _claim, _authority, now_ms) =
+            launched_scheduler_shutdown_fixture().await?;
+        let mut connection =
+            rusqlite::Connection::open(directory.path().join("scheduler-shutdown.sqlite3"))?;
+        let transaction = connection.transaction()?;
+        for index in 0..1_001 {
+            transaction.execute(
+                "INSERT INTO turns(
+                    turn_id,owner_id,agent_id,requester_id,channel_id,client_nonce,input_digest,state,
+                    version,accepted_at_ms,updated_at_ms,expires_at_ms
+                 ) VALUES (?1,'owner-a','agent-a','requester','channel',?2,?3,'queued',0,?4,?4,?5)",
+                rusqlite::params![
+                    format!("backlog-{index}"),
+                    format!("backlog-nonce-{index}"),
+                    format!("backlog-digest-{index}"),
+                    index,
+                    now_ms + 120_000,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+
+        adapter
+            .acquire_runtime_lease("instance-b", now_ms + 60_001, now_ms + 120_000)
+            .await?;
+        let authority = DurableAuthorityHandle {
+            adapter: adapter.clone(),
+            instance_id: "instance-b".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        recover_scheduler_pilot_at(&authority, now_ms + 60_002).await?;
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Waiting)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_completion_settles_before_lease_release(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_directory, adapter, event, claim, authority, now_ms) =
+            launched_scheduler_shutdown_fixture().await?;
+        let report = scheduler_shutdown_report(
+            &event,
+            &claim,
+            TurnAttemptDisposition::Completed,
+            Some("sha256:shutdown-complete"),
+        );
+
+        apply_scheduler_result(&authority, &report, now_ms + 4).await?;
+
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Completed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_confirmed_cancel_is_claim_fenced(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_directory, adapter, event, claim, authority, now_ms) =
+            launched_scheduler_shutdown_fixture().await?;
+        let report =
+            scheduler_shutdown_report(&event, &claim, TurnAttemptDisposition::Cancelled, None);
+
+        apply_scheduler_result(&authority, &report, now_ms + 4).await?;
+
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Cancelled)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_timeout_leaves_launched_claim_hold_uncertain(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use buzz_lifecycle::RecoveryAction;
+
+        let (_directory, adapter, _event, _claim, _authority, now_ms) =
+            launched_scheduler_shutdown_fixture().await?;
+        adapter
+            .acquire_runtime_lease("instance-b", now_ms + 60_001, now_ms + 120_000)
+            .await?;
+        let recovered = adapter
+            .recover_for_restart("instance-b", now_ms + 60_002, 10)
+            .await?;
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].action, RecoveryAction::HoldUncertain);
+        assert_eq!(recovered[0].turn.state, TurnState::Waiting);
+        assert!(adapter
+            .claim_next_for_runtime_lease(
+                "instance-b",
+                "must-not-replay-uncertain",
+                now_ms + 60_003,
+            )
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_stale_completion_cannot_settle_after_takeover(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use buzz_lifecycle::RecoveryAction;
+
+        let (_directory, adapter, event, claim, stale_authority, now_ms) =
+            launched_scheduler_shutdown_fixture().await?;
+        adapter
+            .acquire_runtime_lease("instance-b", now_ms + 60_001, now_ms + 120_000)
+            .await?;
+        let recovered = adapter
+            .recover_for_restart("instance-b", now_ms + 60_002, 10)
+            .await?;
+        assert_eq!(recovered[0].action, RecoveryAction::HoldUncertain);
+
+        let stale_report = scheduler_shutdown_report(
+            &event,
+            &claim,
+            TurnAttemptDisposition::Completed,
+            Some("sha256:stale-shutdown-completion"),
+        );
+        assert!(
+            apply_scheduler_result(&stale_authority, &stale_report, now_ms + 60_003)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            adapter
+                .turn_for_event_id(event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Waiting)
+        );
+        assert!(adapter
+            .claim_next_for_runtime_lease(
+                "instance-b",
+                "stale-completion-must-not-unblock",
+                now_ms + 60_004,
+            )
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    async fn scheduler_test_agent(index: usize) -> pool::OwnedAgent {
+        pool::OwnedAgent {
+            index,
+            acp: acp::AcpClient::spawn("cat", &[], &[], false)
+                .await
+                .expect("spawn inert scheduler test provider"),
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "scheduler-test".to_owned(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        }
+    }
+
+    fn scheduler_test_context() -> Arc<PromptContext> {
+        let keys = nostr::Keys::generate();
+        let rest_client = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".to_owned(),
+            keys: keys.clone(),
+            auth_tag_json: None,
+        };
+        Arc::new(PromptContext {
+            mcp_servers: Vec::new(),
+            initial_message: None,
+            idle_timeout: Duration::from_secs(1),
+            max_turn_duration: Duration::from_secs(1),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: DedupMode::Queue,
+            system_prompt: None,
+            capture_visible_final: false,
+            session_title: None,
+            team_instructions: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            channel_info: pool::ChannelInfoResolver::new(
+                std::collections::HashMap::new(),
+                rest_client.clone(),
+            ),
+            rest_client,
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: config::PermissionMode::Default,
+            agent_keys: keys,
+            agent_owner_pubkey: None,
+            memory_enabled: false,
+            semantic_memory: memory::MemoryProvider::disabled(),
+            harness_name: "scheduler-test".to_owned(),
+            relay_url: "ws://127.0.0.1:1".to_owned(),
+        })
+    }
+
+    async fn assert_scheduler_dispatch_keeps_legacy_queue_empty_and_provider_idle(
+        authority: &DurableAuthorityHandle,
+        subscribed: &HashSet<Uuid>,
+        expected_channel: Uuid,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut pool = AgentPool::from_slots(vec![Some(scheduler_test_agent(0).await)]);
+        let queue = EventQueue::new(DedupMode::Queue);
+        let mut last_activity = tokio::time::Instant::now();
+        let dispatched = dispatch_scheduler_pending(
+            &mut pool,
+            &scheduler_test_context(),
+            &mut last_activity,
+            subscribed,
+            &HashSet::new(),
+            authority,
+        )
+        .await?;
+
+        assert!(dispatched.is_empty());
+        assert_eq!(queue.pending_channels(), 0);
+        assert_eq!(queue.queued_event_count(&expected_channel), 0);
+        assert!(!queue.has_in_flight());
+        assert!(
+            pool.any_idle(),
+            "checked-out provider slot was not returned"
+        );
+        assert_eq!(pool.live_count(), 1);
+        assert!(
+            pool.task_map().is_empty(),
+            "provider task unexpectedly launched"
+        );
+        if let Some(mut agent) = pool.agents_mut()[0].take() {
+            agent.acp.shutdown().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_recovery_and_quarantine_never_touch_event_queue_or_lose_provider_slot(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use buzz_lifecycle::{RecoveryAction, RunLane, RunLaneCapacity};
+
+        // Keep the adapter's 30-day signed-event expiry in the future while
+        // making instance-a's lease logically expired before takeover. Runtime
+        // dispatch itself reads the real wall clock.
+        let now_ms = chrono::Utc::now().timestamp_millis() - 1_000;
+        let limits = RunLaneCapacity {
+            user: 8,
+            agent: 8,
+            background: 8,
+        };
+
+        // A Reserved crash is recoverable. With its channel no longer
+        // subscribed, the re-claim is cancelled before launch; the provider is
+        // returned and the legacy EventQueue remains outside the scheduler path.
+        let reserved_dir = tempfile::tempdir()?;
+        let reserved_adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            reserved_dir.path().join("reserved-provider.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        reserved_adapter
+            .acquire_runtime_lease("instance-a", now_ms, now_ms + 100)
+            .await?;
+        let reserved_channel = Uuid::new_v4();
+        let reserved_tag = nostr::Tag::parse(["h", &reserved_channel.to_string()])?;
+        let reserved_event = EventBuilder::new(Kind::Custom(9), "reserved provider boundary")
+            .tags([reserved_tag])
+            .custom_created_at(Timestamp::from(u64::try_from(now_ms / 1_000)?))
+            .sign_with_keys(&Keys::generate())?;
+        reserved_adapter
+            .admit_scheduled_event_for_runtime_lease(
+                "instance-a",
+                reserved_channel,
+                &reserved_event,
+                "@mention",
+                RunLane::User,
+                "human",
+                limits,
+                now_ms + 1,
+            )
+            .await?;
+        reserved_adapter
+            .claim_next_for_runtime_lease("instance-a", "reserved-crash", now_ms + 2)
+            .await?
+            .ok_or("reserved claim missing")?;
+        reserved_adapter
+            .acquire_runtime_lease("instance-b", now_ms + 100, now_ms + 10_000)
+            .await?;
+        let reserved_authority = DurableAuthorityHandle {
+            adapter: reserved_adapter.clone(),
+            instance_id: "instance-b".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        let recovery = reserved_adapter
+            .recover_scheduler_active_for_runtime_lease("instance-b", now_ms + 101)
+            .await?
+            .ok_or("reserved recovery missing")?;
+        assert_eq!(recovery.action, RecoveryAction::Rehydrate);
+        eprintln!("ACP scheduler boundary: recovered Reserved");
+        assert_scheduler_dispatch_keeps_legacy_queue_empty_and_provider_idle(
+            &reserved_authority,
+            &HashSet::new(),
+            reserved_channel,
+        )
+        .await?;
+        assert_eq!(
+            reserved_adapter
+                .turn_for_event_id(reserved_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Cancelled)
+        );
+
+        // A Launched crash is hold_uncertain. Even with an active subscription,
+        // scheduler dispatch sees no runnable claim and returns its checked-out
+        // provider without creating an EventQueue batch or provider task.
+        let launched_dir = tempfile::tempdir()?;
+        let launched_adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            launched_dir.path().join("launched-provider.sqlite3"),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        launched_adapter
+            .acquire_runtime_lease("instance-a", now_ms, now_ms + 100)
+            .await?;
+        let launched_channel = Uuid::new_v4();
+        let launched_tag = nostr::Tag::parse(["h", &launched_channel.to_string()])?;
+        let launched_event = EventBuilder::new(Kind::Custom(9), "launched provider boundary")
+            .tags([launched_tag])
+            .custom_created_at(Timestamp::from(u64::try_from(now_ms / 1_000)?))
+            .sign_with_keys(&Keys::generate())?;
+        launched_adapter
+            .admit_scheduled_event_for_runtime_lease(
+                "instance-a",
+                launched_channel,
+                &launched_event,
+                "@mention",
+                RunLane::User,
+                "human",
+                limits,
+                now_ms + 1,
+            )
+            .await?;
+        let launched_claim = launched_adapter
+            .claim_next_for_runtime_lease("instance-a", "launched-crash", now_ms + 2)
+            .await?
+            .ok_or("launched claim missing")?;
+        launched_adapter
+            .mark_claim_launched_for_runtime_lease(
+                "instance-a",
+                launched_claim.identity,
+                now_ms + 3,
+            )
+            .await?;
+        launched_adapter
+            .acquire_runtime_lease("instance-b", now_ms + 100, now_ms + 10_000)
+            .await?;
+        let launched_authority = DurableAuthorityHandle {
+            adapter: launched_adapter.clone(),
+            instance_id: "instance-b".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        let recovery = launched_adapter
+            .recover_scheduler_active_for_runtime_lease("instance-b", now_ms + 101)
+            .await?
+            .ok_or("launched recovery missing")?;
+        assert_eq!(recovery.action, RecoveryAction::HoldUncertain);
+        eprintln!("ACP scheduler boundary: quarantined Launched");
+        assert_scheduler_dispatch_keeps_legacy_queue_empty_and_provider_idle(
+            &launched_authority,
+            &HashSet::from([launched_channel]),
+            launched_channel,
+        )
+        .await?;
+        assert_eq!(
+            launched_adapter
+                .turn_for_event_id(launched_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Waiting)
+        );
+
+        // Corrupt opaque input is terminally quarantined by the store before
+        // an ACP batch exists. Dispatch returns the provider and the EventQueue
+        // remains empty rather than cycling the corrupt head.
+        let corrupt_dir = tempfile::tempdir()?;
+        let corrupt_path = corrupt_dir.path().join("corrupt-provider.sqlite3");
+        let corrupt_adapter = durable_lifecycle::DurableLifecycleAdapter::open(
+            corrupt_path.clone(),
+            "owner-a",
+            "agent-a",
+        )
+        .await?;
+        corrupt_adapter
+            .acquire_runtime_lease("instance-a", now_ms, now_ms + 10_000)
+            .await?;
+        let corrupt_channel = Uuid::new_v4();
+        let corrupt_tag = nostr::Tag::parse(["h", &corrupt_channel.to_string()])?;
+        let corrupt_event = EventBuilder::new(Kind::Custom(9), "corrupt provider boundary")
+            .tags([corrupt_tag])
+            .custom_created_at(Timestamp::from(u64::try_from(now_ms / 1_000)?))
+            .sign_with_keys(&Keys::generate())?;
+        corrupt_adapter
+            .admit_scheduled_event_for_runtime_lease(
+                "instance-a",
+                corrupt_channel,
+                &corrupt_event,
+                "@mention",
+                RunLane::User,
+                "human",
+                limits,
+                now_ms + 1,
+            )
+            .await?;
+        rusqlite::Connection::open(corrupt_path)?.execute(
+            "UPDATE turn_dispatch SET opaque_input_json='not-json' WHERE turn_id=(SELECT turn_id FROM turns WHERE client_nonce=?1)",
+            [corrupt_event.id.to_hex()],
+        )?;
+        let corrupt_authority = DurableAuthorityHandle {
+            adapter: corrupt_adapter.clone(),
+            instance_id: "instance-a".to_owned(),
+            shutdown_tx: watch::channel(()).0,
+            renewal_stop_tx: watch::channel(()).0,
+        };
+        eprintln!("ACP scheduler boundary: corrupt opaque input");
+        assert_scheduler_dispatch_keeps_legacy_queue_empty_and_provider_idle(
+            &corrupt_authority,
+            &HashSet::from([corrupt_channel]),
+            corrupt_channel,
+        )
+        .await?;
+        assert_eq!(
+            corrupt_adapter
+                .turn_for_event_id(corrupt_event.id.to_hex())
+                .await?
+                .map(|turn| turn.state),
+            Some(TurnState::Cancelled)
+        );
+
+        Ok(())
+    }
 }
 
 fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
@@ -3608,12 +6642,285 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
-/// Flush queued work to available agents.
-fn dispatch_pending(
+#[cfg(feature = "durable-turn-lifecycle")]
+fn scheduler_channel_block_reason(
+    channel_id: Uuid,
+    subscribed_channel_ids: &HashSet<Uuid>,
+    removed_channels: &HashSet<Uuid>,
+) -> Option<&'static str> {
+    if removed_channels.contains(&channel_id) {
+        Some("channel_removed_before_launch")
+    } else if !subscribed_channel_ids.contains(&channel_id) {
+        Some("channel_not_subscribed_before_launch")
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn cancel_scheduler_claim_for_inactive_channel(
+    authority: &DurableAuthorityHandle,
+    claim: &buzz_lifecycle::RunClaim,
+    channel_id: Uuid,
+    reason: &'static str,
+    occurred_at_ms: i64,
+) -> Result<()> {
+    use buzz_lifecycle::{TerminalUpdate, TurnState};
+
+    authority
+        .adapter
+        .finish_claim_for_runtime_lease(
+            authority.instance_id.clone(),
+            claim.identity.clone(),
+            TerminalUpdate {
+                state: TurnState::Cancelled,
+                result_digest: None,
+                payload: serde_json::json!({
+                    "adapter": "buzz-acp-scheduler",
+                    "reason": reason,
+                    "channelId": channel_id,
+                }),
+                occurred_at_ms,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn dispatch_scheduler_pending(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    last_activity: &mut tokio::time::Instant,
+    subscribed_channel_ids: &HashSet<Uuid>,
+    removed_channels: &HashSet<Uuid>,
+    authority: &DurableAuthorityHandle,
+) -> Result<Vec<(Uuid, ThreadTags)>> {
+    use buzz_lifecycle::RunClaimPhase;
+
+    // Reserve the provider slot before touching the durable scheduler. A claim
+    // therefore cannot exist merely because every provider is already busy.
+    let mut agent = match pool.try_claim(None) {
+        Some(agent) => agent,
+        None => return Ok(Vec::new()),
+    };
+    let execution_id = Uuid::new_v4().to_string();
+    let claim_result = authority
+        .adapter
+        .claim_next_for_runtime_lease(
+            authority.instance_id.clone(),
+            execution_id.clone(),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+    let claim = match claim_result {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            pool.return_agent(agent);
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            // `try_claim` removes the provider from the pool. Store/lease
+            // failures must not silently drop that checked-out process even
+            // though the caller will fail the scheduler runtime closed.
+            pool.return_agent(agent);
+            return Err(error.into());
+        }
+    };
+
+    let input = match authority.adapter.claimed_input(&claim) {
+        Ok(input) => input,
+        Err(error) => {
+            use buzz_lifecycle::{TerminalUpdate, TurnState};
+
+            pool.return_agent(agent);
+            authority
+                .adapter
+                .finish_claim_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    claim.identity,
+                    TerminalUpdate {
+                        state: TurnState::Cancelled,
+                        result_digest: None,
+                        payload: serde_json::json!({
+                            "adapter": "buzz-acp-scheduler",
+                            "reason": "invalid_opaque_input_quarantined",
+                        }),
+                        occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                )
+                .await?;
+            return Err(error.into());
+        }
+    };
+    let channel_id = input.channel_id;
+    let event_id = input.event.id.to_hex();
+    if let Some(reason) =
+        scheduler_channel_block_reason(channel_id, subscribed_channel_ids, removed_channels)
+    {
+        pool.return_agent(agent);
+        cancel_scheduler_claim_for_inactive_channel(
+            authority,
+            &claim,
+            channel_id,
+            reason,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?;
+        tracing::warn!(
+            %channel_id,
+            %event_id,
+            reason,
+            "scheduler claim cancelled before launch for inactive channel"
+        );
+        return Ok(Vec::new());
+    }
+    let typing_scope = queue::parse_thread_tags(&input.event);
+    let batch = FlushBatch {
+        channel_id,
+        events: vec![queue::BatchEvent {
+            event: input.event,
+            prompt_tag: input.prompt_tag,
+            received_at: std::time::Instant::now(),
+        }],
+        cancelled_events: Vec::new(),
+        cancel_reason: None,
+    };
+
+    let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
+    agent.acp.install_steer_rx(steer_rx);
+
+    // This is the last durable mutation before provider execution. If it
+    // fails, no task is spawned and the reserved provider is returned.
+    if let Err(error) = authority
+        .adapter
+        .mark_claim_launched_for_runtime_lease(
+            authority.instance_id.clone(),
+            claim.identity.clone(),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+    {
+        agent.acp.clear_steer_rx();
+        pool.return_agent(agent);
+        let release = authority
+            .adapter
+            .release_claim_to_waiting_for_runtime_lease(
+                authority.instance_id.clone(),
+                claim.identity,
+                claim.dispatch,
+                serde_json::json!({
+                    "adapter": "buzz-acp-scheduler",
+                    "reason": "pre_launch_fence_failed",
+                }),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await;
+        if let Err(release_error) = release {
+            return Err(anyhow::anyhow!(
+                "scheduler launch fence failed ({error}); reservation release also failed ({release_error})"
+            ));
+        }
+        return Err(error.into());
+    }
+
+    let result_tx = pool.result_tx();
+    let ctx_clone = Arc::clone(ctx);
+    let agent_index = agent.index;
+    let task_execution_id = execution_id.clone();
+    let task_claim = pool::SchedulerTaskClaim {
+        identity: claim.identity,
+        dispatch: claim.dispatch,
+        phase: RunClaimPhase::Launched,
+    };
+    let abort_handle = pool.join_set.spawn(async move {
+        pool::run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            ctx_clone,
+            result_tx,
+            Some(control_rx),
+            task_execution_id,
+        )
+        .await;
+    });
+    pool.task_map_mut().insert(
+        abort_handle.id(),
+        pool::TaskMeta {
+            agent_index,
+            channel_id: Some(channel_id),
+            turn_id: execution_id,
+            recoverable_batch: None,
+            control_tx: Some(control_tx),
+            steer_tx: Some(steer_tx),
+            successful_steer_deliveries: HashSet::new(),
+            scheduler_claim: Some(task_claim),
+        },
+    );
+    *last_activity = tokio::time::Instant::now();
+    tracing::debug!(agent = agent_index, %channel_id, %event_id, "scheduler task launched");
+    Ok(vec![(channel_id, typing_scope)])
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+struct SchedulerDispatchContext<'a> {
+    authority: Option<&'a DurableAuthorityHandle>,
+    subscribed_channel_ids: &'a HashSet<Uuid>,
+    removed_channels: &'a HashSet<Uuid>,
+}
+
+async fn dispatch_available(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
     last_activity: &mut tokio::time::Instant,
+    #[cfg(feature = "durable-turn-lifecycle")] scheduler: SchedulerDispatchContext<'_>,
+    #[cfg(feature = "durable-turn-lifecycle")] durable_shadow: Option<&DurableShadowHandle>,
+    #[cfg(feature = "durable-turn-lifecycle")] durable_authority: Option<&DurableAuthorityHandle>,
+) -> Vec<(Uuid, ThreadTags)> {
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if let Some(authority) = scheduler.authority {
+        return match dispatch_scheduler_pending(
+            pool,
+            ctx,
+            last_activity,
+            scheduler.subscribed_channel_ids,
+            scheduler.removed_channels,
+            authority,
+        )
+        .await
+        {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                tracing::error!(%error, "scheduler dispatch failed closed");
+                let _ = authority.shutdown_tx.send(());
+                Vec::new()
+            }
+        };
+    }
+    dispatch_pending(
+        pool,
+        queue,
+        ctx,
+        last_activity,
+        #[cfg(feature = "durable-turn-lifecycle")]
+        durable_shadow,
+        #[cfg(feature = "durable-turn-lifecycle")]
+        durable_authority,
+    )
+    .await
+}
+
+/// Flush queued work to available agents.
+async fn dispatch_pending(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    ctx: &Arc<PromptContext>,
+    last_activity: &mut tokio::time::Instant,
+    #[cfg(feature = "durable-turn-lifecycle")] durable_shadow: Option<&DurableShadowHandle>,
+    #[cfg(feature = "durable-turn-lifecycle")] durable_authority: Option<&DurableAuthorityHandle>,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     loop {
@@ -3668,6 +6975,49 @@ fn dispatch_pending(
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
 
+        #[cfg(feature = "durable-turn-lifecycle")]
+        let event_ids: Vec<String> = batch
+            .events
+            .iter()
+            .chain(batch.cancelled_events.iter())
+            .map(|event| event.event.id.to_hex())
+            .collect();
+
+        #[cfg(feature = "durable-turn-lifecycle")]
+        if let Some(authority) = durable_authority {
+            let bind_result = authority
+                .adapter
+                .bind_events_for_runtime_lease(
+                    authority.instance_id.clone(),
+                    event_ids.clone(),
+                    turn_id.clone(),
+                    serde_json::json!({"executionId": turn_id, "adapter": "buzz-acp-authoritative"}),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await;
+            if let Err(error) = bind_result {
+                tracing::error!(
+                    %error,
+                    channel_id = %channel_id,
+                    "durable bind failed before prompt spawn; batch requeued"
+                );
+                agent.acp.clear_steer_rx();
+                pool.return_agent(agent);
+                queue.requeue_preserve_timestamps(batch);
+                queue.mark_complete(channel_id);
+                let _ = authority.shutdown_tx.send(());
+                break;
+            }
+        }
+
+        #[cfg(feature = "durable-turn-lifecycle")]
+        if let Some(shadow) = durable_shadow {
+            shadow.submit(DurableShadowCommand::Bind {
+                execution_id: turn_id.clone(),
+                event_ids: event_ids.clone(),
+            });
+        }
+
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
                 agent,
@@ -3691,6 +7041,8 @@ fn dispatch_pending(
                 control_tx: Some(control_tx),
                 steer_tx,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         dispatched_channels.push((channel_id, typing_scope));
@@ -3757,6 +7109,52 @@ fn spawn_failure_notice(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn settle_scheduler_shutdown_result(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    result: PromptResult,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+    authority: &DurableAuthorityHandle,
+) -> Result<()> {
+    if let PromptSource::Channel(channel_id) = &result.source {
+        typing_channels.remove(channel_id);
+    }
+    let report = handle_prompt_result(
+        pool,
+        queue,
+        config,
+        result,
+        heartbeat_in_flight,
+        removed_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        rest_client,
+    );
+    apply_scheduler_result(authority, &report, chrono::Utc::now().timestamp_millis()).await
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+fn signal_scheduler_tasks_for_shutdown(pool: &mut AgentPool) -> usize {
+    pool.task_map_mut()
+        .values_mut()
+        .filter(|meta| meta.scheduler_claim.is_some())
+        .filter_map(|meta| meta.control_tx.take())
+        .map(|control_tx| usize::from(control_tx.send(ControlSignal::Cancel).is_ok()))
+        .sum()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -3769,15 +7167,44 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
-) -> LoopAction {
+) -> PromptResultReport {
+    let execution_id = result.turn_id.clone();
+    let triggering_event_ids = std::mem::take(&mut result.triggering_event_ids);
+    let result_digest = result.result_digest.take();
+    let visible_final_text = result.visible_final_text.take();
+    if let Some(visible_final) = visible_final_text.as_ref() {
+        tracing::debug!(
+            target: "pool::prompt",
+            bytes = visible_final.len(),
+            "captured harness-owned visible final text"
+        );
+    }
+    let mut disposition = match (&result.source, &result.outcome) {
+        (PromptSource::Heartbeat, _) => TurnAttemptDisposition::Heartbeat,
+        (PromptSource::Channel(_), PromptOutcome::Ok(_)) => TurnAttemptDisposition::Completed,
+        (PromptSource::Channel(_), PromptOutcome::Cancelled) => TurnAttemptDisposition::Cancelled,
+        (PromptSource::Channel(_), PromptOutcome::CancelDrainTimeout(_)) => {
+            TurnAttemptDisposition::Cancelled
+        }
+        (PromptSource::Channel(_), _) => TurnAttemptDisposition::Failed,
+    };
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
-    let successful_steer_deliveries = pool
+    let task_meta = pool
         .task_map()
         .values()
-        .find(|meta| meta.agent_index == agent_index)
+        .find(|meta| meta.agent_index == agent_index);
+    let successful_steer_deliveries = task_meta
         .map(|meta| meta.successful_steer_deliveries.clone())
         .unwrap_or_default();
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let scheduler_claim = task_meta.and_then(|meta| meta.scheduler_claim.clone());
+    #[cfg(feature = "durable-turn-lifecycle")]
+    if scheduler_claim.is_some() {
+        // Scheduler retries are durable claim transitions. Never let the
+        // legacy EventQueue observe or requeue this batch.
+        result.batch = None;
+    }
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -3805,6 +7232,8 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    #[cfg(feature = "durable-turn-lifecycle")]
+    let mut durable_retry_plan = None;
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -3812,6 +7241,14 @@ fn handle_prompt_result(
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
     if let Some(batch) = result.batch.take() {
+        #[cfg(feature = "durable-turn-lifecycle")]
+        let durable_channel_id = batch.channel_id;
+        #[cfg(feature = "durable-turn-lifecycle")]
+        let durable_prompt_tag = batch
+            .events
+            .last()
+            .or_else(|| batch.cancelled_events.last())
+            .map_or_else(|| "@mention".to_owned(), |event| event.prompt_tag.clone());
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
@@ -3835,6 +7272,20 @@ fn handle_prompt_result(
                 // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
+                disposition = TurnAttemptDisposition::AwaitingMergedRetry;
+                #[cfg(feature = "durable-turn-lifecycle")]
+                {
+                    let (retry_count, delay) = queue.retry_schedule(durable_channel_id);
+                    durable_retry_plan = Some(DurableRetryPlan {
+                        prompt_tag: durable_prompt_tag.clone(),
+                        mode: match reason {
+                            CancelReason::Steer => DurableRetryMode::MergedSteer,
+                            CancelReason::Interrupt => DurableRetryMode::MergedInterrupt,
+                        },
+                        retry_count,
+                        delay,
+                    });
+                }
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3853,6 +7304,7 @@ fn handle_prompt_result(
                 );
                 spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
+                disposition = TurnAttemptDisposition::Failed;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3871,8 +7323,20 @@ fn handle_prompt_result(
                     );
                     spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
+                    disposition = TurnAttemptDisposition::Failed;
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
+                    disposition = TurnAttemptDisposition::RetryScheduled;
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    {
+                        let (retry_count, delay) = queue.retry_schedule(durable_channel_id);
+                        durable_retry_plan = Some(DurableRetryPlan {
+                            prompt_tag: durable_prompt_tag.clone(),
+                            mode: DurableRetryMode::Retry,
+                            retry_count,
+                            delay,
+                        });
+                    }
                 }
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -3889,6 +7353,7 @@ fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
+                disposition = TurnAttemptDisposition::Failed;
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -3896,13 +7361,26 @@ fn handle_prompt_result(
                         "the turn exceeded the maximum duration".to_string()
                     }
                     PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                    PromptOutcome::Error(e) => format!("{e}"),
+                    PromptOutcome::Error(e) => safe_acp_error(e).operator_copy.to_owned(),
                     _ => "repeated failures".to_string(),
                 };
                 let content = format!(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
                 spawn_failure_notice(rest_client, &dead, content);
+                disposition = TurnAttemptDisposition::Failed;
+            } else {
+                disposition = TurnAttemptDisposition::RetryScheduled;
+                #[cfg(feature = "durable-turn-lifecycle")]
+                {
+                    let (retry_count, delay) = queue.retry_schedule(durable_channel_id);
+                    durable_retry_plan = Some(DurableRetryPlan {
+                        prompt_tag: durable_prompt_tag,
+                        mode: DurableRetryMode::Retry,
+                        retry_count,
+                        delay,
+                    });
+                }
             }
         } else {
             tracing::debug!(
@@ -3911,6 +7389,7 @@ fn handle_prompt_result(
                 "dropping failed batch for removed channel"
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
+            disposition = TurnAttemptDisposition::Dropped;
         }
     }
 
@@ -3955,10 +7434,11 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
-    let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
+    let emit_turn_error = |error_kind: &'static str, error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
             let mut payload = serde_json::json!({
                 "outcome": outcome_label,
+                "errorKind": error_kind,
                 "error": error_msg,
             });
             if let Some(code) = error_code {
@@ -4006,7 +7486,7 @@ fn handle_prompt_result(
                 }
                 _ => "Agent session timed out due to inactivity".to_string(),
             };
-            emit_turn_error(&death_message, None);
+            emit_turn_error(outcome_label, &death_message, None);
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
@@ -4021,7 +7501,23 @@ fn handle_prompt_result(
                 // Circuit open — slot stays empty until maintenance refill.
                 if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                     tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
+                    return attach_retry_plan(
+                        PromptResultReport::new(
+                            LoopAction::Exit,
+                            execution_id,
+                            triggering_event_ids,
+                            result_digest,
+                            disposition,
+                        ),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        durable_retry_plan.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        visible_final_text.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        config.capture_visible_final,
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        scheduler_claim.clone(),
+                    );
                 }
             }
         }
@@ -4046,7 +7542,7 @@ fn handle_prompt_result(
             let death_message = format!(
                 "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
             );
-            emit_turn_error(&death_message, None);
+            emit_turn_error(outcome_label, &death_message, None);
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
@@ -4061,7 +7557,23 @@ fn handle_prompt_result(
                 // Circuit open — slot stays empty until maintenance refill.
                 if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                     tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
+                    return attach_retry_plan(
+                        PromptResultReport::new(
+                            LoopAction::Exit,
+                            execution_id,
+                            triggering_event_ids,
+                            result_digest,
+                            disposition,
+                        ),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        durable_retry_plan.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        visible_final_text.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        config.capture_visible_final,
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        scheduler_claim.clone(),
+                    );
                 }
             }
         }
@@ -4081,6 +7593,59 @@ fn handle_prompt_result(
         // via requeue_as_cancelled() above and will be merged into the next
         // FlushBatch by flush_next().
         PromptOutcome::Cancelled => {
+            if config.credential_mode == config::CredentialMode::BrokerV1 {
+                tracing::info!(
+                    agent = agent_index,
+                    "broker-v1 cancellation rotates the ACP process capability"
+                );
+                let index = result.agent.index;
+                let slot_history = &mut crash_history[index];
+                if !spawn_respawn_task(
+                    result.agent,
+                    config,
+                    slot_history,
+                    respawn_tx,
+                    respawn_tasks,
+                    observer,
+                ) && pool.live_count() == 0
+                    && !any_respawn_in_flight(crash_history)
+                {
+                    return attach_retry_plan(
+                        PromptResultReport::new(
+                            LoopAction::Exit,
+                            execution_id,
+                            triggering_event_ids,
+                            result_digest,
+                            disposition,
+                        ),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        durable_retry_plan.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        visible_final_text.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        config.capture_visible_final,
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        scheduler_claim.clone(),
+                    );
+                }
+                return attach_retry_plan(
+                    PromptResultReport::new(
+                        LoopAction::Continue,
+                        execution_id,
+                        triggering_event_ids,
+                        result_digest,
+                        disposition,
+                    ),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    durable_retry_plan,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    visible_final_text,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    config.capture_visible_final,
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    scheduler_claim,
+                );
+            }
             tracing::debug!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -4091,6 +7656,7 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
+            let safe = safe_acp_error(e);
             let is_transport_error = matches!(
                 e,
                 acp::AcpError::Io(_)
@@ -4098,20 +7664,17 @@ fn handle_prompt_result(
                     | acp::AcpError::Timeout(_)
                     | acp::AcpError::Protocol(_)
             );
-            let error_code = match &e {
-                acp::AcpError::AgentError { code, .. } => Some(*code),
-                _ => None,
-            };
             if is_transport_error {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
-                    error = %e,
+                    errorKind = safe.kind,
+                    errorCode = ?safe.code,
                     "transport/protocol error — respawning agent"
                 );
-                emit_turn_error(&e.to_string(), error_code);
+                emit_turn_error(safe.kind, safe.operator_copy, safe.code);
 
                 let index = result.agent.index;
                 let slot_history = &mut crash_history[index];
@@ -4126,7 +7689,23 @@ fn handle_prompt_result(
                     && !any_respawn_in_flight(crash_history)
                 {
                     tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
+                    return attach_retry_plan(
+                        PromptResultReport::new(
+                            LoopAction::Exit,
+                            execution_id,
+                            triggering_event_ids,
+                            result_digest,
+                            disposition,
+                        ),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        durable_retry_plan.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        visible_final_text.clone(),
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        config.capture_visible_final,
+                        #[cfg(feature = "durable-turn-lifecycle")]
+                        scheduler_claim.clone(),
+                    );
                 }
             } else {
                 tracing::warn!(
@@ -4134,15 +7713,32 @@ fn handle_prompt_result(
                     outcome = outcome_label,
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
-                    error = %e,
+                    errorKind = safe.kind,
+                    errorCode = ?safe.code,
                     "agent_returned (application error — pipe intact)"
                 );
-                emit_turn_error(&e.to_string(), error_code);
+                emit_turn_error(safe.kind, safe.operator_copy, safe.code);
                 pool.return_agent(result.agent);
             }
         }
     }
-    LoopAction::Continue
+    attach_retry_plan(
+        PromptResultReport::new(
+            LoopAction::Continue,
+            execution_id,
+            triggering_event_ids,
+            result_digest,
+            disposition,
+        ),
+        #[cfg(feature = "durable-turn-lifecycle")]
+        durable_retry_plan,
+        #[cfg(feature = "durable-turn-lifecycle")]
+        visible_final_text,
+        #[cfg(feature = "durable-turn-lifecycle")]
+        config.capture_visible_final,
+        #[cfg(feature = "durable-turn-lifecycle")]
+        scheduler_claim,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4158,12 +7754,13 @@ fn recover_panicked_agent(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) {
+) -> Option<String> {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
         tracing::error!("panic for unknown task {task_id:?} — bug");
-        return;
+        return None;
     };
+    let durable_execution_id = meta.channel_id.map(|_| meta.turn_id.clone());
     let i = meta.agent_index;
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
@@ -4192,6 +7789,11 @@ fn recover_panicked_agent(
         tracing::warn!("cleared wedged heartbeat_in_flight from panicked agent {i}");
     }
 
+    let (panic_kind, panic_copy) = if join_error.is_cancelled() {
+        ("task_cancelled", "Agent task was cancelled")
+    } else {
+        ("task_panic", "Agent task panicked")
+    };
     if let Some(ref observer) = observer {
         observer.emit(
             "agent_panic",
@@ -4199,7 +7801,8 @@ fn recover_panicked_agent(
             &observer::context_for(meta.channel_id, None, Some(meta.turn_id)),
             serde_json::json!({
                 "outcome": "panic",
-                "error": format!("Agent task panicked: {join_error}"),
+                "errorKind": panic_kind,
+                "error": panic_copy,
             }),
         );
     }
@@ -4212,7 +7815,7 @@ fn recover_panicked_agent(
     let delay = match slot.record_crash() {
         CrashVerdict::CircuitOpen => {
             tracing::error!(agent = i, "circuit open after panic — not respawning");
-            return;
+            return durable_execution_id;
         }
         CrashVerdict::HalfOpenProbe => {
             tracing::info!(agent = i, "circuit half-open — probe respawn after panic");
@@ -4234,18 +7837,95 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    #[cfg(feature = "signing-capability-broker")]
+    let broker_spawner = config.broker_spawner.clone();
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            i,
+            observer,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner,
+        )
+        .await;
         guard.send(result);
     });
+    durable_execution_id
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn fail_authoritative_panic(
+    authority: &DurableAuthorityHandle,
+    execution_id: &str,
+) -> Result<()> {
+    use buzz_lifecycle::{TerminalUpdate, TurnState};
+    use sha2::{Digest, Sha256};
+
+    let result_digest = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(b"buzz-acp:prompt-task-panicked"))
+    );
+    authority
+        .adapter
+        .mark_execution_terminal_for_runtime_lease(
+            authority.instance_id.clone(),
+            execution_id,
+            TerminalUpdate {
+                state: TurnState::Failed,
+                result_digest: Some(result_digest),
+                payload: serde_json::json!({
+                    "executionId": execution_id,
+                    "disposition": "PromptTaskPanicked",
+                    "adapter": "buzz-acp-authoritative",
+                }),
+                occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(feature = "durable-turn-lifecycle")]
+async fn fail_scheduler_panic(
+    authority: &DurableAuthorityHandle,
+    claim: &pool::SchedulerTaskClaim,
+) -> Result<()> {
+    use buzz_lifecycle::{TerminalUpdate, TurnState};
+    use sha2::{Digest, Sha256};
+
+    let result_digest = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(b"buzz-acp:scheduler-prompt-task-panicked"))
+    );
+    authority
+        .adapter
+        .finish_claim_for_runtime_lease(
+            authority.instance_id.clone(),
+            claim.identity.clone(),
+            TerminalUpdate {
+                state: TurnState::Failed,
+                result_digest: Some(result_digest),
+                payload: serde_json::json!({
+                    "executionId": claim.identity.execution_id,
+                    "disposition": "PromptTaskPanicked",
+                    "adapter": "buzz-acp-scheduler",
+                }),
+                occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_ready_join_results(
+async fn drain_ready_join_results(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -4256,11 +7936,21 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    #[cfg(feature = "durable-turn-lifecycle")] durable_authority: Option<&DurableAuthorityHandle>,
+    #[cfg(feature = "durable-turn-lifecycle")] durable_scheduler: Option<&DurableAuthorityHandle>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
-            tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            tracing::error!(
+                taskCancelled = join_error.is_cancelled(),
+                "agent task failed during shutdown"
+            );
+            #[cfg(feature = "durable-turn-lifecycle")]
+            let scheduler_panic_claim = pool
+                .task_map()
+                .get(&join_error.id())
+                .and_then(|meta| meta.scheduler_claim.clone());
+            let _panic_execution_id = recover_panicked_agent(
                 pool,
                 queue,
                 config,
@@ -4273,6 +7963,28 @@ fn drain_ready_join_results(
                 respawn_tasks,
                 observer.clone(),
             );
+            #[cfg(feature = "durable-turn-lifecycle")]
+            if let Some(scheduler) = durable_scheduler {
+                if let Some(claim) = scheduler_panic_claim.as_ref() {
+                    if let Err(error) = fail_scheduler_panic(scheduler, claim).await {
+                        tracing::error!(%error, "scheduler prompt panic could not be durably failed");
+                    }
+                }
+                let _ = scheduler.shutdown_tx.send(());
+                return LoopAction::Exit;
+            } else if let Some(authority) = durable_authority {
+                if let Some(execution_id) = _panic_execution_id.as_deref() {
+                    if let Err(error) = fail_authoritative_panic(authority, execution_id).await {
+                        tracing::error!(
+                            %error,
+                            %execution_id,
+                            "prompt panic could not be durably failed"
+                        );
+                    }
+                }
+                let _ = authority.shutdown_tx.send(());
+                return LoopAction::Exit;
+            }
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                 return LoopAction::Exit;
             }
@@ -4327,6 +8039,8 @@ fn dispatch_heartbeat(
             control_tx: None,
             steer_tx: None,
             successful_steer_deliveries: HashSet::new(),
+            #[cfg(feature = "durable-turn-lifecycle")]
+            scheduler_claim: None,
         },
     );
     *heartbeat_in_flight = true;
@@ -4429,6 +8143,8 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    #[cfg(feature = "signing-capability-broker")]
+    let broker_spawner = config.broker_spawner.clone();
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -4440,7 +8156,17 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            index,
+            observer,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -4486,6 +8212,8 @@ struct PoolStartup {
     has_generated_codex_config: bool,
     model: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    #[cfg(feature = "signing-capability-broker")]
+    broker_spawner: Option<capability_broker::BrokerChildSpawner>,
 }
 
 impl PoolStartup {
@@ -4498,8 +8226,36 @@ impl PoolStartup {
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner: config.broker_spawner.clone(),
         }
     }
+}
+
+async fn spawn_pool_client(startup: &PoolStartup) -> Result<AcpClient> {
+    #[cfg(feature = "signing-capability-broker")]
+    if let Some(spawner) = &startup.broker_spawner {
+        let capability = spawner
+            .issue()
+            .map_err(|error| anyhow::anyhow!("broker-v1 capability issue failed: {error}"))?;
+        return AcpClient::spawn_with_process_capability(
+            &startup.command,
+            &startup.args,
+            &startup.extra_env,
+            startup.has_generated_codex_config,
+            capability,
+        )
+        .await
+        .map_err(anyhow::Error::from);
+    }
+    AcpClient::spawn(
+        &startup.command,
+        &startup.args,
+        &startup.extra_env,
+        startup.has_generated_codex_config,
+    )
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 async fn initialize_agent_pool(
@@ -4510,13 +8266,7 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn(
-            &startup.command,
-            &startup.args,
-            &startup.extra_env,
-            startup.has_generated_codex_config,
-        )
-        .await;
+        let spawn_result = spawn_pool_client(startup).await;
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
@@ -4617,10 +8367,40 @@ async fn spawn_and_init(
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
+    #[cfg(feature = "signing-capability-broker")] broker_spawner: Option<
+        capability_broker::BrokerChildSpawner,
+    >,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
+    #[cfg(feature = "signing-capability-broker")]
+    let spawn = async {
+        if let Some(spawner) = broker_spawner {
+            let capability = spawner
+                .issue()
+                .map_err(|error| anyhow::anyhow!("broker-v1 capability issue failed: {error}"))?;
+            AcpClient::spawn_with_process_capability(
+                command,
+                args,
+                extra_env,
+                has_generated_codex_config,
+                capability,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        } else {
+            AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+    };
+    #[cfg(not(feature = "signing-capability-broker"))]
+    let spawn = async {
+        AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let mut acp = spawn
         .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to spawn agent: {error}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -4916,31 +8696,40 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         command: config.mcp_command.clone(),
         args: vec![],
         env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
-                    // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
-                    value: config
-                        .keys
-                        .secret_key()
-                        .to_bech32()
-                        .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
+            let mut env = if config.credential_mode == config::CredentialMode::BrokerV1 {
+                vec![EnvVar {
+                    name: "BUZZ_CREDENTIAL_MODE".into(),
+                    value: "broker-v1".into(),
+                }]
+            } else {
+                vec![
+                    EnvVar {
+                        name: "BUZZ_RELAY_URL".into(),
+                        value: config.relay_url.clone(),
+                    },
+                    EnvVar {
+                        name: "BUZZ_PRIVATE_KEY".into(),
+                        // bech32 encoding of a valid secret key is infallible.
+                        // Panic here is correct: injecting a bogus secret would cause
+                        // delayed, hard-to-diagnose agent failures downstream.
+                        value: config
+                            .keys
+                            .secret_key()
+                            .to_bech32()
+                            .expect("secret key bech32 encoding should never fail"),
+                    },
+                ]
+            };
             // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
             // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
+            if config.credential_mode == config::CredentialMode::LegacyEnv {
+                if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+                    if !auth_tag.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_AUTH_TAG".into(),
+                            value: auth_tag,
+                        });
+                    }
                 }
             }
             // Forward the agent's display name so dev-mcp can use it as the git
@@ -5105,6 +8894,8 @@ mod owner_control_command_tests {
                 control_tx: Some(control_tx),
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
 
@@ -5249,6 +9040,31 @@ mod author_gate_tests {
             )
             .await,
             "the owner must always be accepted under Allowlist"
+        );
+    }
+
+    #[cfg(feature = "durable-turn-lifecycle")]
+    #[tokio::test]
+    async fn scheduler_classifies_only_humans_and_verified_siblings() {
+        use buzz_lifecycle::RunLane;
+
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        assert_eq!(
+            scheduler_lane_for_author(OWNER, &allowlist, &cache, &dummy_rest_client()).await,
+            Some((RunLane::User, "human"))
+        );
+        assert_eq!(
+            scheduler_lane_for_author(EXTERNAL, &allowlist, &cache, &dummy_rest_client()).await,
+            Some((RunLane::User, "human"))
+        );
+        assert_eq!(
+            scheduler_lane_for_author(SIBLING, &allowlist, &cache, &dummy_rest_client()).await,
+            Some((RunLane::Agent, "sibling"))
+        );
+        assert_eq!(
+            scheduler_lane_for_author(STRANGER, &allowlist, &cache, &dummy_rest_client()).await,
+            None
         );
     }
 
@@ -6575,6 +10391,9 @@ mod build_mcp_servers_tests {
 
     fn test_config() -> Config {
         Config {
+            credential_mode: config::CredentialMode::LegacyEnv,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -6617,6 +10436,7 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            capture_visible_final: false,
         }
     }
 
@@ -6637,6 +10457,35 @@ mod build_mcp_servers_tests {
             names.contains(&"BUZZ_PRIVATE_KEY"),
             "missing BUZZ_PRIVATE_KEY; got {names:?}"
         );
+    }
+
+    #[test]
+    fn broker_mcp_base_projection_contains_no_long_lived_credentials() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_AUTH_TAG", "AUTH_TAG_CANARY_NEVER_PROJECT");
+        let mut config = test_config();
+        config.credential_mode = config::CredentialMode::BrokerV1;
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_AUTH_TAG");
+
+        let environment = &servers[0].env;
+        assert_eq!(
+            environment
+                .iter()
+                .find(|entry| entry.name == "BUZZ_CREDENTIAL_MODE")
+                .map(|entry| entry.value.as_str()),
+            Some("broker-v1")
+        );
+        for forbidden in [
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_ACP_PRIVATE_KEY",
+            "NOSTR_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+        ] {
+            assert!(environment.iter().all(|entry| entry.name != forbidden));
+        }
+        let serialized = serde_json::to_string(&servers).expect("serialize MCP projection");
+        assert!(!serialized.contains("AUTH_TAG_CANARY_NEVER_PROJECT"));
     }
 
     #[test]
@@ -6795,6 +10644,9 @@ mod error_outcome_emission_tests {
 
     fn test_config() -> Config {
         Config {
+            credential_mode: config::CredentialMode::LegacyEnv,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_spawner: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             // `true` exits cleanly, so the async respawn fails fast and
@@ -6840,6 +10692,7 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            capture_visible_final: false,
         }
     }
 
@@ -6911,6 +10764,8 @@ mod error_outcome_emission_tests {
                         session_id: "live-session".into(),
                     },
                 ]),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
 
@@ -6929,11 +10784,14 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
+            triggering_event_ids: vec!["input-event-id".into()],
+            result_digest: Some("sha256:test-output".into()),
+            visible_final_text: None,
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
         };
 
-        handle_prompt_result(
+        let report = handle_prompt_result(
             &mut pool,
             &mut queue,
             &config,
@@ -6946,6 +10804,12 @@ mod error_outcome_emission_tests {
             None,
             None,
         );
+
+        assert_eq!(report.action, LoopAction::Continue);
+        assert_eq!(report.execution_id, "test-turn-id");
+        assert_eq!(report.triggering_event_ids, ["input-event-id"]);
+        assert_eq!(report.result_digest.as_deref(), Some("sha256:test-output"));
+        assert_eq!(report.disposition, TurnAttemptDisposition::Completed);
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
         assert!(returned.state.deliveries[&channel_id]
@@ -6983,6 +10847,8 @@ mod error_outcome_emission_tests {
                         session_id: "old-session".into(),
                     },
                 ]),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
 
@@ -7001,6 +10867,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
         };
@@ -7098,6 +10967,8 @@ mod error_outcome_emission_tests {
                         session_id: "invalidated-session".into(),
                     },
                 ]),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7115,6 +10986,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".into(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
         };
@@ -7137,9 +11011,9 @@ mod error_outcome_emission_tests {
         assert!(!returned.state.deliveries.contains_key(&channel_id));
     }
 
-    /// Drive one error outcome through `handle_prompt_result` and return how
-    /// many `turn_error` events it emitted to the observer feed.
-    async fn turn_errors_emitted_for(outcome: PromptOutcome) -> usize {
+    /// Drive one error outcome through `handle_prompt_result` and return its
+    /// content-safe `turn_error` observer events.
+    async fn turn_error_events_for(outcome: PromptOutcome) -> Vec<observer::ObserverEvent> {
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
 
@@ -7158,6 +11032,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
 
@@ -7178,6 +11054,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome,
             batch: None,
         };
@@ -7207,7 +11086,49 @@ mod error_outcome_emission_tests {
                 .all(|event| event.turn_id.as_deref() == Some("test-turn-id")),
             "turn_error must retain the completed turn id"
         );
-        turn_errors.len()
+        turn_errors
+    }
+
+    async fn turn_errors_emitted_for(outcome: PromptOutcome) -> usize {
+        turn_error_events_for(outcome).await.len()
+    }
+
+    #[tokio::test]
+    async fn agent_error_observer_and_digest_never_include_agent_controlled_detail() {
+        const MESSAGE_SECRET: &str = "AGENT_ERROR_MESSAGE_SECRET_CANARY_d0a9cf";
+        const DATA_SECRET: &str = "AGENT_ERROR_DATA_SECRET_CANARY_7b56be";
+        let message =
+            format!("provider rejected request: {MESSAGE_SECRET}; data={{secret:{DATA_SECRET}}}");
+        let outcome = PromptOutcome::Error(acp::AcpError::AgentError {
+            code: -32077,
+            message,
+        });
+        let digest = pool::digest_attempt_outcome(&outcome).expect("error outcome has digest");
+        let events = turn_error_events_for(outcome).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["errorKind"], "agent_error");
+        assert_eq!(
+            events[0].payload["error"],
+            "Agent reported an application error"
+        );
+        assert_eq!(events[0].payload["code"], -32077);
+
+        let serialized = serde_json::to_string(&events).expect("turn errors serialize");
+        let diagnostic = format!(
+            "{digest:?}{:?}",
+            safe_acp_error(&acp::AcpError::AgentError {
+                code: -32077,
+                message: format!("{MESSAGE_SECRET}{DATA_SECRET}"),
+            })
+        );
+        for canary in [MESSAGE_SECRET, DATA_SECRET] {
+            assert!(!serialized.contains(canary), "observer leaked {canary}");
+            assert!(!digest.contains(canary), "digest material leaked {canary}");
+            assert!(
+                !diagnostic.contains(canary),
+                "safe diagnostic projection leaked {canary}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7235,6 +11156,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         started_rx.await.unwrap();
@@ -7255,7 +11178,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
 
-        recover_panicked_agent(
+        let _ = recover_panicked_agent(
             &mut pool,
             &mut queue,
             &config,
@@ -7279,6 +11202,14 @@ mod error_outcome_emission_tests {
             Some(channel_id.to_string().as_str())
         );
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+        assert_eq!(panic.payload["errorKind"], "task_cancelled");
+        assert_eq!(panic.payload["error"], "Agent task was cancelled");
+        assert!(
+            !serde_json::to_string(&panic)
+                .expect("panic event serializes")
+                .contains("JoinError"),
+            "panic observer payload must not include raw JoinError detail"
+        );
     }
 
     #[tokio::test]
@@ -7328,6 +11259,8 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     successful_steer_deliveries: HashSet::new(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    scheduler_claim: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7346,6 +11279,9 @@ mod error_outcome_emission_tests {
                 agent,
                 source: PromptSource::Channel(Uuid::new_v4()),
                 turn_id: "test-turn-id".to_string(),
+                triggering_event_ids: Vec::new(),
+                result_digest: None,
+                visible_final_text: None,
                 outcome,
                 batch: None,
             };
@@ -7420,6 +11356,8 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     successful_steer_deliveries: HashSet::new(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    scheduler_claim: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7437,6 +11375,9 @@ mod error_outcome_emission_tests {
                 agent,
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
+                triggering_event_ids: Vec::new(),
+                result_digest: None,
+                visible_final_text: None,
                 outcome,
                 batch: Some(batch),
             };
@@ -7526,6 +11467,8 @@ mod error_outcome_emission_tests {
                     control_tx: None,
                     steer_tx: None,
                     successful_steer_deliveries: HashSet::new(),
+                    #[cfg(feature = "durable-turn-lifecycle")]
+                    scheduler_claim: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7543,6 +11486,9 @@ mod error_outcome_emission_tests {
                 agent,
                 source: PromptSource::Channel(channel_id),
                 turn_id: "test-turn-id".to_string(),
+                triggering_event_ids: Vec::new(),
+                result_digest: None,
+                visible_final_text: None,
                 outcome,
                 batch: Some(batch),
             };
@@ -7603,6 +11549,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7629,16 +11577,20 @@ mod error_outcome_emission_tests {
             cancelled_events: vec![],
             cancel_reason: None,
         };
+        let input_event_id = batch.events[0].event.id.to_hex();
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: vec![input_event_id.clone()],
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
             batch: Some(batch),
         };
-        handle_prompt_result(
+        let report = handle_prompt_result(
             &mut pool,
             &mut queue,
             &config,
@@ -7651,6 +11603,10 @@ mod error_outcome_emission_tests {
             Some(observer.clone()),
             None,
         );
+
+        assert_eq!(report.execution_id, "test-turn-id");
+        assert_eq!(report.triggering_event_ids, [input_event_id]);
+        assert_eq!(report.disposition, TurnAttemptDisposition::RetryScheduled);
 
         let events = observer.snapshot();
         let turn_error = events
@@ -7698,6 +11654,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let config = test_config();
@@ -7723,16 +11681,20 @@ mod error_outcome_emission_tests {
             cancelled_events: vec![],
             cancel_reason: None,
         };
+        let input_event_id = batch.events[0].event.id.to_hex();
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: vec![input_event_id.clone()],
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
             }),
             batch: Some(batch),
         };
-        handle_prompt_result(
+        let report = handle_prompt_result(
             &mut pool,
             &mut queue,
             &config,
@@ -7745,6 +11707,9 @@ mod error_outcome_emission_tests {
             Some(observer.clone()),
             None,
         );
+
+        assert_eq!(report.triggering_event_ids, [input_event_id]);
+        assert_eq!(report.disposition, TurnAttemptDisposition::Failed);
 
         let events = observer.snapshot();
         let turn_error = events
@@ -7815,6 +11780,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7844,6 +11811,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
         };
@@ -7955,6 +11925,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7974,6 +11946,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(Uuid::new_v4()),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             // Explicit Stop already dropped the batch upstream in
             // `classify_control_cancel_failure` — `handle_prompt_result`
@@ -8144,6 +12119,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -8161,6 +12138,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
         };
@@ -8230,6 +12210,8 @@ mod error_outcome_emission_tests {
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
+                #[cfg(feature = "durable-turn-lifecycle")]
+                scheduler_claim: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -8247,6 +12229,9 @@ mod error_outcome_emission_tests {
             agent,
             source: PromptSource::Channel(channel_id),
             turn_id: "test-turn-id".to_string(),
+            triggering_event_ids: Vec::new(),
+            result_digest: None,
+            visible_final_text: None,
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),
         };
@@ -8350,9 +12335,10 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_multi_block_prompt_retains_every_section_header_after_elision() {
-        // The real session/prompt fix: format_prompt now emits one block per
-        // section, so the observer payload is params.prompt = [{text: "[Base]…"},
-        // {text: "[Agent Memory — core]…"}, … {text: "[Buzz event: …]…<huge>"}].
+        // Prompt content now rides a dedicated semantic observer event rather
+        // than the redacted ACP wire projection. Each formatted section remains
+        // its own string leaf in `blocks`, so an oversized event body can be
+        // trimmed without erasing the headers of the other context sections.
         // An oversized section is its own leaf, so eliding its body keeps the
         // leaf's head-3000 (which begins with the section's [Header] line) — every
         // header survives, so the desktop "Prompt context" panel counts them all.
@@ -8367,18 +12353,12 @@ mod observer_payload_trim_tests {
             // The triggering event body, oversized on its own.
             format!("[Buzz event: @mention]\nContent: {}", "E".repeat(90_000)),
         ];
-        let block_refs: Vec<&str> = sections.iter().map(String::as_str).collect();
-        // Mirror the wire shape build_prompt_params produces: each block is its
-        // own {type:"text", text} leaf under params.prompt.
-        let prompt_blocks: Vec<serde_json::Value> = block_refs
-            .iter()
-            .map(|text| serde_json::json!({ "type": "text", "text": text }))
-            .collect();
         let mut event = event_with_payload(
-            "acp_write",
+            "transcript_prompt",
             serde_json::json!({
-                "method": "session/prompt",
-                "params": { "sessionId": "sess-1", "prompt": prompt_blocks },
+                "schemaVersion": 1,
+                "source": "session/prompt",
+                "blocks": sections,
             }),
         );
         assert!(
@@ -8392,10 +12372,10 @@ mod observer_payload_trim_tests {
             serialized(&event).len() <= OBSERVER_MAX_PLAINTEXT_LEN,
             "frame must fit after trimming"
         );
-        let blocks = event.payload["params"]["prompt"]
+        let blocks = event.payload["blocks"]
             .as_array()
             .expect("prompt array survives");
-        let texts: Vec<&str> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
+        let texts: Vec<&str> = blocks.iter().map(|block| block.as_str().unwrap()).collect();
         for header in [
             "[Base]",
             "[System]",

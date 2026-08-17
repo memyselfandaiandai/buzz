@@ -777,6 +777,27 @@ pub enum OpenAiApi {
     Auto,
 }
 
+/// Model-visible tool exposure policy.
+///
+/// `Full` preserves the existing behaviour. `Anchored` narrows only the first
+/// provider request in a new session to the qualified shell and read-file
+/// tools, then restores the complete catalog for every later round and turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExposure {
+    Full,
+    Anchored,
+}
+
+impl ToolExposure {
+    /// Stable configuration label used in structured telemetry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Anchored => "anchored",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: Provider,
@@ -815,6 +836,9 @@ pub struct Config {
     /// Set via `BUZZ_AGENT_MAX_HANDOFFS`. Default 10.
     pub max_handoffs: usize,
     pub max_parallel_tools: usize,
+    /// Model-visible tool catalog policy. Authorization and dispatch always
+    /// retain the complete registry. Set via `BUZZ_AGENT_TOOL_EXPOSURE`.
+    pub tool_exposure: ToolExposure,
     pub hook_timeout: Duration,
     /// Maximum `_Stop` rejections per prompt. Default 3. Set to 0 to
     /// disable `_Stop` hooks entirely (agent always honors end_turn).
@@ -961,6 +985,7 @@ impl Config {
             max_context_tokens: parse_env("BUZZ_AGENT_MAX_CONTEXT_TOKENS", 200_000u64)?,
             max_handoffs: parse_env("BUZZ_AGENT_MAX_HANDOFFS", 10)?,
             max_parallel_tools: parse_env("BUZZ_AGENT_MAX_PARALLEL_TOOLS", 8usize)?,
+            tool_exposure: parse_tool_exposure(env("BUZZ_AGENT_TOOL_EXPOSURE").as_deref())?,
             hook_timeout: Duration::from_millis(parse_env("BUZZ_AGENT_HOOK_TIMEOUT_MS", 2500u64)?),
             stop_max_rejections: parse_env("BUZZ_AGENT_STOP_MAX_REJECTIONS", 3u32)?,
             require_reply: parse_env("BUZZ_AGENT_REQUIRE_REPLY", 0u8)? != 0,
@@ -1022,6 +1047,7 @@ impl Config {
             max_context_tokens: 200_001,
             max_handoffs: 0,
             max_parallel_tools: 1,
+            tool_exposure: ToolExposure::Full,
             hook_timeout: Duration::from_secs(1),
             stop_max_rejections: 0,
             require_reply: false,
@@ -1177,6 +1203,18 @@ fn resolve_provider(
         None => Err(
             "config: BUZZ_AGENT_PROVIDER is required — set it to your provider (e.g. anthropic, openai, databricks)".into(),
         ),
+    }
+}
+
+/// Parse `BUZZ_AGENT_TOOL_EXPOSURE`. Pure (env-free) for testability.
+fn parse_tool_exposure(raw: Option<&str>) -> Result<ToolExposure, String> {
+    let raw = raw.unwrap_or("full").trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "full" | "" => Ok(ToolExposure::Full),
+        "anchored" => Ok(ToolExposure::Anchored),
+        _ => Err(format!(
+            "config: BUZZ_AGENT_TOOL_EXPOSURE={raw} not supported (use full|anchored)"
+        )),
     }
 }
 
@@ -1353,6 +1391,27 @@ fn parse_hook_servers(raw: Option<&str>) -> HookServers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_exposure_defaults_to_full() {
+        assert_eq!(parse_tool_exposure(None).unwrap(), ToolExposure::Full);
+        assert_eq!(parse_tool_exposure(Some("  ")).unwrap(), ToolExposure::Full);
+    }
+
+    #[test]
+    fn tool_exposure_accepts_anchored_case_insensitively() {
+        assert_eq!(
+            parse_tool_exposure(Some(" Anchored ")).unwrap(),
+            ToolExposure::Anchored
+        );
+    }
+
+    #[test]
+    fn tool_exposure_rejects_unknown_value_clearly() {
+        let err = parse_tool_exposure(Some("gradual")).unwrap_err();
+        assert!(err.contains("BUZZ_AGENT_TOOL_EXPOSURE=gradual"), "{err}");
+        assert!(err.contains("full|anchored"), "{err}");
+    }
 
     #[test]
     fn hook_servers_unset_is_none() {

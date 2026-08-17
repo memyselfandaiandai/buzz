@@ -30,7 +30,7 @@ pub async fn cmd_create_issue(
     let builder = with_git_provenance(
         buzz_sdk::build_git_issue(&repo, subject, &body, &meta).map_err(sdk_err)?,
     )?;
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let event_id = event.id.to_hex();
     let resp = client.submit_event(event).await?;
     // `link` renders as a rich preview card in Buzz Desktop when included in
@@ -146,7 +146,7 @@ pub async fn cmd_issue_status(
 
     let builder =
         with_git_provenance(buzz_sdk::build_git_status(status, &body, &meta).map_err(sdk_err)?)?;
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder).await?;
     let resp = client.submit_event(event).await?;
     println!("{resp}");
     Ok(())

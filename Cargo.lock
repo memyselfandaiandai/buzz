@@ -832,8 +832,10 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "buzz-core",
+ "buzz-lifecycle",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-signing-capability",
  "chrono",
  "clap",
  "evalexpr",
@@ -843,10 +845,12 @@ dependencies = [
  "nix 0.31.3",
  "nostr 0.44.7",
  "reqwest 0.13.4",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -856,6 +860,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -969,14 +974,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-capability-client"
+version = "0.1.0"
+dependencies = [
+ "buzz-signing-capability",
+ "nostr 0.44.7",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "buzz-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "buzz-capability-client",
  "buzz-core",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-signing-capability",
  "buzz-ws-client",
  "bytes",
  "chrono",
@@ -1115,8 +1136,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "buzz-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -1365,6 +1399,22 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "buzz-signing-capability"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
