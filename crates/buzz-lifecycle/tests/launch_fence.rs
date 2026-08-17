@@ -27,7 +27,9 @@ fn launch_fence_cancel_wins_over_concurrent_activate() {
 
     let cancelled = store.cancel_turn_with_fence(&inert.turn_id, 1_001).unwrap();
     match cancelled {
-        buzz_lifecycle::CancelOutcome::Cancelled(snap) => assert_eq!(snap.state, buzz_lifecycle::TurnState::Cancelled),
+        buzz_lifecycle::CancelOutcome::Cancelled(snap) => {
+            assert_eq!(snap.state, buzz_lifecycle::TurnState::Cancelled)
+        }
         other => panic!("cancel expected {other:?}"),
     }
 
@@ -50,7 +52,10 @@ fn launch_fence_cancel_wins_over_concurrent_activate() {
         .mint_activation_capability("owner-a", "agent-a", 1_010)
         .unwrap();
     let fence_before = store.get_launch_fence("owner-a", "agent-a").unwrap();
-    assert!(cap2.launch_epoch == fence_before.launch_epoch || cap2.launch_epoch > fence_before.launch_epoch - 1);
+    assert!(
+        cap2.launch_epoch == fence_before.launch_epoch
+            || cap2.launch_epoch > fence_before.launch_epoch - 1
+    );
     // strict monotonicity: capability epoch must be > previous fence epoch or equal to current fence (which already bumped)
     assert!(cap2.launch_epoch >= fence_before.launch_epoch);
 
@@ -66,10 +71,18 @@ fn launch_fence_cancel_wins_over_concurrent_activate() {
         .activate_with_capability(&inert2.turn_id, &cap2.capability_id, 3_001, 1_012)
         .unwrap();
     assert!(
-        matches!(act2_reuse, buzz_lifecycle::ActivationOutcome::AlreadyConsumed),
+        matches!(
+            act2_reuse,
+            buzz_lifecycle::ActivationOutcome::AlreadyConsumed
+        ),
         "single-use capability must be consumed, got {act2_reuse:?}"
     );
 
     let fence_after = store.get_launch_fence("owner-a", "agent-a").unwrap();
-    assert!(fence_after.launch_epoch > fence1.launch_epoch, "monotonic epoch: {:?} > {:?}", fence_after, fence1);
+    assert!(
+        fence_after.launch_epoch > fence1.launch_epoch,
+        "monotonic epoch: {:?} > {:?}",
+        fence_after,
+        fence1
+    );
 }

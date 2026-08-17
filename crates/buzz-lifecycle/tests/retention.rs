@@ -32,7 +32,9 @@ fn retention_caps_evict_oldest_terminal_with_ttl_and_size_and_never_block_admiss
             buzz_lifecycle::AdmissionOutcome::Accepted(t) => t.turn_id,
             other => panic!("admit {i} unexpected {other:?}"),
         };
-        store.mark_queued(&turn_id, serde_json::json!({"step":"q"}), t + 1).unwrap();
+        store
+            .mark_queued(&turn_id, serde_json::json!({"step":"q"}), t + 1)
+            .unwrap();
         store
             .mark_terminal(
                 &turn_id,
@@ -49,37 +51,65 @@ fn retention_caps_evict_oldest_terminal_with_ttl_and_size_and_never_block_admiss
     // Add one rejected (tombstone) well before cutoff — must be kept.
     {
         let tomb_req = common::request_at("nonce-tombstone", "digest-tomb", 0);
-        let outcome = store.reject_admission(&tomb_req, "policy", serde_json::json!({}), 0).unwrap();
+        let outcome = store
+            .reject_admission(&tomb_req, "policy", serde_json::json!({}), 0)
+            .unwrap();
         let snap = match outcome {
-            buzz_lifecycle::RejectionOutcome::Rejected(t) | buzz_lifecycle::RejectionOutcome::Duplicate(t) => t,
+            buzz_lifecycle::RejectionOutcome::Rejected(t)
+            | buzz_lifecycle::RejectionOutcome::Duplicate(t) => t,
         };
         assert_eq!(snap.state, TurnState::Rejected);
     }
 
     let usage_before = store.retention_usage("owner-a", "agent-a").unwrap();
-    assert!(usage_before.pruneable_count >= 8, "pruneable {}", usage_before.pruneable_count);
+    assert!(
+        usage_before.pruneable_count >= 8,
+        "pruneable {}",
+        usage_before.pruneable_count
+    );
     assert_eq!(usage_before.tombstone_count, 1);
 
     let now_ms = 20 * day_ms;
-    let enforced = store.enforce_retention("owner-a", "agent-a", now_ms).unwrap();
-    assert!(enforced.pruned >= 4, "pruned {} ttl_pruned {} size_pruned {}", enforced.pruned, enforced.ttl_pruned, enforced.size_pruned);
+    let enforced = store
+        .enforce_retention("owner-a", "agent-a", now_ms)
+        .unwrap();
+    assert!(
+        enforced.pruned >= 4,
+        "pruned {} ttl_pruned {} size_pruned {}",
+        enforced.pruned,
+        enforced.ttl_pruned,
+        enforced.size_pruned
+    );
     assert!(enforced.vacuumed, "should have vacuumed after pruning");
 
     let usage_after = store.retention_usage("owner-a", "agent-a").unwrap();
     assert_eq!(usage_after.tombstone_count, 1, "tombstone kept");
-    assert!(usage_after.pruneable_count <= 4, "remaining pruneable {}", usage_after.pruneable_count);
+    assert!(
+        usage_after.pruneable_count <= 4,
+        "remaining pruneable {}",
+        usage_after.pruneable_count
+    );
 
     let last = common::request_at("nonce-after", "digest-after", now_ms);
     let out = store.admit(&last).unwrap();
-    assert!(matches!(out, buzz_lifecycle::AdmissionOutcome::Accepted(_)), "admission after retention {out:?}");
+    assert!(
+        matches!(out, buzz_lifecycle::AdmissionOutcome::Accepted(_)),
+        "admission after retention {out:?}"
+    );
 
     for i in 100..120 {
-        let req = common::request_at(&format!("nonce-sz-{i}"), &format!("digest-sz-{i}"), now_ms + i);
+        let req = common::request_at(
+            &format!("nonce-sz-{i}"),
+            &format!("digest-sz-{i}"),
+            now_ms + i,
+        );
         let tid = match store.admit(&req).unwrap() {
             buzz_lifecycle::AdmissionOutcome::Accepted(t) => t.turn_id,
             _ => panic!(),
         };
-        store.mark_queued(&tid, serde_json::json!({}), now_ms + i + 1).unwrap();
+        store
+            .mark_queued(&tid, serde_json::json!({}), now_ms + i + 1)
+            .unwrap();
         store
             .mark_terminal(
                 &tid,
@@ -97,9 +127,17 @@ fn retention_caps_evict_oldest_terminal_with_ttl_and_size_and_never_block_admiss
         buzz_lifecycle::AdmissionOutcome::Accepted(t) => t.turn_id,
         _ => panic!(),
     };
-    store.mark_queued(&live_tid, serde_json::json!({}), now_ms + 1000).unwrap();
+    store
+        .mark_queued(&live_tid, serde_json::json!({}), now_ms + 1000)
+        .unwrap();
 
-    let _ = store.enforce_retention("owner-a", "agent-a", now_ms + 2000).unwrap();
+    let _ = store
+        .enforce_retention("owner-a", "agent-a", now_ms + 2000)
+        .unwrap();
     let live = store.turn(&live_tid).unwrap();
-    assert!(!live.state.is_terminal(), "live turn must not be evicted: {:?}", live.state);
+    assert!(
+        !live.state.is_terminal(),
+        "live turn must not be evicted: {:?}",
+        live.state
+    );
 }
