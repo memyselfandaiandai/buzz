@@ -542,6 +542,11 @@ impl BrokerState {
 pub(crate) struct CapabilityBroker {
     state: Arc<BrokerState>,
     address: SocketAddr,
+    /// Override for the IP advertised in issued endpoints. When set, the
+    /// broker advertises `ws://{advertised_ip}:{port}` instead of
+    /// `ws://127.0.0.1:{port}`, allowing Tailscale or other overlay networks
+    /// to reach the broker from remote workers without baked-in IP logic.
+    advertised_ip: Option<std::net::Ipv4Addr>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -551,6 +556,7 @@ impl fmt::Debug for CapabilityBroker {
         formatter
             .debug_struct("CapabilityBroker")
             .field("address", &self.address)
+            .field("advertised_ip", &self.advertised_ip)
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -564,18 +570,28 @@ impl CapabilityBroker {
     /// accepted TCP connection to WebSocket. The endpoint provider is
     /// responsible for making the port reachable over Tailscale or other
     /// remote transports.
+    ///
+    /// When Tailscale is installed and running, the broker automatically
+    /// discovers the Tailscale IPv4 address and uses it as the advertised
+    /// endpoint IP so that remote workers can reach the broker over the
+    /// Tailnet at `ws://100.x.y.z:<port>`. Set `BUZZ_ACP_BROKER_ADVERTISE_IP`
+    /// to override auto-discovery.
     pub(crate) async fn from_config(
         config: &Config,
         auth_tag_json: Option<&str>,
     ) -> Result<Self, BrokerError> {
         let relay = RelayOrigin::parse(&config.relay_url).map_err(|_| BrokerError::InvalidRelay)?;
-        Self::start(config.keys.clone(), relay, auth_tag_json).await
+        let advertised_ip = config
+            .broker_advertise_ip
+            .or_else(Self::discover_tailscale_ip);
+        Self::start(config.keys.clone(), relay, auth_tag_json, advertised_ip).await
     }
 
     async fn start(
         keys: Keys,
         relay: RelayOrigin,
         auth_tag_json: Option<&str>,
+        advertised_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<Self, BrokerError> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -597,9 +613,25 @@ impl CapabilityBroker {
         Ok(Self {
             state,
             address,
+            advertised_ip,
             shutdown_tx: Some(shutdown_tx),
             task,
         })
+    }
+
+    /// Attempt to discover the Tailscale IPv4 address by running
+    /// `tailscale ip -4`. Returns `None` when Tailscale is not installed,
+    /// not running, or the output is not a valid IPv4 address.
+    fn discover_tailscale_ip() -> Option<std::net::Ipv4Addr> {
+        let output = std::process::Command::new("tailscale")
+            .args(["ip", "-4"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let ip_str = std::str::from_utf8(&output.stdout).ok()?.trim();
+        ip_str.parse::<std::net::Ipv4Addr>().ok()
     }
 
     /// Issue one inactive capability for a session and return its only raw
@@ -658,7 +690,11 @@ impl CapabilityBroker {
             issued.descriptor.expires_at_unix_ms,
         );
         Ok(SessionCapabilityProjection {
-            endpoint: format!("ws://{}", self.address),
+            endpoint: format!(
+                "ws://{}:{}",
+                self.advertised_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+                self.address.port()
+            ),
             descriptor: issued.descriptor,
             token: issued.token,
             connect_timeout_ms: CONNECT_TIMEOUT.as_millis() as u64,
@@ -967,7 +1003,7 @@ mod tests {
     async fn broker(auth_tag: Option<&str>) -> (CapabilityBroker, Keys, RelayOrigin) {
         let keys = Keys::generate();
         let relay = RelayOrigin::parse(RELAY).expect("relay");
-        let broker = CapabilityBroker::start(keys.clone(), relay.clone(), auth_tag)
+        let broker = CapabilityBroker::start(keys.clone(), relay.clone(), auth_tag, None)
             .await
             .expect("start broker");
         (broker, keys, relay)
@@ -1089,7 +1125,7 @@ mod tests {
         let auth = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
             .expect("auth tag");
         let relay = RelayOrigin::parse(RELAY).expect("relay");
-        let broker = CapabilityBroker::start(agent.clone(), relay.clone(), Some(&auth))
+        let broker = CapabilityBroker::start(agent.clone(), relay.clone(), Some(&auth), None)
             .await
             .expect("broker");
         let session = Uuid::new_v4();
@@ -1179,7 +1215,7 @@ mod tests {
         let auth =
             buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "").expect("auth tag");
         let relay = RelayOrigin::parse(RELAY).expect("relay");
-        let broker = CapabilityBroker::start(agent.clone(), relay.clone(), Some(&auth))
+        let broker = CapabilityBroker::start(agent.clone(), relay.clone(), Some(&auth), None)
             .await
             .expect("broker");
         let session = Uuid::new_v4();

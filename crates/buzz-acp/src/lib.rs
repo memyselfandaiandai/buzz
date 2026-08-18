@@ -10621,6 +10621,8 @@ mod build_mcp_servers_tests {
             credential_mode: config::CredentialMode::LegacyEnv,
             #[cfg(feature = "signing-capability-broker")]
             broker_spawner: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_advertise_ip: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -10874,6 +10876,8 @@ mod error_outcome_emission_tests {
             credential_mode: config::CredentialMode::LegacyEnv,
             #[cfg(feature = "signing-capability-broker")]
             broker_spawner: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_advertise_ip: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             // `true` exits cleanly, so the async respawn fails fast and

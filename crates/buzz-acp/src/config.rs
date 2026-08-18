@@ -550,6 +550,14 @@ pub struct CliArgs {
     /// Requires `--lazy-pool`; ignored otherwise. 0 disables idle re-sleep.
     #[arg(long, env = "BUZZ_ACP_IDLE_POOL_SLEEP", default_value_t = 0)]
     pub idle_pool_sleep: u64,
+
+    /// Override the IP address advertised in broker-v1 capability endpoints.
+    /// When set, `issue_session` returns `ws://<broker_advertise_ip>:<port>`
+    /// instead of `ws://127.0.0.1:<port>`. Auto-detected from Tailscale when
+    /// unset.
+    #[cfg(feature = "signing-capability-broker")]
+    #[arg(long, env = "BUZZ_ACP_BROKER_ADVERTISE_IP")]
+    pub broker_advertise_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -568,6 +576,12 @@ pub struct Config {
     /// Runtime-only local broker process factory, installed after channel discovery.
     #[cfg(feature = "signing-capability-broker")]
     pub(crate) broker_spawner: Option<crate::capability_broker::BrokerChildSpawner>,
+    /// Override the IP address advertised in broker-v1 capability endpoints.
+    /// When set, `issue_session` returns `ws://<broker_advertise_ip>:<port>`
+    /// instead of `ws://127.0.0.1:<port>`. Auto-detected from Tailscale when
+    /// unset. Only effective when `signing-capability-broker` is enabled.
+    #[cfg(feature = "signing-capability-broker")]
+    pub broker_advertise_ip: Option<std::net::Ipv4Addr>,
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
@@ -1155,6 +1169,8 @@ impl Config {
             credential_mode,
             #[cfg(feature = "signing-capability-broker")]
             broker_spawner: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_advertise_ip: args.broker_advertise_ip,
             keys,
             relay_url: args.relay_url,
             agent_command,
@@ -1632,6 +1648,8 @@ mod tests {
             credential_mode: CredentialMode::LegacyEnv,
             #[cfg(feature = "signing-capability-broker")]
             broker_spawner: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_advertise_ip: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
