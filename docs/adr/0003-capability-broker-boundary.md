@@ -84,10 +84,10 @@ Before applying that projection, ACP removes inherited `BUZZ_PRIVATE_KEY`,
 `BUZZ_ACP_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_AUTH_TAG`, and every unrecognized
 `BUZZ_CAPABILITY_*` variable. Extra environment entries cannot override those
 reserved names. Endpoint and relay schemes, public-key shape, expiry, empty
-values, and control characters are validated before spawn. Local-v1 uses one
-bounded NDJSON request and response over an ephemeral
-`tcp://127.0.0.1:<nonzero-port>` connection; this loopback transport is not a
-remote security boundary.
+values, and control characters are validated before spawn. Local-v1 uses a single
+WebSocket request and response over an ephemeral
+`ws://127.0.0.1:<nonzero-port>` connection; WebSocket framing (tokio-tungstenite)
+replaces NDJSON. This loopback transport is not a remote security boundary.
 
 ### Local process-generation lifecycle
 
@@ -173,7 +173,7 @@ The completed local pilot provides:
 It does **not** provide:
 
 - service-authenticated remote transport or a separate signer process; local
-  raw TCP is loopback-only and bearer-token authenticated;
+  WebSocket is loopback-only and bearer-token authenticated;
 - a durable registry, audit log, restart-safe revocation ledger, or recovery
   protocol;
 - OS/process isolation from the harness, host administrator, debugger, or
@@ -288,12 +288,13 @@ them. Evidence lives in
 
 ### Locked invariants
 
-1. **Transport is Tailscale.** The broker's service-authenticated transport for
-   remote/Kubernetes workers is Tailnet-bound (ACL-gated, broker loopback-bound).
-   Dev Tailnet `100.117.196.100 <-> 100.125.42.122` proves the path. This locks
-   the `Local v1 and remote/Kubernetes isolation` placeholder
-   "for example a Tailscale- or mTLS-bound broker" — mTLS remains a fallback-only
-   note and does not reopen the choice.
+1. **Transport is WebSocket (tokio-tungstenite).** The broker binds localhost
+   (`127.0.0.1:0`) and upgrades each connection to WebSocket. Tailscale is an
+   **endpoint provider**, not baked into the transport — it makes the
+   local-broker port reachable at `ws://100.x.y.z:<port>` over the Tailnet.
+   The broker has no Tailscale code and no `is_tailscale_ipv4` / `100.x`
+   constant. This supersedes the earlier "Transport is Tailscale" draft.
+   mTLS remains a documented fallback if Tailnet is unavailable.
 
 2. **At-rest store is the same lifecycle SQLite WAL on the device persistent path.**
    `crates/buzz-lifecycle` SQLite WAL (`SCHEMA_VERSION 8`, `journal_mode=WAL`,
@@ -332,8 +333,9 @@ them. Evidence lives in
 
 ### Acceptance matrix update (remote-ready row deltas)
 
-- **Transport:** Remote row now reads "Tailscale Tailnet, ACL-gated" (locked above),
-  not "Tailscale- or mTLS-bound (to be decided)".
+- **Transport:** Remote row now reads **"WebSocket (tokio-tungstenite); Tailscale is
+  an endpoint provider that advertises the broker's 100.x address"** (locked above),
+  not "Tailscale Tailnet, ACL-gated" or "Tailscale- or mTLS-bound (to be decided)".
 - **At-rest / retention / compaction / backup:** Retention/compaction shape locked
   above; remaining gate narrows to **backup/restore verification + OS at-rest encryption proof per target**.
 - **Cancellation/launch:** Local `cancel-wins` fence locked in v8 above; remaining gate narrows to **wiring the fence through the real remote provider launch** and its installed-runtime test.

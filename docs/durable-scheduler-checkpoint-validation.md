@@ -208,14 +208,14 @@ launch-fence choices that future remote/Kubernetes slices must not re-decide.
 No `buzz-acp`/`buzz-lifecycle` behavior changes in this slice beyond comments;
 the store already implements the invariant locally.
 
-### Transport — Tailscale (locked)
+### Transport — WebSocket (locked)
 
-Service-authenticated transport is **Tailscale**. The dev Tailnet proving the
-path is `100.117.196.100 <-> 100.125.42.122` (control-plane ↔ worker),
-broker loopback-bound, Tailnet ACL-gated. This resolves the ADR-0003
-placeholder "for example a Tailscale- or mTLS-bound broker" — mTLS remains a
-documented fallback only if Tailnet is unavailable and does not reopen the
-choice for this slice.
+Service-authenticated transport is **WebSocket (tokio-tungstenite)**. The broker
+binds localhost (`127.0.0.1:0`) and upgrades each connection to WebSocket;
+Tailscale is an **endpoint provider** that makes the local-broker port reachable
+as `ws://100.x.y.z:<port>` over the Tailnet. The broker has no Tailscale baked-in
+code. This supersedes the earlier "Tailscale-bound TCP" draft. mTLS remains a
+documented fallback only if Tailnet is unavailable.
 
 ### At-rest store — same lifecycle SQLite WAL on device persistent path (locked)
 
