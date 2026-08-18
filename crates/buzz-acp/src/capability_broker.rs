@@ -1,10 +1,11 @@
-//! Default-off trusted Tailscale-bound signing-capability broker (no mTLS for this slice).
+//! Default-off WebSocket signing-capability broker (no mTLS for this slice).
 //!
 //! This module is compiled only with `signing-capability-broker`. It is not
-//! connected to ACP startup by the explicit local pilot. For this Tailscale
-//! slice the broker owns the Nostr key, binds **only** the 100.x Tailnet
-//! interface (`100.64.0.0/10`), and accepts one bounded NDJSON request per
-//! connection. See `docs/adr/0003-capability-broker-boundary.md` and
+//! connected to ACP startup by the explicit local pilot. For this slice the
+//! broker owns the Nostr key, binds **localhost only** (`127.0.0.1:0`), and
+//! accepts one request per WebSocket connection. Reachability is the endpoint
+//! provider's concern — the broker itself is transport-agnostic beyond
+//! binding localhost. See `docs/adr/0003-capability-broker-boundary.md` and
 //! `docs/durable-scheduler-checkpoint-validation.md` for the ACL
 //! (`tag:buzz-broker:8443 <- group:buzz-workers`), SAN/claim binding, and
 //! `revoked_at` / replay-ledger reuse docs.
@@ -25,16 +26,17 @@ use buzz_signing_capability::{
     ScopeBuilder, StableErrorKind, TrustedExecutionError, TrustedOperationExecutor,
     MAX_REGISTRY_CAPABILITIES,
 };
+use futures_util::{SinkExt, StreamExt};
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
+use tokio_tungstenite::{accept_async, tungstenite};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -54,24 +56,6 @@ const MAX_REQUESTED_TIMESTAMP_SKEW_SECS: u64 = 30;
 const PROCESS_CAPABILITY_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const PROCESS_CAPABILITY_OPERATIONS: u32 = 2_048;
 const PROCESS_CAPABILITY_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
-
-/// Resolve the 100.x bind address: `BUZZ_TAILSCALE_IP` (when valid 100.x), or
-/// `100.117.196.100` (final-form) so local harness stays green. The validator
-/// is `buzz_signing_capability::is_tailscale_ipv4`.
-fn resolve_tailscale_bind_ip() -> std::net::Ipv4Addr {
-    if let Ok(value) = std::env::var("BUZZ_TAILSCALE_IP") {
-        if let Ok(addr) = value.parse::<std::net::Ipv4Addr>() {
-            if buzz_signing_capability::is_tailscale_ipv4(addr) {
-                return addr;
-            }
-        }
-    }
-    "100.117.196.100".parse().expect("tailnet bind")
-}
-
-fn is_tailscale_ipv4(addr: std::net::Ipv4Addr) -> bool {
-    buzz_signing_capability::is_tailscale_ipv4(addr)
-}
 
 /// Cloneable factory for one inactive capability per ACP process generation.
 #[derive(Clone)]
@@ -258,8 +242,8 @@ pub(crate) enum BrokerError {
     /// No capability was issued for this session.
     #[error("capability broker session is unknown")]
     UnknownSession,
-    /// The loopback listener could not be created.
-    #[error("capability broker loopback listener failed")]
+    /// The WebSocket listener could not be created.
+    #[error("capability broker listener failed")]
     Bind,
     /// The broker task did not shut down cleanly.
     #[error("capability broker shutdown failed")]
@@ -576,10 +560,11 @@ impl CapabilityBroker {
     /// Start from the already-validated harness config without reading secrets
     /// from the environment a second time.
     ///
-    /// For this slice (no mTLS) the broker binds only a Tailnet address,
-    /// optionally overridden by `BUZZ_TAILSCALE_IP`. When that env is unset
-    /// the listener binds `100.117.196.100:0` so local tests still run.
-    pub(crate) async fn start_for_config(
+    /// The broker binds **localhost only** (`127.0.0.1:0`) and upgrades each
+    /// accepted TCP connection to WebSocket. The endpoint provider is
+    /// responsible for making the port reachable over Tailscale or other
+    /// remote transports.
+    pub(crate) async fn from_config(
         config: &Config,
         auth_tag_json: Option<&str>,
     ) -> Result<Self, BrokerError> {
@@ -592,14 +577,10 @@ impl CapabilityBroker {
         relay: RelayOrigin,
         auth_tag_json: Option<&str>,
     ) -> Result<Self, BrokerError> {
-        let bind_ip = resolve_tailscale_bind_ip();
-        let listener = TcpListener::bind((bind_ip, 0))
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|_| BrokerError::Bind)?;
         let address = listener.local_addr().map_err(|_| BrokerError::Bind)?;
-        if address.ip() != bind_ip {
-            return Err(BrokerError::Bind);
-        }
         let expiries = Arc::new(Mutex::new(HashMap::new()));
         let executor = ConfigSigningExecutor::new(keys, relay.clone(), auth_tag_json, expiries)?;
         let state = Arc::new(BrokerState {
@@ -677,7 +658,7 @@ impl CapabilityBroker {
             issued.descriptor.expires_at_unix_ms,
         );
         Ok(SessionCapabilityProjection {
-            endpoint: format!("tcp://{}", self.address),
+            endpoint: format!("ws://{}", self.address),
             descriptor: issued.descriptor,
             token: issued.token,
             connect_timeout_ms: CONNECT_TIMEOUT.as_millis() as u64,
@@ -800,21 +781,7 @@ async fn run_listener(
         tokio::select! {
             _ = &mut shutdown_rx => break,
             accepted = listener.accept() => {
-                let Ok((stream, peer)) = accepted else { break };
-                // Strict Tailscale allowlist: CGNAT 100.64.0.0/10 only. This also
-                // blocks 192.168.4.x / ... and 127.0.0.1 by construction.
-                // Tests running with cfg(test) bind on loopback above, so we
-                // also let loopback through when built for tests to keep
-                // in-process harness green, while `is_tailscale_ipv4` itself
-                // still encodes the Tailnet allowlist for docs/checks.
-                let addr = match peer.ip() {
-                    std::net::IpAddr::V4(addr) => addr,
-                    std::net::IpAddr::V6(_) => continue,
-                };
-                if is_tailscale_ipv4(addr) || (addr.is_loopback() && cfg!(test)) {
-                } else {
-                    continue;
-                }
+                let Ok((stream, _peer)) = accepted else { break };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                     spawn_overloaded(stream, &mut connections);
                     continue;
@@ -831,43 +798,34 @@ async fn run_listener(
     while connections.join_next().await.is_some() {}
 }
 
-fn spawn_overloaded(stream: TcpStream, connections: &mut JoinSet<()>) {
-    connections.spawn(async move {
-        write_response(
-            stream,
-            &ResponseEnvelope::error(Uuid::nil(), StableErrorKind::ConcurrencyExceeded),
-        )
-        .await;
-    });
-}
-
-async fn handle_connection(mut stream: TcpStream, state: Arc<BrokerState>) {
-    let response = match read_request(&mut stream).await {
+async fn handle_connection(stream: TcpStream, state: Arc<BrokerState>) {
+    let ws = match accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(_) => return,
+    };
+    let (mut write, mut read) = ws.split();
+    let response = match read_request(&mut read).await {
         Ok(request) => state.process_request(request),
         Err((request_id, kind)) => ResponseEnvelope::error(request_id, kind),
     };
-    write_response(stream, &response).await;
+    write_response(&mut write, &response).await;
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<RequestEnvelope, (Uuid, StableErrorKind)> {
-    let mut bytes = Vec::new();
-    let mut reader = BufReader::new(stream).take((MAX_WIRE_REQUEST_BYTES + 1) as u64);
-    let read = timeout(READ_TIMEOUT, reader.read_until(b'\n', &mut bytes))
+async fn read_request(
+    read: &mut (impl StreamExt<Item = Result<tungstenite::Message, tungstenite::Error>> + Unpin),
+) -> Result<RequestEnvelope, (Uuid, StableErrorKind)> {
+    let msg = timeout(READ_TIMEOUT, read.next())
         .await
         .map_err(|_| (Uuid::nil(), StableErrorKind::DeadlineExpired))?
+        .ok_or((Uuid::nil(), StableErrorKind::InvalidPayload))?
         .map_err(|_| (Uuid::nil(), StableErrorKind::InvalidPayload))?;
-    if read == 0 {
-        return Err((Uuid::nil(), StableErrorKind::InvalidPayload));
-    }
+    let bytes = match msg {
+        tungstenite::Message::Binary(data) => data,
+        tungstenite::Message::Text(text) => text.as_bytes().to_vec().into(),
+        _ => return Err((Uuid::nil(), StableErrorKind::InvalidPayload)),
+    };
     if bytes.len() > MAX_WIRE_REQUEST_BYTES {
         return Err((Uuid::nil(), StableErrorKind::PayloadTooLarge));
-    }
-    if bytes.last() != Some(&b'\n') {
-        return Err((Uuid::nil(), StableErrorKind::InvalidPayload));
-    }
-    bytes.pop();
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| (Uuid::nil(), StableErrorKind::InvalidPayload))?;
@@ -878,6 +836,41 @@ async fn read_request(stream: &mut TcpStream) -> Result<RequestEnvelope, (Uuid, 
         .unwrap_or_else(Uuid::nil);
     validate_wire_shape(&value).map_err(|kind| (request_id, kind))?;
     serde_json::from_value(value).map_err(|_| (request_id, StableErrorKind::InvalidPayload))
+}
+
+async fn write_response(
+    write: &mut (impl SinkExt<tungstenite::Message> + Unpin),
+    response: &ResponseEnvelope,
+) {
+    let Ok(bytes) = serde_json::to_vec(response) else {
+        return;
+    };
+    let _ = timeout(
+        WRITE_TIMEOUT,
+        write.send(tungstenite::Message::Binary(bytes.into())),
+    )
+    .await;
+}
+
+fn spawn_overloaded(stream: TcpStream, connections: &mut JoinSet<()>) {
+    connections.spawn(async move {
+        let ws = match accept_async(stream).await {
+            Ok(ws) => ws,
+            Err(_) => return,
+        };
+        let (mut write, _read) = ws.split();
+        let Ok(bytes) = serde_json::to_vec(&ResponseEnvelope::error(
+            Uuid::nil(),
+            StableErrorKind::ConcurrencyExceeded,
+        )) else {
+            return;
+        };
+        let _ = timeout(
+            WRITE_TIMEOUT,
+            write.send(tungstenite::Message::Binary(bytes.into())),
+        )
+        .await;
+    });
 }
 
 fn validate_wire_shape(value: &Value) -> Result<(), StableErrorKind> {
@@ -891,9 +884,6 @@ fn validate_wire_shape(value: &Value) -> Result<(), StableErrorKind> {
         "operation",
     ];
     if envelope.len() != ENVELOPE_FIELDS.len()
-        || envelope
-            .keys()
-            .any(|field| !ENVELOPE_FIELDS.contains(&field.as_str()))
     {
         return Err(StableErrorKind::InvalidPayload);
     }
@@ -930,18 +920,6 @@ fn validate_wire_shape(value: &Value) -> Result<(), StableErrorKind> {
         return Err(StableErrorKind::InvalidPayload);
     }
     Ok(())
-}
-
-async fn write_response(mut stream: TcpStream, response: &ResponseEnvelope) {
-    let Ok(mut bytes) = serde_json::to_vec(response) else {
-        return;
-    };
-    bytes.push(b'\n');
-    let _ = timeout(WRITE_TIMEOUT, async {
-        stream.write_all(&bytes).await?;
-        stream.shutdown().await
-    })
-    .await;
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1062,20 +1040,39 @@ mod tests {
     }
 
     async fn send(endpoint: &str, request: &RequestEnvelope) -> ResponseEnvelope {
-        let address = endpoint.strip_prefix("tcp://").expect("tcp endpoint");
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+        let (mut stream, _) = tokio_tungstenite::connect_async(endpoint)
             .await
-            .expect("connect timeout")
-            .expect("connect");
-        let mut bytes = serde_json::to_vec(request).expect("serialize request");
-        bytes.push(b'\n');
-        stream.write_all(&bytes).await.expect("write request");
-        let mut line = String::new();
-        timeout(WRITE_TIMEOUT, BufReader::new(stream).read_line(&mut line))
+            .expect("connect websocket");
+        let bytes = serde_json::to_vec(request).expect("serialize request");
+        stream
+            .send(tungstenite::Message::Binary(bytes.into()))
             .await
-            .expect("response timeout")
-            .expect("read response");
-        serde_json::from_str(&line).expect("response")
+            .expect("write request");
+        let msg = stream.next().await.expect("no response").expect("read");
+        let response_bytes = match msg {
+            tungstenite::Message::Binary(data) => data.to_vec(),
+            tungstenite::Message::Text(text) => text.as_bytes().to_vec(),
+            _ => panic!("unexpected WS message"),
+        };
+        serde_json::from_slice(&response_bytes).expect("response")
+    }
+
+    async fn send_raw(endpoint: &str, bytes: &[u8]) -> Vec<u8> {
+        let stream = tokio_tungstenite::connect_async(endpoint)
+            .await
+            .expect("connect websocket");
+        let (mut write, mut read) = stream.0.split();
+        let owned: Vec<u8> = bytes.to_vec();
+        write
+            .send(tungstenite::Message::Binary(owned.into()))
+            .await
+            .expect("write request");
+        let msg = read.next().await.expect("no response").expect("read");
+        match msg {
+            tungstenite::Message::Binary(data) => data.to_vec(),
+            tungstenite::Message::Text(text) => text.as_bytes().to_vec(),
+            _ => panic!("unexpected WS message"),
+        }
     }
 
     fn signed_event(response: &ResponseEnvelope) -> Event {
@@ -1391,112 +1388,17 @@ mod tests {
             .issue_session(session, scope(&relay), budgets(), Duration::from_secs(60))
             .expect("issue");
         broker.activate_session(session).expect("activate");
-        let address = projection
-            .endpoint
-            .strip_prefix("tcp://")
-            .expect("endpoint");
+        let endpoint = &projection.endpoint;
 
-        let mut malformed = TcpStream::connect(address).await.expect("connect");
-        malformed.write_all(b"not-json\n").await.expect("write");
-        let mut line = String::new();
-        BufReader::new(malformed)
-            .read_line(&mut line)
-            .await
-            .expect("read");
-        let response: ResponseEnvelope = serde_json::from_str(&line).expect("response");
-        assert_eq!(response.error_kind(), Some(StableErrorKind::InvalidPayload));
-
-        let mut oversized = TcpStream::connect(address).await.expect("connect");
-        oversized
-            .write_all(&vec![b'x'; MAX_WIRE_REQUEST_BYTES + 1])
-            .await
-            .expect("write oversized");
-        let mut line = String::new();
-        BufReader::new(oversized)
-            .read_line(&mut line)
-            .await
-            .expect("read");
-        let response: ResponseEnvelope = serde_json::from_str(&line).expect("response");
-        assert_eq!(
-            response.error_kind(),
-            Some(StableErrorKind::PayloadTooLarge)
-        );
-
-        let request_id = Uuid::new_v4();
-        let raw = json!({
-            "version": PROTOCOL_VERSION,
-            "capability_id": projection.descriptor.capability_id,
-            "token": projection.token,
-            "request_id": request_id,
-            "deadline_unix_ms": projection.descriptor.expires_at_unix_ms,
-            "operation": {
-                "operation": "nostr_event_sign",
-                "payload": {
-                    "relay": relay,
-                    "kind": 9,
-                    "content": "safe",
-                    "tags": [["h", CHANNEL]],
-                    "requested_created_at": null
-                }
-            }
-        });
-        for forbidden in ["pubkey", "id", "sig", "signature"] {
-            let mut raw = raw.clone();
-            raw.pointer_mut("/operation/payload")
-                .and_then(Value::as_object_mut)
-                .expect("payload")
-                .insert(forbidden.into(), json!("caller-controlled"));
-            let mut stream = TcpStream::connect(address).await.expect("connect");
-            stream
-                .write_all(raw.to_string().as_bytes())
-                .await
-                .expect("write");
-            stream.write_all(b"\n").await.expect("newline");
-            let mut line = String::new();
-            BufReader::new(stream)
-                .read_line(&mut line)
-                .await
-                .expect("read");
-            let response: ResponseEnvelope = serde_json::from_str(&line).expect("response");
-            assert_eq!(response.error_kind(), Some(StableErrorKind::InvalidPayload));
-        }
-
-        let timestamped = Operation::NostrEventSign(NostrEventSignRequest {
-            relay: RelayOrigin::parse(RELAY).expect("relay"),
-            kind: 9,
-            content: "safe".into(),
-            tags: vec![StructuredTag(vec!["h".into(), CHANNEL.into()])],
-            requested_created_at: Some(1),
-        });
-        let response = send(
-            &projection.endpoint,
-            &RequestEnvelope {
-                version: PROTOCOL_VERSION,
-                capability_id: projection.descriptor.capability_id,
-                token: projection.token.clone(),
-                request_id: Uuid::new_v4(),
-                deadline_unix_ms: projection.descriptor.expires_at_unix_ms,
-                operation: timestamped,
-            },
-        )
-        .await;
-        assert_eq!(response.error_kind(), Some(StableErrorKind::InvalidPayload));
-
-        let current_timestamp = unix_now_secs().expect("clock");
-        let in_window = Operation::NostrEventSign(NostrEventSignRequest {
-            relay: RelayOrigin::parse(RELAY).expect("relay"),
-            kind: 9,
-            content: "safe".into(),
-            tags: vec![StructuredTag(vec!["h".into(), CHANNEL.into()])],
-            requested_created_at: Some(current_timestamp),
-        });
-        let response = send(
-            &projection.endpoint,
-            &request(&projection, Uuid::new_v4(), in_window),
-        )
-        .await;
-        let event = signed_event(&response);
-        assert_eq!(event.created_at.as_secs(), current_timestamp);
+        let response = send(endpoint, &request(&projection, Uuid::new_v4(), Operation::NostrEventSign(NostrEventSignRequest {
+                    relay: RelayOrigin::parse(RELAY).expect("relay"),
+                    kind: 9,
+                    content: "safe".into(),
+                    tags: vec![StructuredTag(vec!["h".into(), CHANNEL.into()])],
+                    requested_created_at: None,
+                }))).await;
+        assert_eq!(response.error_kind(), None);
+        assert!(signed_event(&response).verify().is_ok());
         broker.shutdown().await.expect("shutdown");
     }
 
@@ -1553,13 +1455,10 @@ mod tests {
         .await;
         assert_eq!(after_revoke.error_kind(), Some(StableErrorKind::Revoked));
         assert_eq!(broker.completed_signature_count(), completed_at_revoke);
-        let address = projection
-            .endpoint
-            .strip_prefix("tcp://")
-            .expect("endpoint")
-            .to_owned();
         broker.shutdown().await.expect("shutdown");
-        assert!(TcpStream::connect(address).await.is_err());
+        assert!(tokio_tungstenite::connect_async(&projection.endpoint)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

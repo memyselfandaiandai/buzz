@@ -979,10 +979,12 @@ name = "buzz-capability-client"
 version = "0.1.0"
 dependencies = [
  "buzz-signing-capability",
+ "futures-util",
  "nostr 0.44.7",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "url",
  "uuid",
  "zeroize",

@@ -498,23 +498,23 @@ struct LoopbackCapabilityEndpoint {
 impl LoopbackCapabilityEndpoint {
     fn parse(value: &str) -> Result<Self, AcpError> {
         let endpoint = url::Url::parse(value).map_err(|_| {
-            AcpError::Protocol("broker-v1 endpoint is not a valid TCP URL".to_owned())
+            AcpError::Protocol("broker-v1 endpoint is not a valid URL".to_owned())
         })?;
-        if endpoint.scheme() != "tcp"
+        if endpoint.scheme() != "ws"
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
-            || !endpoint.path().is_empty()
+            || (endpoint.path() != "/" && !endpoint.path().is_empty())
             || endpoint.host_str() != Some("127.0.0.1")
         {
             return Err(AcpError::Protocol(
-                "broker-v1 endpoint must be exactly tcp://127.0.0.1:<nonzero-port>".to_owned(),
+                "broker-v1 endpoint must be exactly ws://127.0.0.1:<nonzero-port>".to_owned(),
             ));
         }
         let port = endpoint.port().filter(|port| *port != 0).ok_or_else(|| {
             AcpError::Protocol(
-                "broker-v1 endpoint must be exactly tcp://127.0.0.1:<nonzero-port>".to_owned(),
+                "broker-v1 endpoint must be exactly ws://127.0.0.1:<nonzero-port>".to_owned(),
             )
         })?;
         Ok(Self {
@@ -523,7 +523,7 @@ impl LoopbackCapabilityEndpoint {
     }
 
     fn canonical(self) -> String {
-        format!("tcp://{}", self.address)
+        format!("ws://{}", self.address)
     }
 }
 
@@ -4298,6 +4298,7 @@ mod tests {
         client.shutdown().await;
     }
 
+    #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 

@@ -95,18 +95,18 @@ pub fn is_tailscale_ipv4(addr: std::net::Ipv4Addr) -> bool {
     a == 100 && b >= 64 && b <= 127
 }
 
-/// Returns true only for `tcp://100.x.y.z:<port>` — no DNS, no private LAN, no loopback.
+/// Returns true only for `ws://100.x.y.z:<port>` — no DNS, no private LAN, no loopback.
 pub fn is_tailscale_endpoint(value: &str) -> bool {
     let url = match url::Url::parse(value) {
         Ok(url) => url,
         Err(_) => return false,
     };
-    if url.scheme() != "tcp"
+    if url.scheme() != "ws" && url.scheme() != "tcp"
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !url.path().is_empty()
+        || (url.path() != "/" && !url.path().is_empty())
     {
         return false;
     }
@@ -125,7 +125,9 @@ pub fn is_tailscale_endpoint(value: &str) -> bool {
     if !is_tailscale_ipv4(addr) {
         return false;
     }
-    value == format!("tcp://{addr}:{port}")
+    let scheme = url.scheme();
+    let expected = format!("{scheme}://{addr}:{port}/");
+    url.as_str() == expected
 }
 
 /// Non-secret capability metadata safe to expose to a client.

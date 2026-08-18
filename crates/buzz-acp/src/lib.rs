@@ -2690,7 +2690,7 @@ async fn tokio_main() -> Result<()> {
     #[cfg(feature = "signing-capability-broker")]
     if broker_mode {
         let broker = Arc::new(
-            capability_broker::CapabilityBroker::start_for_config(
+            capability_broker::CapabilityBroker::from_config(
                 &config,
                 relay_auth_tag_json.as_deref(),
             )

@@ -1,18 +1,16 @@
-//! Strict client for the local Buzz signing-capability broker.
+//! Strict WebSocket client for the Buzz signing-capability broker.
 //!
-//! The client accepts only the fixed `broker-v1` child projection, connects
-//! **only** to canonical Tailscale TCP endpoints (`tcp://100.x.y.z:<port>`
-//! with `100.64.0.0/10`), and never falls back to a long-lived credential.
-//! For this slice the authenticated tailnet (ACL + durable `revoked_at`
-//! ledger) is the service-authenticated transport — **no mTLS**. Its public
-//! operation surface is deliberately narrower than the protocol inventory:
-//! consumers can request identity metadata, a structured Nostr event
-//! signature, or a relay-bound NIP-98 authorization.
+//! The client accepts the fixed `broker-v1` child projection and connects
+//! over WebSocket (`ws://<host>:<port>`) to any reachable endpoint — local
+//! loopback, LAN, or remote via Tailscale. Transport-level address
+//! enforcement is the endpoint provider's concern, not this crate's. Its
+//! public operation surface is deliberately narrower than the protocol
+//! inventory: consumers can request identity metadata, a structured Nostr
+//! event signature, or a relay-bound NIP-98 authorization.
 
 use std::{
     ffi::OsString,
     fmt,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,12 +23,12 @@ pub use buzz_signing_capability::{
     HttpMethod, Nip98SignRequest, NostrEventSignRequest, RelayOrigin, StableErrorKind,
     StructuredTag,
 };
+use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, PublicKey};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     time::timeout,
 };
+use tokio_tungstenite::connect_async;
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -68,7 +66,7 @@ const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 /// One stable timeout phase, without transport or credential detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutPhase {
-    /// Opening the loopback TCP connection.
+    /// Opening the WebSocket connection.
     Connect,
     /// Writing and half-closing the single request frame.
     Write,
@@ -111,8 +109,8 @@ pub enum ClientError {
     /// A required environment name or value was not valid Unicode.
     #[error("capability projection contains invalid environment text")]
     InvalidEnvironment,
-    /// The endpoint was not the canonical Tailscale TCP form.
-    #[error("capability endpoint must be tcp://100.x.y.z:<nonzero-port> in 100.64.0.0/10")]
+    /// The endpoint was not a valid WebSocket URL.
+    #[error("capability endpoint must be a valid ws:// URL")]
     InvalidEndpoint,
     /// The capability identifier was not a non-nil UUID.
     #[error("capability identifier is invalid")]
@@ -156,7 +154,7 @@ pub enum ClientError {
     /// The response exceeded the client frame bound.
     #[error("capability response exceeds the wire bound")]
     ResponseTooLarge,
-    /// The response did not contain exactly one newline-delimited frame and EOF.
+    /// The response WebSocket message did not contain a valid response envelope.
     #[error("capability response framing is invalid")]
     InvalidFrame,
     /// The response envelope or result shape was malformed.
@@ -217,12 +215,12 @@ impl Default for ClientTimeouts {
     }
 }
 
-/// One validated local signing-capability client.
+/// One validated WebSocket-client capability.
 ///
 /// `Debug` intentionally reports only public projection metadata. The bearer
 /// token is held in a zeroizing allocation and is never formatted.
 pub struct CapabilityClient {
-    endpoint: SocketAddrV4,
+    endpoint: Url,
     capability_id: Uuid,
     token: Arc<SecretToken>,
     public_key: PublicKey,
@@ -234,7 +232,7 @@ pub struct CapabilityClient {
 impl Clone for CapabilityClient {
     fn clone(&self) -> Self {
         Self {
-            endpoint: self.endpoint,
+            endpoint: self.endpoint.clone(),
             capability_id: self.capability_id,
             token: Arc::clone(&self.token),
             public_key: self.public_key,
@@ -551,36 +549,51 @@ impl CapabilityClient {
 
     async fn exchange(&self, request: RequestEnvelope) -> Result<OperationResult, ClientError> {
         let request_id = request.request_id;
-        let mut frame = serde_json::to_vec(&request).map_err(|_| ClientError::InvalidRequest)?;
-        if frame
-            .len()
-            .checked_add(1)
-            .is_none_or(|length| length > MAX_WIRE_FRAME_BYTES)
-        {
+        let frame = serde_json::to_vec(&request).map_err(|_| ClientError::InvalidRequest)?;
+        let frame_len = frame.len();
+        if frame_len > MAX_WIRE_FRAME_BYTES {
             return Err(ClientError::RequestTooLarge);
         }
-        frame.push(b'\n');
 
-        let address = SocketAddr::V4(self.endpoint);
-        let mut stream = timeout(self.timeouts.connect, TcpStream::connect(address))
-            .await
-            .map_err(|_| ClientError::Timeout(TimeoutPhase::Connect))?
-            .map_err(|_| ClientError::Connect)?;
-        timeout(self.timeouts.write, async {
-            stream.write_all(&frame).await?;
-            stream.shutdown().await
-        })
+        let (ws_stream, _) = timeout(
+            self.timeouts.connect,
+            connect_async(self.endpoint.as_str()),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(TimeoutPhase::Connect))?
+        .map_err(|_| ClientError::Connect)?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        timeout(
+            self.timeouts.write,
+            write.send(tokio_tungstenite::tungstenite::Message::Binary(frame.into())),
+        )
         .await
         .map_err(|_| ClientError::Timeout(TimeoutPhase::Write))?
         .map_err(|_| ClientError::Write)?;
 
-        let mut response_bytes = Vec::new();
-        let mut bounded = stream.take((MAX_WIRE_FRAME_BYTES + 1) as u64);
-        timeout(self.timeouts.read, bounded.read_to_end(&mut response_bytes))
-            .await
-            .map_err(|_| ClientError::Timeout(TimeoutPhase::Read))?
-            .map_err(|_| ClientError::Read)?;
-        parse_response(&response_bytes, request_id)
+        let response = timeout(self.timeouts.read, async {
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => return Ok(data.to_vec()),
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => return Ok(text.as_bytes().to_vec()),
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => return Err(ClientError::Read),
+                    Ok(_) => continue,
+                    Err(_) => return Err(ClientError::Read),
+                }
+            }
+            Err(ClientError::Read)
+        })
+        .await
+        .map_err(|_| ClientError::Timeout(TimeoutPhase::Read))?
+        .map_err(|_| ClientError::Read)?;
+
+        if response.len() > MAX_WIRE_FRAME_BYTES {
+            return Err(ClientError::ResponseTooLarge);
+        }
+
+        parse_response(&response, request_id)
     }
 
     #[cfg(test)]
@@ -594,47 +607,35 @@ fn os_value(value: Option<OsString>) -> Result<OsString, ClientError> {
     value.ok_or(ClientError::IncompleteProjection)
 }
 
-/// True only for the CGNAT `100.64.0.0/10` Tailnet range (100.64.0.0..=100.127.255.255).
-pub fn is_tailscale_ipv4(addr: Ipv4Addr) -> bool {
-    let o = addr.octets();
-    // In tests, also accept the loopback fixture so the in-process fake
-    // brokers that bind on `127.0.0.1:0` can be exercised through the same
-    // parser that enforces `100.x` in production. All non-test paths and the
-    // explicit `is_tailscale_endpoint` helper still reject non-100.x.
-    if addr == Ipv4Addr::LOCALHOST && cfg!(test) {
-        return true;
-    }
-    o[0] == 100 && o[1] >= 64 && o[1] <= 127
-}
-
-/// Validates *Tailscale-bound* remote-signer endpoints only (no mTLS for this slice):
-/// the scheme+host+port MUST be `tcp://100.x.y.z:<non-zero-port>` where the
-/// address falls inside `100.64.0.0/10`, otherwise the client refuses to dial.
-fn parse_endpoint(value: &str) -> Result<SocketAddrV4, ClientError> {
-    let endpoint = Url::parse(value).map_err(|_| ClientError::InvalidEndpoint)?;
-    if endpoint.scheme() != "tcp"
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-        || endpoint.query().is_some()
-        || endpoint.fragment().is_some()
-        || !endpoint.path().is_empty()
+/// Validates a broker endpoint: scheme MUST be `ws`, host MUST be an IPv4
+/// address (loopback, LAN, or Tailscale 100.x), port MUST be non-zero, no
+/// path/query/fragment/credentials. This is deliberately permissive: address
+/// enforcement is the endpoint provider's concern.
+fn parse_endpoint(value: &str) -> Result<Url, ClientError> {
+    let url = Url::parse(value).map_err(|_| ClientError::InvalidEndpoint)?;
+    if url.scheme() != "ws"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.path() != "/" && !url.path().is_empty())
     {
         return Err(ClientError::InvalidEndpoint);
     }
-    let host = endpoint.host_str().ok_or(ClientError::InvalidEndpoint)?;
-    let addr: Ipv4Addr = host.parse().map_err(|_| ClientError::InvalidEndpoint)?;
-    if !is_tailscale_ipv4(addr) {
-        return Err(ClientError::InvalidEndpoint);
-    }
-    let port = endpoint
+    let addr: std::net::Ipv4Addr = url
+        .host_str()
+        .ok_or(ClientError::InvalidEndpoint)?
+        .parse()
+        .map_err(|_| ClientError::InvalidEndpoint)?;
+    let port = url
         .port()
-        .filter(|port| *port != 0)
+        .filter(|p| *p != 0)
         .ok_or(ClientError::InvalidEndpoint)?;
-    let address = SocketAddrV4::new(addr, port);
-    if value != format!("tcp://{address}") {
+    let canonical = format!("ws://{addr}:{port}/");
+    if url.as_str() != canonical {
         return Err(ClientError::InvalidEndpoint);
     }
-    Ok(address)
+    Ok(url)
 }
 
 fn unix_now_ms() -> Result<i64, ClientError> {
@@ -648,15 +649,12 @@ fn parse_response(bytes: &[u8], request_id: Uuid) -> Result<OperationResult, Cli
     if bytes.len() > MAX_WIRE_FRAME_BYTES {
         return Err(ClientError::ResponseTooLarge);
     }
-    let Some((&b'\n', payload)) = bytes.split_last() else {
-        return Err(ClientError::InvalidFrame);
-    };
-    if payload.is_empty() || payload.contains(&b'\n') || payload.contains(&b'\r') {
+    if bytes.is_empty() || bytes.contains(&b'\n') || bytes.contains(&b'\r') {
         return Err(ClientError::InvalidFrame);
     }
 
     let value: serde_json::Value =
-        serde_json::from_slice(payload).map_err(|_| ClientError::InvalidResponse)?;
+        serde_json::from_slice(bytes).map_err(|_| ClientError::InvalidResponse)?;
     validate_response_shape(&value)?;
     let response: ResponseEnvelope =
         serde_json::from_value(value).map_err(|_| ClientError::InvalidResponse)?;
