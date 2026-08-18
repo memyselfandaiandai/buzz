@@ -33,6 +33,7 @@ members = [
     "crates/buzz-lifecycle",
     "crates/buzz-signing-capability",
     "crates/buzz-capability-client",
+    "crates/buzz-remote-signer",
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
 ]

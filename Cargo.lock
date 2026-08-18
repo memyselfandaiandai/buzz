@@ -1380,6 +1380,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-remote-signer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buzz-capability-client",
+ "buzz-signing-capability",
+ "clap",
+ "nostr 0.44.7",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
