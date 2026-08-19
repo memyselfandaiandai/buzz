@@ -517,7 +517,11 @@ impl LoopbackCapabilityEndpoint {
         let ip: std::net::Ipv4Addr = host_str.parse().map_err(|_| {
             AcpError::Protocol("broker-v1 endpoint host must be an IPv4 address".to_owned())
         })?;
-        if !ip.is_loopback() && !buzz_signing_capability::is_tailscale_ipv4(ip) {
+        fn is_tailscale_ipv4(addr: std::net::Ipv4Addr) -> bool {
+            let octets = addr.octets();
+            octets[0] == 100 && (64..=127).contains(&octets[1])
+        }
+        if !ip.is_loopback() && !is_tailscale_ipv4(ip) {
             return Err(AcpError::Protocol(
                 "broker-v1 endpoint host must be loopback (127.0.0.1) or Tailscale (100.64.0.0/10)".to_owned(),
             ));
