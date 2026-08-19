@@ -3112,7 +3112,20 @@ impl<A: WorkspaceAdapter> Controller<A> {
                     self.ledger.mark_cleaned(session_id, &claim)?;
                 }
                 Lifecycle::RecoveryError => {
-                    if self.ledger.cleanup_claim(session_id)?.is_some() {
+                    if self.ledger.cancellation_requested(session_id)?
+                        || matches!(
+                            self.ledger.state(session_id)?,
+                            Lifecycle::Cancelled | Lifecycle::Expired | Lifecycle::Terminal
+                        )
+                    {
+                        let claim = cleanup_claim(&identity);
+                        self.ledger.begin_cleanup(
+                            session_id,
+                            &identity.owner_id,
+                            &identity.workspace_id,
+                            &claim,
+                        )?;
+                    } else if self.ledger.cleanup_claim(session_id)?.is_some() {
                         self.ledger.transition(
                             session_id,
                             Lifecycle::Cleaning,
