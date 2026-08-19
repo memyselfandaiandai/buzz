@@ -506,19 +506,29 @@ impl LoopbackCapabilityEndpoint {
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
             || (endpoint.path() != "/" && !endpoint.path().is_empty())
-            || endpoint.host_str() != Some("127.0.0.1")
         {
             return Err(AcpError::Protocol(
-                "broker-v1 endpoint must be exactly ws://127.0.0.1:<nonzero-port>".to_owned(),
+                "broker-v1 endpoint must be a valid ws:// IPv4 socket address".to_owned(),
+            ));
+        }
+        let host_str = endpoint.host_str().ok_or_else(|| {
+            AcpError::Protocol("broker-v1 endpoint must have a host".to_owned())
+        })?;
+        let ip: std::net::Ipv4Addr = host_str.parse().map_err(|_| {
+            AcpError::Protocol("broker-v1 endpoint host must be an IPv4 address".to_owned())
+        })?;
+        if !ip.is_loopback() && !buzz_signing_capability::is_tailscale_ipv4(ip) {
+            return Err(AcpError::Protocol(
+                "broker-v1 endpoint host must be loopback (127.0.0.1) or Tailscale (100.64.0.0/10)".to_owned(),
             ));
         }
         let port = endpoint.port().filter(|port| *port != 0).ok_or_else(|| {
             AcpError::Protocol(
-                "broker-v1 endpoint must be exactly ws://127.0.0.1:<nonzero-port>".to_owned(),
+                "broker-v1 endpoint must specify a nonzero port".to_owned(),
             )
         })?;
         Ok(Self {
-            address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port),
+            address: std::net::SocketAddrV4::new(ip, port),
         })
     }
 

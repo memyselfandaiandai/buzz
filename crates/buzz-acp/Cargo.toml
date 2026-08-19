@@ -20,6 +20,11 @@ path = "src/lib.rs"
 name = "buzz-acp"
 path = "src/main.rs"
 
+[[bin]]
+name = "buzz-acp-broker"
+path = "src/bin/broker_standalone.rs"
+required-features = ["signing-capability-broker"]
+
 [dependencies]
 # Internal
 buzz-core = { workspace = true }
@@ -85,6 +90,7 @@ evalexpr = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
+buzz-capability-client = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
 axum = { workspace = true }

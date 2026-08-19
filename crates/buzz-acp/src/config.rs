@@ -934,14 +934,13 @@ impl Config {
     }
 
     /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
-    /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
+    /// tests and tools can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
-    #[cfg(test)]
     pub fn from_args(args: CliArgs) -> Result<Self, ConfigError> {
         Self::from_args_with_credential_mode(args, CredentialMode::LegacyEnv)
     }
 
-    fn from_args_with_credential_mode(
+    pub fn from_args_with_credential_mode(
         mut args: CliArgs,
         credential_mode: CredentialMode,
     ) -> Result<Self, ConfigError> {

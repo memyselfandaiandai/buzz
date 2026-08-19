@@ -2,8 +2,8 @@
 
 mod acp;
 #[cfg(feature = "signing-capability-broker")]
-pub(crate) mod capability_broker;
-mod config;
+pub mod capability_broker;
+pub mod config;
 #[cfg(feature = "durable-turn-lifecycle")]
 pub mod durable_lifecycle;
 mod engram_fetch;

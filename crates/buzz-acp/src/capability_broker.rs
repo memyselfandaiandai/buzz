@@ -59,7 +59,7 @@ const PROCESS_CAPABILITY_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Cloneable factory for one inactive capability per ACP process generation.
 #[derive(Clone)]
-pub(crate) struct BrokerChildSpawner {
+pub struct BrokerChildSpawner {
     broker: Arc<CapabilityBroker>,
     scope: CapabilityScope,
     public_key: nostr::PublicKey,
@@ -78,7 +78,7 @@ impl fmt::Debug for BrokerChildSpawner {
 
 impl BrokerChildSpawner {
     /// Build the fixed local-v1 consumer scope for the startup channel set.
-    pub(crate) fn for_channels(
+    pub fn for_channels(
         broker: Arc<CapabilityBroker>,
         config: &Config,
         channels: impl IntoIterator<Item = Uuid>,
@@ -113,7 +113,7 @@ impl BrokerChildSpawner {
     }
 
     /// Issue a fresh, inactive process-generation lease.
-    pub(crate) fn issue(&self) -> Result<ProcessCapabilityLease, BrokerError> {
+    pub fn issue(&self) -> Result<ProcessCapabilityLease, BrokerError> {
         let session_id = Uuid::new_v4();
         let projection = self.broker.issue_session(
             session_id,
@@ -167,7 +167,7 @@ enum ProcessCapabilityState {
 }
 
 /// Capability and typed child projection owned by one ACP process generation.
-pub(crate) struct ProcessCapabilityLease {
+pub struct ProcessCapabilityLease {
     broker: Arc<CapabilityBroker>,
     session_id: Uuid,
     projection: AcpChildCredentialProjection,
@@ -185,15 +185,15 @@ impl fmt::Debug for ProcessCapabilityLease {
 }
 
 impl ProcessCapabilityLease {
-    pub(crate) fn projection(&self) -> &AcpChildCredentialProjection {
+    pub fn projection(&self) -> &AcpChildCredentialProjection {
         &self.projection
     }
 
-    pub(crate) fn mcp_env(&self) -> Vec<EnvVar> {
+    pub fn mcp_env(&self) -> Vec<EnvVar> {
         self.projection.mcp_env()
     }
 
-    pub(crate) fn activate(&mut self) -> Result<(), BrokerError> {
+    pub fn activate(&mut self) -> Result<(), BrokerError> {
         match self.state {
             ProcessCapabilityState::Inactive => {
                 self.broker.activate_session(self.session_id)?;
@@ -205,7 +205,7 @@ impl ProcessCapabilityLease {
         }
     }
 
-    pub(crate) fn revoke(&mut self) -> Result<(), BrokerError> {
+    pub fn revoke(&mut self) -> Result<(), BrokerError> {
         if self.state == ProcessCapabilityState::Revoked {
             return Ok(());
         }
@@ -223,7 +223,7 @@ impl Drop for ProcessCapabilityLease {
 
 /// Secret-safe broker construction or control failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub(crate) enum BrokerError {
+pub enum BrokerError {
     /// The configured relay is not a canonical relay root.
     #[error("capability broker relay is invalid")]
     InvalidRelay,
@@ -539,14 +539,14 @@ impl BrokerState {
 }
 
 /// Running default-off loopback broker and its trusted control API.
-pub(crate) struct CapabilityBroker {
+pub struct CapabilityBroker {
     state: Arc<BrokerState>,
-    address: SocketAddr,
+    pub address: SocketAddr,
     /// Override for the IP advertised in issued endpoints. When set, the
     /// broker advertises `ws://{advertised_ip}:{port}` instead of
     /// `ws://127.0.0.1:{port}`, allowing Tailscale or other overlay networks
     /// to reach the broker from remote workers without baked-in IP logic.
-    advertised_ip: Option<std::net::Ipv4Addr>,
+    pub advertised_ip: Option<std::net::Ipv4Addr>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -557,26 +557,19 @@ impl fmt::Debug for CapabilityBroker {
             .debug_struct("CapabilityBroker")
             .field("address", &self.address)
             .field("advertised_ip", &self.advertised_ip)
-            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
 
 impl CapabilityBroker {
-    /// Start from the already-validated harness config without reading secrets
-    /// from the environment a second time.
-    ///
-    /// The broker binds **localhost only** (`127.0.0.1:0`) and upgrades each
-    /// accepted TCP connection to WebSocket. The endpoint provider is
-    /// responsible for making the port reachable over Tailscale or other
-    /// remote transports.
+    /// Construct and start the broker directly from validated configuration.
     ///
     /// When Tailscale is installed and running, the broker automatically
     /// discovers the Tailscale IPv4 address and uses it as the advertised
     /// endpoint IP so that remote workers can reach the broker over the
     /// Tailnet at `ws://100.x.y.z:<port>`. Set `BUZZ_ACP_BROKER_ADVERTISE_IP`
     /// to override auto-discovery.
-    pub(crate) async fn from_config(
+    pub async fn from_config(
         config: &Config,
         auth_tag_json: Option<&str>,
     ) -> Result<Self, BrokerError> {
@@ -593,7 +586,9 @@ impl CapabilityBroker {
         auth_tag_json: Option<&str>,
         advertised_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<Self, BrokerError> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        let bind_addr = advertised_ip
+            .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+        let listener = TcpListener::bind((bind_addr, 0))
             .await
             .map_err(|_| BrokerError::Bind)?;
         let address = listener.local_addr().map_err(|_| BrokerError::Bind)?;
@@ -744,7 +739,7 @@ impl CapabilityBroker {
     }
 
     /// Stop accepting connections and wait for bounded in-flight connections.
-    pub(crate) async fn shutdown(mut self) -> Result<(), BrokerError> {
+    pub async fn shutdown(mut self) -> Result<(), BrokerError> {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
