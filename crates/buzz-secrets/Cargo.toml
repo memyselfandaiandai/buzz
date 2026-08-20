@@ -1,0 +1,31 @@
+[package]
+name = "buzz-secrets"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable secret vault provider SPI and ABAC leasing engine for Buzz"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["sync", "time", "process", "rt", "macros"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Keyring support for Tier 1 native OS credential storage
+keyring = { version = "3.6.3", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "vendored"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "vendored"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "vendored"], optional = true }
+
+[features]
+default = ["os-keyring", "bws"]
+os-keyring = ["dep:keyring"]
+bws = []

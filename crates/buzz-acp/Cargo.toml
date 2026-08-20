@@ -10,7 +10,7 @@ description = "ACP harness that bridges Buzz events to AI agents"
 [features]
 default = []
 durable-turn-lifecycle = ["dep:buzz-lifecycle"]
-signing-capability-broker = ["dep:buzz-signing-capability"]
+signing-capability-broker = ["dep:buzz-signing-capability", "dep:buzz-secrets"]
 
 [lib]
 name = "buzz_acp"
@@ -32,6 +32,7 @@ buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
 buzz-lifecycle = { workspace = true, optional = true }
 buzz-signing-capability = { workspace = true, optional = true }
+buzz-secrets = { path = "../buzz-secrets", optional = true }
 
 # Nostr
 nostr = { workspace = true }
