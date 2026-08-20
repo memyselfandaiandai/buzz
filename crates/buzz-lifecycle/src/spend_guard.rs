@@ -18,10 +18,10 @@ impl Default for SpendGuardConfig {
     fn default() -> Self {
         Self {
             window_ms: 60_000,
-            max_wakes_per_window: 20,
-            max_runs_per_window: 20,
-            grace_ms: 5_000,
-            snooze_ms: 30_000,
+            max_wakes_per_window: 100,
+            max_runs_per_window: 60,
+            grace_ms: 15_000,
+            snooze_ms: 180_000,
         }
     }
 }

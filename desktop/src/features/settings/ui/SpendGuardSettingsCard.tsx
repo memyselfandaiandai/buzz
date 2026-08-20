@@ -36,8 +36,8 @@ export function SpendGuardSettingsCard() {
         window_ms: Number(windowSecs) * 1000,
         max_wakes_per_window: Number(maxWakes),
         max_runs_per_window: Number(maxRuns),
-        grace_ms: 5000,
-        snooze_ms: 30000,
+        grace_ms: 15000,
+        snooze_ms: 180000,
       });
       setStatus(updated);
     } catch (e) {
