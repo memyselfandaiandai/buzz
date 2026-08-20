@@ -84,6 +84,19 @@ impl SpendGuardState {
     pub fn is_in_grace(&self, now_ms: i64) -> bool {
         self.grace_until_ms.is_some_and(|u| now_ms < u)
     }
+    pub fn is_paused(&self) -> bool {
+        !self.paused_scopes.is_empty() || !self.paused_definition_ids.is_empty()
+    }
+    pub fn toggle_global_pause(&mut self, paused: bool) {
+        if paused {
+            if !self.paused_scopes.contains(&"global".to_string()) {
+                self.paused_scopes.push("global".to_string());
+            }
+        } else {
+            self.paused_scopes.clear();
+            self.paused_definition_ids.clear();
+        }
+    }
 
     /// Record a wake. Returns true if budget exceeded (caller should trigger scoped pause).
     pub fn record_wake(&mut self, now_ms: i64) -> Result<bool, LifecycleError> {

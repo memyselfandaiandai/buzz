@@ -54,6 +54,8 @@ pub struct AppState {
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
     pub huddle_state: Mutex<HuddleState>,
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
+    pub human_card_broker: Mutex<buzz_lifecycle::HumanCardBroker>,
+    pub spend_guard_state: Mutex<buzz_lifecycle::SpendGuardState>,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
@@ -215,7 +217,12 @@ pub fn build_app_state() -> AppState {
         managed_agent_processes: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
-        huddle_audio: Default::default(),
+        huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState::default(),
+        human_card_broker: Mutex::new(buzz_lifecycle::HumanCardBroker::new()),
+        spend_guard_state: Mutex::new(
+            buzz_lifecycle::SpendGuardState::new(buzz_lifecycle::SpendGuardConfig::default(), 0)
+                .expect("default spend guard config is valid"),
+        ),
         app_handle: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(

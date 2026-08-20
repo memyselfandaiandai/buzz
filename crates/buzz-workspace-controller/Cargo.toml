@@ -7,7 +7,7 @@ license.workspace = true
 description = "Provider-neutral durable disposable-workspace controller for Buzz"
 
 [dependencies]
-rusqlite = { version = "=0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

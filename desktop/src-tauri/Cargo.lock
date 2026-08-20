@@ -1092,9 +1092,11 @@ dependencies = [
  "block2",
  "buzz-agent",
  "buzz-core",
+ "buzz-lifecycle",
  "buzz-media",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-secrets",
  "buzz-terminal",
  "buzz-voice",
  "bytes",
@@ -1174,6 +1176,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-media"
 version = "0.1.0"
 dependencies = [
@@ -1223,6 +1236,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "buzz-secrets"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "keyring",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

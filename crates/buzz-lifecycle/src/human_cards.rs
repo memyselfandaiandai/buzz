@@ -166,6 +166,9 @@ impl HumanCardBroker {
     pub fn get(&self, card_id: &str) -> Option<&HumanCard> {
         self.cards.get(card_id)
     }
+    pub fn all_cards(&self) -> Vec<HumanCard> {
+        self.cards.values().cloned().collect()
+    }
     /// Exactly-once answer→resume. Second caller gets `AlreadyAnswered`. Resume flag is set atomically with the answer.
     pub fn answer(
         &mut self,
