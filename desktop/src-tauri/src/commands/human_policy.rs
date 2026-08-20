@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::app_state::AppState;
-use buzz_lifecycle::{CardAnswer, CardChoice, CardKind, HumanCard, SpendGuardConfig};
+use buzz_lifecycle::{
+    CardAnswer, CardChoice, CardKind, CaptureManifest, DryRunRequest, DryRunResult,
+    HumanCard, ManifestFile, PreflightCheck, PreflightFrame, SkillCurator, SkillVersion,
+    SpendGuardConfig,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HumanCardWire {
@@ -199,4 +203,38 @@ pub async fn toggle_spend_guard_pause(
         snoozed: guard.is_snoozed(now),
         in_grace: guard.is_in_grace(now),
     })
+}
+
+#[tauri::command]
+pub async fn list_curated_skills(
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillVersion>, String> {
+    let curator = state.skill_curator.lock().map_err(|e| e.to_string())?;
+    Ok(curator.all_skills())
+}
+
+#[tauri::command]
+pub async fn preflight_skill_capture(
+    owner_id: String,
+    manifest: CaptureManifest,
+    frame_a: PreflightFrame,
+    frame_b: PreflightFrame,
+    state: State<'_, AppState>,
+) -> Result<SkillVersion, String> {
+    let mut curator = state.skill_curator.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let manifest_id = manifest.manifest_id.clone();
+    curator.capture(manifest).map_err(|e| format!("{:?}", e))?;
+    curator
+        .create_private_skill(&owner_id, &manifest_id, (&frame_a, &frame_b), now)
+        .map_err(|e| format!("{:?}", e))
+}
+
+#[tauri::command]
+pub async fn dry_run_skill_capability(
+    req: DryRunRequest,
+    state: State<'_, AppState>,
+) -> Result<DryRunResult, String> {
+    let curator = state.skill_curator.lock().map_err(|e| e.to_string())?;
+    curator.dry_run(&req).map_err(|e| format!("{:?}", e))
 }

@@ -2,7 +2,7 @@ import { AgentDefaultsSettingsCard } from "./AgentDefaultsSettingsCard";
 import { HarnessesSettingsPanel } from "./HarnessesSettingsPanel";
 import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
 import { SpendGuardSettingsCard } from "./SpendGuardSettingsCard";
-import { SettingsOptionGroupList } from "./SettingsOptionGroup";
+import { SkillCuratorSettingsCard } from "./SkillCuratorSettingsCard";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
 export function AgentsSettingsPanel() {
@@ -13,12 +13,13 @@ export function AgentsSettingsPanel() {
         description="Control how agents behave, enforce spend fences, and supervise local executions."
       />
 
-      <SettingsOptionGroupList>
+      <div className="space-y-6">
         <SpendGuardSettingsCard />
+        <SkillCuratorSettingsCard />
         <PreventSleepSettingsCard />
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />
-      </SettingsOptionGroupList>
+      </div>
     </section>
   );
 }

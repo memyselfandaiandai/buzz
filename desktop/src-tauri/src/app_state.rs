@@ -56,6 +56,7 @@ pub struct AppState {
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
     pub human_card_broker: Mutex<buzz_lifecycle::HumanCardBroker>,
     pub spend_guard_state: Mutex<buzz_lifecycle::SpendGuardState>,
+    pub skill_curator: Mutex<buzz_lifecycle::SkillCurator>,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
@@ -223,6 +224,13 @@ pub fn build_app_state() -> AppState {
             buzz_lifecycle::SpendGuardState::new(buzz_lifecycle::SpendGuardConfig::default(), 0)
                 .expect("default spend guard config is valid"),
         ),
+        skill_curator: Mutex::new(buzz_lifecycle::SkillCurator::new(vec![
+            "fs:read".to_string(),
+            "fs:write".to_string(),
+            "terminal:exec".to_string(),
+            "web:search".to_string(),
+            "web:extract".to_string(),
+        ])),
         app_handle: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(

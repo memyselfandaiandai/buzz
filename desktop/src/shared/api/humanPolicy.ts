@@ -74,6 +74,69 @@ export async function updateSpendGuardConfig(config: SpendGuardConfig): Promise<
   return invokeTauri<SpendGuardStatus>("update_spend_guard_config", { config });
 }
 
-export async function toggleSpendGuardPause(pause: boolean): Promise<SpendGuardStatus> {
-  return invokeTauri<SpendGuardStatus>("toggle_spend_guard_pause", { pause });
+export async function toggleSpendGuardPause(paused: boolean): Promise<SpendGuardStatus> {
+  return invokeTauri<SpendGuardStatus>("toggle_spend_guard_pause", { paused });
+}
+
+export interface SkillVersion {
+  skill_id: string;
+  owner_id: string;
+  version: number;
+  manifest_id: string;
+  created_at_ms: number;
+  private: boolean;
+}
+
+export interface ManifestFile {
+  path: string;
+  sha256: string;
+}
+
+export interface CaptureManifest {
+  manifest_id: string;
+  owner_id: string;
+  title: string;
+  summary: string;
+  files: ManifestFile[];
+}
+
+export interface PreflightCheck {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface PreflightFrame {
+  frame_id: string;
+  checks: PreflightCheck[];
+}
+
+export interface DryRunRequest {
+  skill_id: string;
+  version: number;
+  capabilities: string[];
+}
+
+export interface DryRunResult {
+  skill_id: string;
+  version: number;
+  allowed: boolean;
+  detail: string;
+}
+
+export async function listCuratedSkills(): Promise<SkillVersion[]> {
+  return invokeTauri<SkillVersion[]>("list_curated_skills");
+}
+
+export async function preflightSkillCapture(params: {
+  owner_id: string;
+  manifest: CaptureManifest;
+  frame_a: PreflightFrame;
+  frame_b: PreflightFrame;
+}): Promise<SkillVersion> {
+  return invokeTauri<SkillVersion>("preflight_skill_capture", params);
+}
+
+export async function dryRunSkillCapability(req: DryRunRequest): Promise<DryRunResult> {
+  return invokeTauri<DryRunResult>("dry_run_skill_capability", { req });
 }

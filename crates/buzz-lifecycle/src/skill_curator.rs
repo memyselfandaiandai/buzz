@@ -193,6 +193,12 @@ impl SkillCurator {
     pub fn versions(&self, skill_id: &str) -> Option<&[SkillVersion]> {
         self.skills.get(skill_id).map(|v| v.as_slice())
     }
+    pub fn all_skills(&self) -> Vec<SkillVersion> {
+        self.skills
+            .values()
+            .filter_map(|versions| versions.last().cloned())
+            .collect()
+    }
 
     /// Capability-bounded dry-run: all requested capabilities must be in the allowlist.
     pub fn dry_run(&self, req: &DryRunRequest) -> Result<DryRunResult, LifecycleError> {
