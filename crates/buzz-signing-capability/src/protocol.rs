@@ -417,6 +417,17 @@ pub enum GitObjectKind {
     Tag,
 }
 
+/// Structured request to lease a bounded secret for tool execution.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretLeaseRequest {
+    /// Target secret key to lease.
+    pub secret_key: String,
+    /// Tool or capability requesting the secret lease.
+    pub tool_name: String,
+}
+
+structural_debug!(SecretLeaseRequest, "SecretLeaseRequest", { secret_key_bytes: |value: &SecretLeaseRequest| value.secret_key.len(), tool_name_bytes: |value: &SecretLeaseRequest| value.tool_name.len() });
+
 /// Structured request to sign one bounded Git commit or tag payload.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitObjectSignRequest {
@@ -456,6 +467,8 @@ pub enum OperationKind {
     GitNip98Sign,
     /// Sign a canonical Git commit or tag payload.
     GitObjectSign,
+    /// Lease a bounded secret for tool execution.
+    SecretLease,
 }
 
 /// Structured operations accepted by the v1 protocol.
@@ -485,6 +498,8 @@ pub enum Operation {
     GitNip98Sign(GitNip98SignRequest),
     /// Sign a canonical Git object payload.
     GitObjectSign(GitObjectSignRequest),
+    /// Lease a bounded secret for tool execution.
+    SecretLease(SecretLeaseRequest),
 }
 
 impl Operation {
@@ -501,6 +516,7 @@ impl Operation {
             Self::EngramBuildEvent(_) => OperationKind::EngramBuildEvent,
             Self::GitNip98Sign(_) => OperationKind::GitNip98Sign,
             Self::GitObjectSign(_) => OperationKind::GitObjectSign,
+            Self::SecretLease(_) => OperationKind::SecretLease,
         }
     }
 
@@ -581,6 +597,12 @@ pub enum OperationResult {
     EngramPlaintext { body_json: String },
     /// Armored NIP-GS Git signature.
     GitSignature { armored_signature: String },
+    /// Leased secret value and expiration.
+    SecretLease {
+        secret_key: String,
+        secret_value: String,
+        expires_at_unix_ms: i64,
+    },
 }
 
 impl fmt::Debug for OperationResult {
@@ -598,6 +620,10 @@ impl fmt::Debug for OperationResult {
             Self::EngramCoordinate { d_tag } => ("engram_coordinate", d_tag.len()),
             Self::EngramPlaintext { body_json } => ("engram_plaintext", body_json.len()),
             Self::GitSignature { armored_signature } => ("git_signature", armored_signature.len()),
+            Self::SecretLease { secret_key, secret_value, .. } => (
+                "secret_lease",
+                secret_key.len() + secret_value.len(),
+            ),
         };
         formatter
             .debug_struct("OperationResult")

@@ -224,6 +224,11 @@ impl SecretBroker {
 }
 
 #[cfg(feature = "os-keyring")]
+pub use keyring_provider::OsKeyringVault;
+#[cfg(feature = "bws")]
+pub use bws_provider::BwsVault;
+
+#[cfg(feature = "os-keyring")]
 pub mod keyring_provider {
     use super::*;
 

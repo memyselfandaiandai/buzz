@@ -16,7 +16,7 @@ pub use protocol::{
     EngramCoordinateRequest, EngramDecryptRequest, GitNip98SignRequest, GitObjectKind,
     GitObjectSignRequest, HttpMethod, IdentityMetadata, Nip42SignRequest, Nip98SignRequest,
     NostrEventSignRequest, Operation, OperationKind, OperationResult, ProtocolError, RelayOrigin,
-    RequestEnvelope, ResponseEnvelope, StableErrorKind, StructuredTag, TrustedExecutionError,
+    RequestEnvelope, ResponseEnvelope, SecretLeaseRequest, StableErrorKind, StructuredTag, TrustedExecutionError,
     TrustedOperationExecutor, PROTOCOL_VERSION,
 };
 pub use registry::{

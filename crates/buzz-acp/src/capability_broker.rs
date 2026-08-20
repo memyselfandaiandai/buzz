@@ -88,6 +88,7 @@ impl BrokerChildSpawner {
             .allow_operation(OperationKind::IdentityMetadata)
             .allow_operation(OperationKind::NostrEventSign)
             .allow_operation(OperationKind::Nip98Sign)
+            .allow_operation(OperationKind::SecretLease)
             .allow_http(HttpMethod::Post, HttpPathRule::Exact("/query".to_owned()))
             .allow_http(HttpMethod::Post, HttpPathRule::Exact("/events".to_owned()));
         for kind in [9, 45_001, 45_003, 40_008, 40_003, 9_005, 45_002] {
@@ -317,6 +318,7 @@ struct ConfigSigningExecutor {
     auth_tag: Option<Tag>,
     auth_conditions: Option<String>,
     expiries: Arc<Mutex<HashMap<Uuid, i64>>>,
+    secret_vault: Arc<dyn buzz_secrets::SecretVaultProvider>,
     #[cfg(test)]
     completed_signatures: AtomicU64,
 }
@@ -338,6 +340,7 @@ impl ConfigSigningExecutor {
         relay: RelayOrigin,
         auth_tag_json: Option<&str>,
         expiries: Arc<Mutex<HashMap<Uuid, i64>>>,
+        secret_vault: Option<Arc<dyn buzz_secrets::SecretVaultProvider>>,
     ) -> Result<Self, BrokerError> {
         let (canonical_auth_tag, auth_tag, auth_conditions) = match auth_tag_json {
             Some(raw) if !raw.is_empty() => {
@@ -359,6 +362,7 @@ impl ConfigSigningExecutor {
             }
             Some(_) | None => (None, None, None),
         };
+        let secret_vault = secret_vault.unwrap_or_else(|| Arc::new(buzz_secrets::OsKeyringVault::new("buzz-agent-vault")));
         Ok(Self {
             keys,
             relay,
@@ -366,6 +370,7 @@ impl ConfigSigningExecutor {
             auth_tag,
             auth_conditions,
             expiries,
+            secret_vault,
             #[cfg(test)]
             completed_signatures: AtomicU64::new(0),
         })
@@ -487,6 +492,28 @@ impl TrustedOperationExecutor for ConfigSigningExecutor {
             }
             Operation::NostrEventSign(request) => self.sign_event(request),
             Operation::Nip98Sign(request) => self.sign_nip98(request),
+            Operation::SecretLease(request) => {
+                let expires_at_unix_ms = lock(&self.expiries)
+                    .get(&authorized.capability_id())
+                    .copied()
+                    .ok_or_else(Self::stable_internal)?;
+                let secret_value = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        self.secret_vault.get_secret(&request.secret_key).await
+                    })
+                })
+                .map_err(|e| match e {
+                    buzz_secrets::SecretError::NotFound(_) => {
+                        TrustedExecutionError::new(StableErrorKind::ResourceNotAllowed)
+                    }
+                    _ => Self::stable_internal(),
+                })?;
+                Ok(OperationResult::SecretLease {
+                    secret_key: request.secret_key.clone(),
+                    secret_value,
+                    expires_at_unix_ms,
+                })
+            }
             _ => Err(TrustedExecutionError::new(
                 StableErrorKind::OperationNotAllowed,
             )),
@@ -580,11 +607,13 @@ impl CapabilityBroker {
         Self::start(config.keys.clone(), relay, auth_tag_json, advertised_ip).await
     }
 
-    async fn start(
+    /// Start a broker instance with a custom secret vault provider (useful for testing and pluggable vaults).
+    pub async fn start_with_vault(
         keys: Keys,
         relay: RelayOrigin,
         auth_tag_json: Option<&str>,
         advertised_ip: Option<std::net::Ipv4Addr>,
+        secret_vault: Option<Arc<dyn buzz_secrets::SecretVaultProvider>>,
     ) -> Result<Self, BrokerError> {
         let bind_addr = advertised_ip
             .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
@@ -593,7 +622,7 @@ impl CapabilityBroker {
             .map_err(|_| BrokerError::Bind)?;
         let address = listener.local_addr().map_err(|_| BrokerError::Bind)?;
         let expiries = Arc::new(Mutex::new(HashMap::new()));
-        let executor = ConfigSigningExecutor::new(keys, relay.clone(), auth_tag_json, expiries)?;
+        let executor = ConfigSigningExecutor::new(keys, relay.clone(), auth_tag_json, expiries, secret_vault)?;
         let state = Arc::new(BrokerState {
             registry: CapabilityRegistry::new(),
             executor,
@@ -612,6 +641,15 @@ impl CapabilityBroker {
             shutdown_tx: Some(shutdown_tx),
             task,
         })
+    }
+
+    async fn start(
+        keys: Keys,
+        relay: RelayOrigin,
+        auth_tag_json: Option<&str>,
+        advertised_ip: Option<std::net::Ipv4Addr>,
+    ) -> Result<Self, BrokerError> {
+        Self::start_with_vault(keys, relay, auth_tag_json, advertised_ip, None).await
     }
 
     /// Attempt to discover the Tailscale IPv4 address by running

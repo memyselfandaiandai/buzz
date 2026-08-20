@@ -77,6 +77,8 @@ pub struct CapabilityScope {
     http_rules: Vec<HttpScopeRule>,
     channel_ids: BTreeSet<String>,
     peer_pubkeys: BTreeSet<String>,
+    allowed_secrets: BTreeSet<String>,
+    allowed_secret_tools: BTreeSet<String>,
 }
 
 impl CapabilityScope {
@@ -223,6 +225,18 @@ impl CapabilityScope {
                 }
                 Ok(())
             }
+            Operation::SecretLease(request) => {
+                if request.secret_key.is_empty() || request.tool_name.is_empty() {
+                    return Err(ProtocolError::new(StableErrorKind::InvalidPayload));
+                }
+                if !self.allowed_secrets.is_empty() && !self.allowed_secrets.contains(&request.secret_key) {
+                    return Err(ProtocolError::new(StableErrorKind::ResourceNotAllowed));
+                }
+                if !self.allowed_secret_tools.is_empty() && !self.allowed_secret_tools.contains(&request.tool_name) {
+                    return Err(ProtocolError::new(StableErrorKind::ResourceNotAllowed));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -295,6 +309,8 @@ impl ScopeBuilder {
                 http_rules: Vec::new(),
                 channel_ids: BTreeSet::new(),
                 peer_pubkeys: BTreeSet::new(),
+                allowed_secrets: BTreeSet::new(),
+                allowed_secret_tools: BTreeSet::new(),
             },
         }
     }
@@ -302,6 +318,18 @@ impl ScopeBuilder {
     /// Allow one structured operation.
     pub fn allow_operation(mut self, operation: OperationKind) -> Self {
         self.scope.operations.insert(operation);
+        self
+    }
+
+    /// Allow leasing a specific secret key.
+    pub fn allow_secret(mut self, secret_key: impl Into<String>) -> Self {
+        self.scope.allowed_secrets.insert(secret_key.into());
+        self
+    }
+
+    /// Allow leasing secrets for a specific tool.
+    pub fn allow_secret_tool(mut self, tool_name: impl Into<String>) -> Self {
+        self.scope.allowed_secret_tools.insert(tool_name.into());
         self
     }
 

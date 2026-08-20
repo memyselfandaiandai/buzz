@@ -399,6 +399,23 @@ impl CapabilityClient {
         })
     }
 
+    /// Ask the broker to lease a bounded secret for tool execution.
+    pub async fn acquire_secret(
+        &self,
+        secret_key: impl Into<String>,
+        tool_name: impl Into<String>,
+    ) -> Result<buzz_signing_capability::OperationResult, ClientError> {
+        let request = buzz_signing_capability::SecretLeaseRequest {
+            secret_key: secret_key.into(),
+            tool_name: tool_name.into(),
+        };
+        let result = self.execute(Operation::SecretLease(request)).await?;
+        if !matches!(result, OperationResult::SecretLease { .. }) {
+            return Err(ClientError::UnexpectedResult);
+        }
+        Ok(result)
+    }
+
     fn parse_environment<I>(variables: I) -> Result<Self, ClientError>
     where
         I: IntoIterator<Item = (OsString, OsString)>,

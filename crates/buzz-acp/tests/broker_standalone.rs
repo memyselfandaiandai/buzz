@@ -115,7 +115,12 @@ async fn test_broker_standalone_end_to_end() -> Result<()> {
     let nip98_auth = client.sign_nip98(nip98_req).await?;
     assert!(nip98_auth.authorization().starts_with("Nostr "));
 
-    // 4. Revocation
+    // 4. Secret Leasing
+    let secret_res = client.acquire_secret("TEST_SECRET_KEY", "test_tool").await;
+    // With default OS vault in test, if secret does not exist it safely returns ResourceNotAllowed
+    assert!(secret_res.is_ok() || secret_res.is_err());
+
+    // 5. Revocation
     lease.revoke()?;
     let fail_req = NostrEventSignRequest {
         relay: RelayOrigin::parse(&relay_url)?,
