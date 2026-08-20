@@ -167,6 +167,18 @@ impl AutomationBroker {
         Ok(cur)
     }
 
+    pub fn all_definitions(&self) -> Vec<AutomationDefinition> {
+        let mut list: Vec<AutomationDefinition> = self.definitions.values().cloned().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
+    pub fn all_runs(&self) -> Vec<AutomationRun> {
+        let mut list: Vec<AutomationRun> = self.runs.values().cloned().collect();
+        list.sort_by_key(|r| -r.created_at_ms);
+        list
+    }
+
     pub fn get_definition(&self, definition_id: &str) -> Option<&AutomationDefinition> {
         self.definitions.get(definition_id)
     }

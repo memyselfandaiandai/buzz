@@ -4,7 +4,7 @@ use crate::app_state::AppState;
 use buzz_lifecycle::{
     CardAnswer, CardChoice, CardKind, CaptureManifest, DryRunRequest, DryRunResult,
     HumanCard, ManifestFile, PreflightCheck, PreflightFrame, SkillCurator, SkillVersion,
-    SpendGuardConfig,
+    SpendGuardConfig, AutomationDefinition, AutomationRun, AutomationWake,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,4 +272,76 @@ pub async fn toggle_workspace_recording(
     let obs = registry.get_or_create(&workspace_id);
     obs.set_recording(enabled);
     Ok(obs.clone())
+}
+
+#[tauri::command]
+pub async fn list_automation_definitions(
+    state: State<'_, AppState>,
+) -> Result<Vec<AutomationDefinition>, String> {
+    let broker = state.automation_broker.lock().map_err(|e| e.to_string())?;
+    Ok(broker.all_definitions())
+}
+
+#[tauri::command]
+pub async fn create_automation_definition(
+    definition_id: String,
+    name: String,
+    owner_id: String,
+    config_json: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<AutomationDefinition, String> {
+    let mut broker = state.automation_broker.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let def = AutomationDefinition {
+        definition_id,
+        owner_id,
+        name,
+        revision: 1,
+        enabled: false,
+        created_at_ms: now,
+        updated_at_ms: now,
+        config_json,
+    };
+    broker.create_definition(def).map_err(|e| format!("{:?}", e))
+}
+
+#[tauri::command]
+pub async fn toggle_automation_enabled(
+    definition_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<AutomationDefinition, String> {
+    let mut broker = state.automation_broker.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    broker.set_enabled(&definition_id, enabled, now).map_err(|e| format!("{:?}", e))
+}
+
+#[tauri::command]
+pub async fn list_automation_runs(
+    state: State<'_, AppState>,
+) -> Result<Vec<AutomationRun>, String> {
+    let broker = state.automation_broker.lock().map_err(|e| e.to_string())?;
+    Ok(broker.all_runs())
+}
+
+#[tauri::command]
+pub async fn trigger_automation_wake(
+    wake_id: String,
+    definition_id: String,
+    owner_id: String,
+    revision: u64,
+    payload_json: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<AutomationWake, String> {
+    let mut broker = state.automation_broker.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let wake = AutomationWake {
+        wake_id,
+        definition_id,
+        owner_id,
+        revision,
+        payload_json,
+        created_at_ms: now,
+    };
+    broker.create_wake(wake).map_err(|e| format!("{:?}", e))
 }

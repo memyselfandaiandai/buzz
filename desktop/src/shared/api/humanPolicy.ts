@@ -189,3 +189,71 @@ export async function toggleWorkspaceRecording(params: {
   return invokeTauri<WorkspaceObserverContract>("toggle_workspace_recording", params);
 }
 
+export interface AutomationDefinition {
+  definition_id: string;
+  owner_id: string;
+  name: string;
+  revision: number;
+  enabled: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  config_json: unknown;
+}
+
+export type AutomationRunState = "pending" | "delivered" | "acked" | "failed";
+
+export interface AutomationRun {
+  run_id: string;
+  wake_id: string;
+  definition_id: string;
+  owner_id: string;
+  revision: number;
+  state: AutomationRunState;
+  attempts: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface AutomationWake {
+  wake_id: string;
+  definition_id: string;
+  owner_id: string;
+  revision: number;
+  payload_json: unknown;
+  created_at_ms: number;
+}
+
+export async function listAutomationDefinitions(): Promise<AutomationDefinition[]> {
+  return invokeTauri<AutomationDefinition[]>("list_automation_definitions");
+}
+
+export async function createAutomationDefinition(params: {
+  definitionId: string;
+  name: string;
+  ownerId: string;
+  configJson: unknown;
+}): Promise<AutomationDefinition> {
+  return invokeTauri<AutomationDefinition>("create_automation_definition", params);
+}
+
+export async function toggleAutomationEnabled(params: {
+  definitionId: string;
+  enabled: boolean;
+}): Promise<AutomationDefinition> {
+  return invokeTauri<AutomationDefinition>("toggle_automation_enabled", params);
+}
+
+export async function listAutomationRuns(): Promise<AutomationRun[]> {
+  return invokeTauri<AutomationRun[]>("list_automation_runs");
+}
+
+export async function triggerAutomationWake(params: {
+  wakeId: string;
+  definitionId: string;
+  ownerId: string;
+  revision: number;
+  payloadJson: unknown;
+}): Promise<AutomationWake> {
+  return invokeTauri<AutomationWake>("trigger_automation_wake", params);
+}
+
