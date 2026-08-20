@@ -238,3 +238,38 @@ pub async fn dry_run_skill_capability(
     let curator = state.skill_curator.lock().map_err(|e| e.to_string())?;
     curator.dry_run(&req).map_err(|e| format!("{:?}", e))
 }
+
+#[tauri::command]
+pub async fn get_workspace_observer(
+    workspace_id: String,
+    state: State<'_, AppState>,
+) -> Result<buzz_workspace_controller::WorkspaceObserverContract, String> {
+    let mut registry = state.workspace_observers.lock().map_err(|e| e.to_string())?;
+    Ok(registry.get_or_create(&workspace_id).clone())
+}
+
+#[tauri::command]
+pub async fn set_workspace_observer_presence(
+    workspace_id: String,
+    viewer_id: String,
+    active_view: String,
+    state: State<'_, AppState>,
+) -> Result<buzz_workspace_controller::WorkspaceObserverContract, String> {
+    let mut registry = state.workspace_observers.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let obs = registry.get_or_create(&workspace_id);
+    obs.update_presence(viewer_id, active_view, now);
+    Ok(obs.clone())
+}
+
+#[tauri::command]
+pub async fn toggle_workspace_recording(
+    workspace_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<buzz_workspace_controller::WorkspaceObserverContract, String> {
+    let mut registry = state.workspace_observers.lock().map_err(|e| e.to_string())?;
+    let obs = registry.get_or_create(&workspace_id);
+    obs.set_recording(enabled);
+    Ok(obs.clone())
+}

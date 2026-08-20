@@ -57,6 +57,7 @@ pub struct AppState {
     pub human_card_broker: Mutex<buzz_lifecycle::HumanCardBroker>,
     pub spend_guard_state: Mutex<buzz_lifecycle::SpendGuardState>,
     pub skill_curator: Mutex<buzz_lifecycle::SkillCurator>,
+    pub workspace_observers: Mutex<buzz_workspace_controller::WorkspaceObserverRegistry>,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
@@ -231,6 +232,7 @@ pub fn build_app_state() -> AppState {
             "web:search".to_string(),
             "web:extract".to_string(),
         ])),
+        workspace_observers: Mutex::new(buzz_workspace_controller::WorkspaceObserverRegistry::new()),
         app_handle: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(

@@ -14,6 +14,9 @@ use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 
+pub mod observer;
+pub use observer::*;
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum lifetime of a locally modeled activation capability.
 pub const MAX_ACTIVATION_TTL_SECONDS: i64 = 300;

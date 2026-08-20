@@ -3,6 +3,7 @@ import { HarnessesSettingsPanel } from "./HarnessesSettingsPanel";
 import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
 import { SpendGuardSettingsCard } from "./SpendGuardSettingsCard";
 import { SkillCuratorSettingsCard } from "./SkillCuratorSettingsCard";
+import { WorkspaceObserverCard } from "./WorkspaceObserverCard";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
 export function AgentsSettingsPanel() {
@@ -16,6 +17,7 @@ export function AgentsSettingsPanel() {
       <div className="space-y-6">
         <SpendGuardSettingsCard />
         <SkillCuratorSettingsCard />
+        <WorkspaceObserverCard />
         <PreventSleepSettingsCard />
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />

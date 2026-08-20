@@ -140,3 +140,52 @@ export async function preflightSkillCapture(params: {
 export async function dryRunSkillCapability(req: DryRunRequest): Promise<DryRunResult> {
   return invokeTauri<DryRunResult>("dry_run_skill_capability", { req });
 }
+
+export type WorkspaceLifecycleState =
+  | "prepared"
+  | "admitted"
+  | "creating"
+  | "active"
+  | "terminating"
+  | "terminal";
+
+export interface ViewerPresence {
+  viewer_id: string;
+  last_seen_unix_ms: number;
+  active_view: string;
+}
+
+export interface WorkspaceFrameUpdate {
+  frame_seq: number;
+  payload_bytes: number;
+  timestamp_unix_ms: number;
+}
+
+export interface WorkspaceObserverContract {
+  workspace_id: string;
+  lifecycle: WorkspaceLifecycleState;
+  viewers: ViewerPresence[];
+  frame_updates: WorkspaceFrameUpdate[];
+  recording_enabled: boolean;
+  scheduled_input_json?: string | null;
+}
+
+export async function getWorkspaceObserver(workspaceId: string): Promise<WorkspaceObserverContract> {
+  return invokeTauri<WorkspaceObserverContract>("get_workspace_observer", { workspaceId });
+}
+
+export async function setWorkspaceObserverPresence(params: {
+  workspaceId: string;
+  viewerId: string;
+  activeView: string;
+}): Promise<WorkspaceObserverContract> {
+  return invokeTauri<WorkspaceObserverContract>("set_workspace_observer_presence", params);
+}
+
+export async function toggleWorkspaceRecording(params: {
+  workspaceId: string;
+  enabled: boolean;
+}): Promise<WorkspaceObserverContract> {
+  return invokeTauri<WorkspaceObserverContract>("toggle_workspace_recording", params);
+}
+

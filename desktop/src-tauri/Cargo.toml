@@ -104,6 +104,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 url = "2"
 buzz_lifecycle = { package = "buzz-lifecycle", path = "../../crates/buzz-lifecycle", features = ["cards-automations-skills"] }
 buzz_secrets = { package = "buzz-secrets", path = "../../crates/buzz-secrets" }
+buzz_workspace_controller = { package = "buzz-workspace-controller", path = "../../crates/buzz-workspace-controller" }
 buzz_core_pkg = { package = "buzz-core", path = "../../crates/buzz-core" }
 buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona" }
 buzz_sdk_pkg = { package = "buzz-sdk", path = "../../crates/buzz-sdk" }
