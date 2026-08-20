@@ -51,7 +51,12 @@ impl WorkspaceObserverContract {
         self.lifecycle = state;
     }
 
-    pub fn update_presence(&mut self, viewer_id: impl Into<String>, active_view: impl Into<String>, now_ms: i64) {
+    pub fn update_presence(
+        &mut self,
+        viewer_id: impl Into<String>,
+        active_view: impl Into<String>,
+        now_ms: i64,
+    ) {
         let viewer_id = viewer_id.into();
         let active_view = active_view.into();
         if let Some(existing) = self.viewers.iter_mut().find(|v| v.viewer_id == viewer_id) {
@@ -131,6 +136,9 @@ mod tests {
         assert_eq!(obs.frame_updates.len(), 1);
 
         obs.bind_scheduled_input(r#"{"turn_id":"t-1"}"#);
-        assert_eq!(obs.scheduled_input_json.as_deref(), Some(r#"{"turn_id":"t-1"}"#));
+        assert_eq!(
+            obs.scheduled_input_json.as_deref(),
+            Some(r#"{"turn_id":"t-1"}"#)
+        );
     }
 }

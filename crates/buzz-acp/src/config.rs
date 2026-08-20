@@ -558,6 +558,27 @@ pub struct CliArgs {
     #[cfg(feature = "signing-capability-broker")]
     #[arg(long, env = "BUZZ_ACP_BROKER_ADVERTISE_IP")]
     pub broker_advertise_ip: Option<std::net::Ipv4Addr>,
+
+    /// Secret identifiers explicitly allowed for broker-v1 lease requests.
+    /// Values are identifiers only; never provide secret values or tokens.
+    #[cfg(feature = "signing-capability-broker")]
+    #[arg(
+        long = "broker-allowed-secret",
+        env = "BUZZ_ACP_BROKER_ALLOWED_SECRETS",
+        hide_env_values = true,
+        value_delimiter = ','
+    )]
+    pub broker_allowed_secrets: Option<Vec<String>>,
+
+    /// Tool identifiers explicitly allowed to consume broker-v1 secret leases.
+    #[cfg(feature = "signing-capability-broker")]
+    #[arg(
+        long = "broker-allowed-secret-tool",
+        env = "BUZZ_ACP_BROKER_ALLOWED_SECRET_TOOLS",
+        hide_env_values = true,
+        value_delimiter = ','
+    )]
+    pub broker_allowed_secret_tools: Option<Vec<String>>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -582,6 +603,12 @@ pub struct Config {
     /// unset. Only effective when `signing-capability-broker` is enabled.
     #[cfg(feature = "signing-capability-broker")]
     pub broker_advertise_ip: Option<std::net::Ipv4Addr>,
+    /// Validated secret identifiers authorized for broker-v1 leases.
+    #[cfg(feature = "signing-capability-broker")]
+    pub broker_allowed_secrets: Vec<String>,
+    /// Validated tool identifiers authorized to consume broker-v1 leases.
+    #[cfg(feature = "signing-capability-broker")]
+    pub broker_allowed_secret_tools: Vec<String>,
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
@@ -667,6 +694,52 @@ pub struct Config {
 
 /// Maximum length, in characters, of a session title sent to the adapter.
 const SESSION_TITLE_MAX_CHARS: usize = 80;
+
+#[cfg(feature = "signing-capability-broker")]
+const MAX_BROKER_SECRET_SCOPE_IDENTIFIERS: usize = 64;
+#[cfg(feature = "signing-capability-broker")]
+const MAX_BROKER_SECRET_SCOPE_IDENTIFIER_BYTES: usize = 255;
+
+#[cfg(feature = "signing-capability-broker")]
+fn validate_broker_secret_scope(
+    secrets: Option<Vec<String>>,
+    tools: Option<Vec<String>>,
+) -> Result<(Vec<String>, Vec<String>), ConfigError> {
+    let (secrets, tools) = match (secrets, tools) {
+        (None, None) => return Ok((Vec::new(), Vec::new())),
+        (Some(secrets), Some(tools)) if !secrets.is_empty() && !tools.is_empty() => {
+            (secrets, tools)
+        }
+        _ => {
+            return Err(ConfigError::ConfigFile(
+                "broker secret scope requires both non-empty allowed-secret and allowed-secret-tool lists"
+                    .to_string(),
+            ))
+        }
+    };
+    if secrets.len() > MAX_BROKER_SECRET_SCOPE_IDENTIFIERS
+        || tools.len() > MAX_BROKER_SECRET_SCOPE_IDENTIFIERS
+    {
+        return Err(ConfigError::ConfigFile(
+            "broker secret scope exceeds the identifier count limit".to_string(),
+        ));
+    }
+    let valid_identifier = |value: &str| {
+        !value.is_empty()
+            && value.len() <= MAX_BROKER_SECRET_SCOPE_IDENTIFIER_BYTES
+            && !value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+    };
+    if !secrets.iter().all(|value| valid_identifier(value))
+        || !tools.iter().all(|value| valid_identifier(value))
+    {
+        return Err(ConfigError::ConfigFile(
+            "broker secret scope contains an invalid identifier".to_string(),
+        ));
+    }
+    Ok((secrets, tools))
+}
 
 /// Normalize a configured session title into something safe to hand an adapter.
 ///
@@ -1164,12 +1237,22 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        #[cfg(feature = "signing-capability-broker")]
+        let (broker_allowed_secrets, broker_allowed_secret_tools) = validate_broker_secret_scope(
+            args.broker_allowed_secrets,
+            args.broker_allowed_secret_tools,
+        )?;
+
         let config = Config {
             credential_mode,
             #[cfg(feature = "signing-capability-broker")]
             broker_spawner: None,
             #[cfg(feature = "signing-capability-broker")]
             broker_advertise_ip: args.broker_advertise_ip,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secrets,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secret_tools,
             keys,
             relay_url: args.relay_url,
             agent_command,
@@ -1641,6 +1724,67 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "signing-capability-broker")]
+    #[test]
+    fn broker_secret_scope_is_both_or_neither_and_rejects_whitespace() {
+        assert_eq!(
+            validate_broker_secret_scope(None, None).expect("default disabled scope"),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            validate_broker_secret_scope(
+                Some(vec!["OPENROUTER_API_KEY".to_string()]),
+                Some(vec!["model_inference".to_string()]),
+            )
+            .expect("explicit scope"),
+            (
+                vec!["OPENROUTER_API_KEY".to_string()],
+                vec!["model_inference".to_string()]
+            )
+        );
+
+        for (secrets, tools) in [
+            (Some(vec!["secret-id".to_string()]), None),
+            (None, Some(vec!["tool-id".to_string()])),
+            (Some(Vec::new()), Some(vec!["tool-id".to_string()])),
+            (Some(vec!["secret-id".to_string()]), Some(Vec::new())),
+        ] {
+            assert!(validate_broker_secret_scope(secrets, tools).is_err());
+        }
+        for invalid in [" secret-id", "secret-id ", "secret id", "\tsecret-id"] {
+            assert!(validate_broker_secret_scope(
+                Some(vec![invalid.to_string()]),
+                Some(vec!["tool-id".to_string()]),
+            )
+            .is_err());
+            assert!(validate_broker_secret_scope(
+                Some(vec!["secret-id".to_string()]),
+                Some(vec![invalid.to_string()]),
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(feature = "signing-capability-broker")]
+    #[test]
+    fn broker_secret_scope_enforces_identifier_limits() {
+        assert!(validate_broker_secret_scope(
+            Some(vec![
+                "s".to_string();
+                MAX_BROKER_SECRET_SCOPE_IDENTIFIERS + 1
+            ]),
+            Some(vec!["tool-id".to_string()]),
+        )
+        .is_err());
+        assert!(validate_broker_secret_scope(
+            Some(vec![
+                "s".repeat(MAX_BROKER_SECRET_SCOPE_IDENTIFIER_BYTES + 1)
+            ]),
+            Some(vec!["tool-id".to_string()]),
+        )
+        .is_err());
+    }
+
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
@@ -1649,6 +1793,10 @@ mod tests {
             broker_spawner: None,
             #[cfg(feature = "signing-capability-broker")]
             broker_advertise_ip: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secrets: Vec::new(),
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secret_tools: Vec::new(),
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),

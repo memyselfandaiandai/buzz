@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::registry::AuthorizedOperation;
 
@@ -82,6 +82,8 @@ pub enum StableErrorKind {
     ReplayConflict,
     /// An exact replay exceeded its per-request retry allowance.
     ReplayLimitExceeded,
+    /// Secret-bearing responses are deliberately never replayed or cached.
+    SensitiveReplayDenied,
     /// An exact request is still being executed.
     RequestInProgress,
     /// A trusted executor failed without exposing its internal message.
@@ -146,6 +148,15 @@ impl CapabilityToken {
 
     pub(crate) fn secret_bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+
+    /// Transfer the bearer into a zeroizing string without copying its allocation.
+    ///
+    /// This is intended for trusted process-boundary projection code that must
+    /// retain one explicit zeroizing owner instead of serializing the bearer
+    /// through an ordinary intermediate value.
+    pub fn into_zeroizing_secret(mut self) -> Zeroizing<String> {
+        Zeroizing::new(std::mem::take(&mut self.0))
     }
 }
 
@@ -280,6 +291,7 @@ impl fmt::Debug for StructuredTag {
 
 /// Structured request to sign a Nostr event.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NostrEventSignRequest {
     /// Bound relay for which the event is intended.
     pub relay: RelayOrigin,
@@ -302,6 +314,7 @@ structural_debug!(NostrEventSignRequest, "NostrEventSignRequest", {
 
 /// Structured request for a NIP-98 authorization event.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Nip98SignRequest {
     /// Bound relay.
     pub relay: RelayOrigin,
@@ -419,6 +432,7 @@ pub enum GitObjectKind {
 
 /// Structured request to lease a bounded secret for tool execution.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretLeaseRequest {
     /// Target secret key to lease.
     pub secret_key: String,
@@ -476,7 +490,12 @@ pub enum OperationKind {
 /// There is intentionally no raw-key export, arbitrary digest, arbitrary URL,
 /// or generic signing operation.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "operation",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Operation {
     /// Return public identity metadata.
     IdentityMetadata,
@@ -537,6 +556,7 @@ impl fmt::Debug for Operation {
 
 /// Versioned request envelope presented to the authorization registry.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
     /// Protocol version; must equal [`PROTOCOL_VERSION`].
     pub version: u16,
@@ -579,8 +599,9 @@ pub struct IdentityMetadata {
 }
 
 /// Typed operation results returned by a future trusted broker.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "result", content = "payload", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum OperationResult {
     /// Public identity metadata.
     IdentityMetadata(IdentityMetadata),
@@ -605,6 +626,90 @@ pub enum OperationResult {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "result", content = "payload", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+enum WireOperationResult {
+    IdentityMetadata(IdentityMetadata),
+    SignedEvent {
+        event_json: String,
+    },
+    Authorization {
+        authorization: String,
+        auth_tag: Option<String>,
+    },
+    EngramCoordinate {
+        d_tag: String,
+    },
+    EngramPlaintext {
+        body_json: String,
+    },
+    GitSignature {
+        armored_signature: String,
+    },
+    SecretLease {
+        secret_key: String,
+        secret_value: ZeroizingString,
+        expires_at_unix_ms: i64,
+    },
+}
+
+struct ZeroizingString(zeroize::Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for ZeroizingString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)
+            .map(zeroize::Zeroizing::new)
+            .map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match WireOperationResult::deserialize(deserializer)? {
+            WireOperationResult::IdentityMetadata(value) => Self::IdentityMetadata(value),
+            WireOperationResult::SignedEvent { event_json } => Self::SignedEvent { event_json },
+            WireOperationResult::Authorization {
+                authorization,
+                auth_tag,
+            } => Self::Authorization {
+                authorization,
+                auth_tag,
+            },
+            WireOperationResult::EngramCoordinate { d_tag } => Self::EngramCoordinate { d_tag },
+            WireOperationResult::EngramPlaintext { body_json } => {
+                Self::EngramPlaintext { body_json }
+            }
+            WireOperationResult::GitSignature { armored_signature } => {
+                Self::GitSignature { armored_signature }
+            }
+            WireOperationResult::SecretLease {
+                secret_key,
+                mut secret_value,
+                expires_at_unix_ms,
+            } => Self::SecretLease {
+                secret_key,
+                secret_value: std::mem::take(&mut *secret_value.0),
+                expires_at_unix_ms,
+            },
+        })
+    }
+}
+
+impl Drop for OperationResult {
+    fn drop(&mut self) {
+        if let Self::SecretLease { secret_value, .. } = self {
+            secret_value.zeroize();
+        }
+    }
+}
+
 impl fmt::Debug for OperationResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (kind, bytes) = match self {
@@ -620,10 +725,11 @@ impl fmt::Debug for OperationResult {
             Self::EngramCoordinate { d_tag } => ("engram_coordinate", d_tag.len()),
             Self::EngramPlaintext { body_json } => ("engram_plaintext", body_json.len()),
             Self::GitSignature { armored_signature } => ("git_signature", armored_signature.len()),
-            Self::SecretLease { secret_key, secret_value, .. } => (
-                "secret_lease",
-                secret_key.len() + secret_value.len(),
-            ),
+            Self::SecretLease {
+                secret_key,
+                secret_value,
+                ..
+            } => ("secret_lease", secret_key.len() + secret_value.len()),
         };
         formatter
             .debug_struct("OperationResult")
@@ -641,7 +747,7 @@ enum ResponseStatus {
 }
 
 /// Versioned response envelope with only stable error classifications.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ResponseEnvelope {
     /// Protocol version.
     pub version: u16,
@@ -687,6 +793,103 @@ impl ResponseEnvelope {
     /// Return the stable error classification, when present.
     pub const fn error_kind(&self) -> Option<StableErrorKind> {
         self.error_kind
+    }
+
+    /// Consume a structurally valid envelope without cloning a possibly-secret result.
+    /// `Err(Some(kind))` is a broker rejection; `Err(None)` is an invalid status shape.
+    pub fn into_result_or_error(self) -> Result<OperationResult, Option<StableErrorKind>> {
+        match (self.status, self.result, self.error_kind) {
+            (ResponseStatus::Ok, Some(result), None) => Ok(result),
+            (ResponseStatus::Error, None, Some(kind)) => Err(Some(kind)),
+            _ => Err(None),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponseEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ResponseVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ResponseVisitor {
+            type Value = ResponseEnvelope;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a strict capability response envelope")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                const FIELDS: &[&str] =
+                    &["version", "request_id", "status", "result", "error_kind"];
+                let mut version = None;
+                let mut request_id = None;
+                let mut status = None;
+                let mut result = None;
+                let mut error_kind = None;
+
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "version" => {
+                            if version.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version = Some(map.next_value()?);
+                        }
+                        "request_id" => {
+                            if request_id.is_some() {
+                                return Err(serde::de::Error::duplicate_field("request_id"));
+                            }
+                            request_id = Some(map.next_value()?);
+                        }
+                        "status" => {
+                            if status.is_some() {
+                                return Err(serde::de::Error::duplicate_field("status"));
+                            }
+                            status = Some(map.next_value()?);
+                        }
+                        "result" => {
+                            if result.is_some() {
+                                return Err(serde::de::Error::duplicate_field("result"));
+                            }
+                            // Deliberately deserialize the typed result directly. A parsed
+                            // SecretLease owns and wipes its secret even if a later field fails.
+                            result = Some(map.next_value()?);
+                        }
+                        "error_kind" => {
+                            if error_kind.is_some() {
+                                return Err(serde::de::Error::duplicate_field("error_kind"));
+                            }
+                            error_kind = Some(map.next_value()?);
+                        }
+                        _ => return Err(serde::de::Error::unknown_field(&field, FIELDS)),
+                    }
+                }
+
+                let version = version.ok_or_else(|| serde::de::Error::missing_field("version"))?;
+                let request_id =
+                    request_id.ok_or_else(|| serde::de::Error::missing_field("request_id"))?;
+                let status = status.ok_or_else(|| serde::de::Error::missing_field("status"))?;
+                match (&status, result.is_some(), error_kind.is_some()) {
+                    (ResponseStatus::Ok, true, false) | (ResponseStatus::Error, false, true) => {
+                        Ok(ResponseEnvelope {
+                            version,
+                            request_id,
+                            status,
+                            result,
+                            error_kind,
+                        })
+                    }
+                    _ => Err(serde::de::Error::custom("invalid response status shape")),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ResponseVisitor)
     }
 }
 

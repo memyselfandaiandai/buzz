@@ -37,6 +37,7 @@ tauri-build = { version = "2", features = [] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 ctrlc = { version = "3", features = ["termination"] }
+nix = { version = "0.30", features = ["signal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "vendored"], optional = true }
@@ -63,9 +64,12 @@ user-idle = { version = "0.6", default-features = false }
 plist = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Foundation"] }
 keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "vendored"], optional = true }
 user-idle = { version = "0.6", default-features = false }
+
+[target.'cfg(windows)'.dev-dependencies]
+process-wrap = { version = "9.1", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
 
 [dependencies]
 atomic-write-file = "0.3"
@@ -97,7 +101,7 @@ nostr = { version = "0.44", features = ["nip44", "nip49"] }
 # OS-entropy source for backup passphrase generation (already in the tree as a
 # transitive dependency; pinned here for direct use).
 getrandom = "0.2"
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 percent-encoding = "2"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt,
+    fmt, io,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     CapabilityScope, CapabilityToken, Operation, OperationKind, ProtocolError, ResponseEnvelope,
@@ -33,6 +34,29 @@ pub const MAX_REGISTRY_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const DIGEST_DOMAIN: &[u8] = b"buzz-signing-capability/request/v1\0";
+
+struct BoundedResponseWriter<'a> {
+    encoded: &'a mut Zeroizing<Vec<u8>>,
+    limit_exceeded: bool,
+}
+
+impl io::Write for BoundedResponseWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.encoded.len()) {
+            self.limit_exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "response exceeds hard byte limit",
+            ));
+        }
+        self.encoded.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Trusted wall-clock and monotonic-style readings supplied by the future broker.
 ///
@@ -92,7 +116,7 @@ pub enum CapabilityState {
 /// Returns true only for the CGNAT `100.64.0.0/10` Tailscale carrier behind `100.x`.
 pub fn is_tailscale_ipv4(addr: std::net::Ipv4Addr) -> bool {
     let [a, b, ..] = addr.octets();
-    a == 100 && b >= 64 && b <= 127
+    a == 100 && (64..=127).contains(&b)
 }
 
 /// Returns true only for `ws://100.x.y.z:<port>` — no DNS, no private LAN, no loopback.
@@ -266,6 +290,9 @@ enum ReplayEntry {
         response_bytes: usize,
         replay_count: u16,
     },
+    SensitiveComplete {
+        payload_digest: [u8; 32],
+    },
 }
 
 impl CapabilityRegistry {
@@ -354,8 +381,7 @@ impl CapabilityRegistry {
 
     /// Permanently revoke a capability.
     ///
-    /// Durable reuse: store `revoked_at_unix_ms` equals `now.unix_ms` on the
-    /// d...[truncated]
+    /// Durable stores should persist the revocation timestamp at this transition.
     pub fn revoke(&self, capability_id: Uuid) -> Result<(), ProtocolError> {
         let mut state = try_lock_registry(&self.inner)
             .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?;
@@ -428,7 +454,14 @@ impl CapabilityRegistry {
                         Ok(AuthorizationOutcome::Replay(response.clone()))
                     }
                 }
-                ReplayEntry::Pending { .. } | ReplayEntry::Complete { .. } => {
+                ReplayEntry::SensitiveComplete {
+                    payload_digest: prior,
+                } if prior.ct_eq(&payload_digest).into() => {
+                    Err(ProtocolError::new(StableErrorKind::SensitiveReplayDenied))
+                }
+                ReplayEntry::Pending { .. }
+                | ReplayEntry::Complete { .. }
+                | ReplayEntry::SensitiveComplete { .. } => {
                     record.state = CapabilityState::Revoked;
                     Err(ProtocolError::new(StableErrorKind::ReplayConflict))
                 }
@@ -465,12 +498,53 @@ impl CapabilityRegistry {
             authorized: AuthorizedOperation {
                 capability_id: request.capability_id,
                 request_id: request.request_id,
+                deadline_unix_ms: request.deadline_unix_ms,
                 operation: request.operation,
                 payload_bytes,
             },
             payload_digest,
             completed: false,
         }))
+    }
+
+    /// Revalidate a completed request immediately before its result is published.
+    ///
+    /// The caller must serialize this check with trusted activation and
+    /// revocation control flow. Only a completed ledger entry can cross the
+    /// publication boundary; pending or missing state revokes the capability.
+    pub fn revalidate_publication(
+        &self,
+        capability_id: Uuid,
+        request_id: Uuid,
+        deadline_unix_ms: i64,
+        now: ClockReading,
+    ) -> Result<(), ProtocolError> {
+        let mut state = try_lock_registry(&self.inner)
+            .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?;
+        let record = state
+            .capabilities
+            .get_mut(&capability_id)
+            .ok_or_else(|| ProtocolError::new(StableErrorKind::UnknownCapability))?;
+        check_clock_and_expiry(record, now)?;
+        match record.state {
+            CapabilityState::Inactive => {
+                return Err(ProtocolError::new(StableErrorKind::Inactive));
+            }
+            CapabilityState::Revoked => {
+                return Err(ProtocolError::new(StableErrorKind::Revoked));
+            }
+            CapabilityState::Active => {}
+        }
+        if deadline_unix_ms <= now.unix_ms {
+            return Err(ProtocolError::new(StableErrorKind::DeadlineExpired));
+        }
+        match record.replay.get(&request_id) {
+            Some(ReplayEntry::Complete { .. } | ReplayEntry::SensitiveComplete { .. }) => Ok(()),
+            Some(ReplayEntry::Pending { .. }) | None => {
+                record.state = CapabilityState::Revoked;
+                Err(ProtocolError::new(StableErrorKind::ReplayConflict))
+            }
+        }
     }
 
     /// Return a non-secret snapshot for tests and operator metrics.
@@ -517,6 +591,7 @@ impl fmt::Debug for AuthorizationOutcome {
 pub struct AuthorizedOperation {
     capability_id: Uuid,
     request_id: Uuid,
+    deadline_unix_ms: i64,
     operation: Operation,
     payload_bytes: u64,
 }
@@ -530,6 +605,11 @@ impl AuthorizedOperation {
     /// Idempotency identifier.
     pub const fn request_id(&self) -> Uuid {
         self.request_id
+    }
+
+    /// Exact caller deadline that bounded authorization.
+    pub const fn deadline_unix_ms(&self) -> i64 {
+        self.deadline_unix_ms
     }
 
     /// Authorized operation kind.
@@ -554,6 +634,7 @@ impl fmt::Debug for AuthorizedOperation {
             .debug_struct("AuthorizedOperation")
             .field("capability_id", &self.capability_id)
             .field("request_id", &self.request_id)
+            .field("deadline_unix_ms", &self.deadline_unix_ms)
             .field("operation_kind", &self.operation.kind())
             .field("payload_bytes", &self.payload_bytes)
             .finish()
@@ -578,23 +659,76 @@ impl AuthorizationPermit {
         &self.authorized
     }
 
-    /// Cache and return a successful response, releasing the concurrency slot.
+    /// Revalidate authoritative state after execution and before publishing a result.
+    pub fn revalidate(&self, now: ClockReading) -> Result<(), ProtocolError> {
+        let mut state = try_lock_registry(&self.inner)
+            .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?;
+        let record = state
+            .capabilities
+            .get_mut(&self.authorized.capability_id)
+            .ok_or_else(|| ProtocolError::new(StableErrorKind::UnknownCapability))?;
+        check_clock_and_expiry(record, now)?;
+        match record.state {
+            CapabilityState::Inactive => {
+                return Err(ProtocolError::new(StableErrorKind::Inactive));
+            }
+            CapabilityState::Revoked => {
+                return Err(ProtocolError::new(StableErrorKind::Revoked));
+            }
+            CapabilityState::Active => {}
+        }
+        if self.authorized.deadline_unix_ms <= now.unix_ms {
+            return Err(ProtocolError::new(StableErrorKind::DeadlineExpired));
+        }
+        match record.replay.get(&self.authorized.request_id) {
+            Some(ReplayEntry::Pending { payload_digest })
+                if bool::from(payload_digest.ct_eq(&self.payload_digest)) =>
+            {
+                Ok(())
+            }
+            _ => {
+                record.state = CapabilityState::Revoked;
+                Err(ProtocolError::new(StableErrorKind::ReplayConflict))
+            }
+        }
+    }
+
+    /// Return a successful response, caching only non-secret results.
     pub fn complete(
         mut self,
         result: crate::OperationResult,
     ) -> Result<ResponseEnvelope, ProtocolError> {
+        let sensitive = matches!(&result, crate::OperationResult::SecretLease { .. });
         let response = ResponseEnvelope::success(self.authorized.request_id, result);
-        let response_bytes = serde_json::to_vec(&response)
-            .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?;
-        let response = if response_bytes.len() > MAX_RESPONSE_BYTES {
+        let mut encoded = Zeroizing::new(Vec::with_capacity(MAX_RESPONSE_BYTES));
+        let oversized = {
+            let mut writer = BoundedResponseWriter {
+                encoded: &mut encoded,
+                limit_exceeded: false,
+            };
+            match serde_json::to_writer(&mut writer, &response) {
+                Ok(()) => false,
+                Err(_) if writer.limit_exceeded => true,
+                Err(_) => return Err(ProtocolError::new(StableErrorKind::Internal)),
+            }
+        };
+        let response = if oversized {
             ResponseEnvelope::error(self.authorized.request_id, StableErrorKind::PayloadTooLarge)
         } else {
             response
         };
-        let response_size = serde_json::to_vec(&response)
-            .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?
-            .len();
-        self.finish(response.clone(), response_size)?;
+        if sensitive {
+            self.finish_sensitive()?;
+        } else {
+            let response_size = if oversized {
+                serde_json::to_vec(&response)
+                    .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?
+                    .len()
+            } else {
+                encoded.len()
+            };
+            self.finish(response.clone(), response_size)?;
+        }
         Ok(response)
     }
 
@@ -608,6 +742,33 @@ impl AuthorizationPermit {
         } else {
             ResponseEnvelope::error(self.authorized.request_id, StableErrorKind::Internal)
         }
+    }
+
+    fn finish_sensitive(&mut self) -> Result<(), ProtocolError> {
+        let mut state = try_lock_registry(&self.inner)
+            .map_err(|_| ProtocolError::new(StableErrorKind::Internal))?;
+        if let Some(record) = state.capabilities.get_mut(&self.authorized.capability_id) {
+            record.in_flight = record.in_flight.saturating_sub(1);
+            if matches!(
+                record.replay.get(&self.authorized.request_id),
+                Some(ReplayEntry::Pending { payload_digest })
+                    if payload_digest.ct_eq(&self.payload_digest).into()
+            ) {
+                record.replay.insert(
+                    self.authorized.request_id,
+                    ReplayEntry::SensitiveComplete {
+                        payload_digest: self.payload_digest,
+                    },
+                );
+            } else {
+                record.state = CapabilityState::Revoked;
+            }
+        }
+        state.response_ledger_bytes = state
+            .response_ledger_bytes
+            .saturating_sub(MAX_RESPONSE_BYTES);
+        self.completed = true;
+        Ok(())
     }
 
     fn finish(
@@ -753,6 +914,7 @@ impl CapabilityRecord {
             .map(|entry| match entry {
                 ReplayEntry::Pending { .. } => MAX_RESPONSE_BYTES,
                 ReplayEntry::Complete { response_bytes, .. } => *response_bytes,
+                ReplayEntry::SensitiveComplete { .. } => 0,
             })
             .sum()
     }

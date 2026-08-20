@@ -58,6 +58,7 @@ pub struct AppState {
     pub spend_guard_state: Mutex<buzz_lifecycle::SpendGuardState>,
     pub skill_curator: Mutex<buzz_lifecycle::SkillCurator>,
     pub automation_broker: Mutex<buzz_lifecycle::AutomationBroker>,
+    pub secret_access_broker: Option<Arc<buzz_secrets::SecretBroker>>,
     pub workspace_observers: Mutex<buzz_workspace_controller::WorkspaceObserverRegistry>,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
@@ -183,6 +184,12 @@ pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
 }
 
 pub fn build_app_state() -> AppState {
+    build_app_state_with_secret_audit(buzz_secrets::SecretAuditStore::open_default())
+}
+
+fn build_app_state_with_secret_audit(
+    secret_audit: Result<buzz_secrets::SecretAuditStore, buzz_secrets::SecretError>,
+) -> AppState {
     // Env var takes precedence (dev/CI). If absent, resolve_persisted_identity()
     // in setup() will replace the ephemeral placeholder with a persisted key.
     let (keys, identity_storage) = match identity_from_env() {
@@ -195,6 +202,13 @@ pub fn build_app_state() -> AppState {
         }
         None => (Keys::generate(), IdentityStorage::Ephemeral),
     };
+
+    let secret_access_broker = secret_audit.ok().map(|audit| {
+        Arc::new(buzz_secrets::SecretBroker::with_audit(
+            Vec::new(),
+            Arc::new(audit),
+        ))
+    });
 
     AppState {
         keys: Mutex::new(keys),
@@ -234,9 +248,8 @@ pub fn build_app_state() -> AppState {
             "web:extract".to_string(),
         ])),
         automation_broker: Mutex::new(buzz_lifecycle::AutomationBroker::new()),
-        workspace_observers: Mutex::new(
-            buzz_workspace_controller::WorkspaceObserverRegistry::new(),
-        ),
+        secret_access_broker,
+        workspace_observers: Mutex::new(buzz_workspace_controller::WorkspaceObserverRegistry::new()),
         app_handle: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(
@@ -1096,3 +1109,32 @@ pub(crate) fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), S
 #[cfg(test)]
 #[path = "app_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod secret_audit_startup_tests {
+    use super::*;
+
+    #[test]
+    fn available_secret_audit_constructs_broker_and_signing_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit = buzz_secrets::SecretAuditStore::open(temp.path().join("secret-audit.sqlite"));
+
+        let state = build_app_state_with_secret_audit(audit);
+
+        assert!(state.secret_access_broker.is_some());
+        assert!(state.signing_keys().is_ok());
+    }
+
+    #[test]
+    fn unavailable_secret_audit_keeps_signing_state_available() {
+        let state = build_app_state_with_secret_audit(Err(buzz_secrets::SecretError::Audit(
+            "C:\\sensitive\\audit.sqlite: database disk image is malformed".to_string(),
+        )));
+
+        assert!(state.secret_access_broker.is_none());
+        assert!(
+            state.signing_keys().is_ok(),
+            "optional secret audit failure must not block unrelated signing state"
+        );
+    }
+}

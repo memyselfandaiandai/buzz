@@ -11,8 +11,14 @@
 
 use anyhow::Result;
 use buzz_acp::capability_broker::{BrokerChildSpawner, CapabilityBroker};
-use buzz_acp::config::{CliArgs, Config, CredentialMode, DedupMode, MultipleEventHandling, PermissionMode, RespondTo, SubscribeMode};
-use buzz_capability_client::{CapabilityClient, HttpMethod, Nip98SignRequest, NostrEventSignRequest, RelayOrigin, StructuredTag};
+use buzz_acp::config::{
+    CliArgs, Config, CredentialMode, DedupMode, MultipleEventHandling, PermissionMode, RespondTo,
+    SubscribeMode,
+};
+use buzz_capability_client::{
+    CapabilityClient, ClientError, HttpMethod, Nip98SignRequest, NostrEventSignRequest,
+    RelayOrigin, StableErrorKind, StructuredTag,
+};
 use nostr::Keys;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -70,6 +76,8 @@ async fn test_broker_standalone_end_to_end() -> Result<()> {
         lazy_pool: false,
         idle_pool_sleep: 0,
         broker_advertise_ip: Some(std::net::Ipv4Addr::LOCALHOST),
+        broker_allowed_secrets: None,
+        broker_allowed_secret_tools: None,
     };
 
     let config = Config::from_args_with_credential_mode(cli_args, CredentialMode::BrokerV1)?;
@@ -90,7 +98,10 @@ async fn test_broker_standalone_end_to_end() -> Result<()> {
     // 1. Identity metadata
     let meta = client.identity_metadata().await?;
     assert_eq!(meta.public_key, keys.public_key().to_hex());
-    assert_eq!(meta.relay.as_str().trim_end_matches('/'), relay_url.trim_end_matches('/'));
+    assert_eq!(
+        meta.relay.as_str().trim_end_matches('/'),
+        relay_url.trim_end_matches('/')
+    );
 
     // 2. Sign Nostr event
     let req = NostrEventSignRequest {
@@ -110,15 +121,22 @@ async fn test_broker_standalone_end_to_end() -> Result<()> {
         relay: RelayOrigin::parse(&relay_url)?,
         method: HttpMethod::Post,
         path: "/events".to_string(),
-        payload_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()),
+        payload_sha256: Some(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+        ),
     };
     let nip98_auth = client.sign_nip98(nip98_req).await?;
     assert!(nip98_auth.authorization().starts_with("Nostr "));
 
     // 4. Secret Leasing
-    let secret_res = client.acquire_secret("TEST_SECRET_KEY", "test_tool").await;
-    // With default OS vault in test, if secret does not exist it safely returns ResourceNotAllowed
-    assert!(secret_res.is_ok() || secret_res.is_err());
+    let secret_error = client
+        .acquire_secret("TEST_SECRET_KEY", "test_tool")
+        .await
+        .expect_err("default production scope must disable secret leasing");
+    assert_eq!(
+        secret_error,
+        ClientError::Broker(StableErrorKind::OperationNotAllowed)
+    );
 
     // 5. Revocation
     lease.revoke()?;

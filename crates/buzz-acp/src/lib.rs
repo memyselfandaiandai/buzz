@@ -10623,6 +10623,10 @@ mod build_mcp_servers_tests {
             broker_spawner: None,
             #[cfg(feature = "signing-capability-broker")]
             broker_advertise_ip: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secrets: Vec::new(),
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secret_tools: Vec::new(),
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -10878,6 +10882,10 @@ mod error_outcome_emission_tests {
             broker_spawner: None,
             #[cfg(feature = "signing-capability-broker")]
             broker_advertise_ip: None,
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secrets: Vec::new(),
+            #[cfg(feature = "signing-capability-broker")]
+            broker_allowed_secret_tools: Vec::new(),
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             // `true` exits cleanly, so the async respawn fails fast and

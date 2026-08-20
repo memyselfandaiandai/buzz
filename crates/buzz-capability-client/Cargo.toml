@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Strict loopback client for short-lived Buzz signing capabilities"
 
 [dependencies]
+bytes = "1"
 buzz-signing-capability = { workspace = true }
 futures-util = { workspace = true }
 nostr = { workspace = true }

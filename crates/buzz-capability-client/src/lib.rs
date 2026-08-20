@@ -23,15 +23,14 @@ pub use buzz_signing_capability::{
     HttpMethod, Nip98SignRequest, NostrEventSignRequest, RelayOrigin, StableErrorKind,
     StructuredTag,
 };
+use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, PublicKey};
-use tokio::{
-    time::timeout,
-};
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use url::Url;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const CAPABILITY_ENDPOINT_ENV: &str = "BUZZ_CAPABILITY_ENDPOINT";
 const CAPABILITY_ID_ENV: &str = "BUZZ_CAPABILITY_ID";
@@ -62,6 +61,33 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
+
+struct SecureResponseFrame(BytesMut);
+
+impl SecureResponseFrame {
+    fn try_new(bytes: tokio_tungstenite::tungstenite::Bytes) -> Result<Self, ClientError> {
+        bytes
+            .try_into_mut()
+            .map(Self)
+            .map_err(|_| ClientError::Read)
+    }
+
+    fn zeroize_now(&mut self) {
+        self.0.as_mut().zeroize();
+    }
+}
+
+impl AsRef<[u8]> for SecureResponseFrame {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecureResponseFrame {
+    fn drop(&mut self) {
+        self.zeroize_now();
+    }
+}
 
 /// One stable timeout phase, without transport or credential detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +207,9 @@ pub enum ClientError {
     /// A returned NIP-98 header was malformed.
     #[error("capability broker returned an invalid authorization")]
     InvalidAuthorization,
+    /// A secret lease did not match the requested selector or bounded lifetime.
+    #[error("capability broker returned an invalid secret lease")]
+    InvalidSecretLease,
 }
 
 struct SecretToken(Zeroizing<String>);
@@ -333,7 +362,7 @@ impl CapabilityClient {
     /// Fetch and cross-check non-secret broker identity metadata.
     pub async fn identity_metadata(&self) -> Result<IdentityMetadata, ClientError> {
         let result = self.execute(Operation::IdentityMetadata).await?;
-        let OperationResult::IdentityMetadata(metadata) = result else {
+        let OperationResult::IdentityMetadata(metadata) = &result else {
             return Err(ClientError::UnexpectedResult);
         };
         if metadata.public_key != self.public_key.to_hex()
@@ -342,7 +371,7 @@ impl CapabilityClient {
         {
             return Err(ClientError::IdentityMismatch);
         }
-        Ok(metadata)
+        Ok(metadata.clone())
     }
 
     /// Ask the broker to sign one structured Nostr event.
@@ -356,11 +385,11 @@ impl CapabilityClient {
         let requested_kind = request.kind;
         let requested_content = request.content.clone();
         let result = self.execute(Operation::NostrEventSign(request)).await?;
-        let OperationResult::SignedEvent { event_json } = result else {
+        let OperationResult::SignedEvent { event_json } = &result else {
             return Err(ClientError::UnexpectedResult);
         };
         let event: Event =
-            serde_json::from_str(&event_json).map_err(|_| ClientError::InvalidSignedEvent)?;
+            serde_json::from_str(event_json).map_err(|_| ClientError::InvalidSignedEvent)?;
         if event.verify().is_err()
             || event.pubkey != self.public_key
             || u32::from(event.kind.as_u16()) != requested_kind
@@ -380,13 +409,13 @@ impl CapabilityClient {
         let OperationResult::Authorization {
             authorization,
             auth_tag,
-        } = result
+        } = &result
         else {
             return Err(ClientError::UnexpectedResult);
         };
         if !authorization.starts_with("Nostr ")
             || authorization.len() <= "Nostr ".len()
-            || contains_header_break(&authorization)
+            || contains_header_break(authorization)
             || auth_tag
                 .as_ref()
                 .is_some_and(|value| contains_header_break(value) || !valid_auth_tag_json(value))
@@ -394,25 +423,46 @@ impl CapabilityClient {
             return Err(ClientError::InvalidAuthorization);
         }
         Ok(Nip98Authorization {
-            authorization,
-            auth_tag,
+            authorization: authorization.clone(),
+            auth_tag: auth_tag.clone(),
         })
     }
 
     /// Ask the broker to lease a bounded secret for tool execution.
+    ///
+    /// Returns [`ClientError::InvalidSecretLease`] unless the typed lease matches
+    /// the exact requested secret key and remains current within both the sent
+    /// request deadline and the projected capability expiry.
     pub async fn acquire_secret(
         &self,
         secret_key: impl Into<String>,
         tool_name: impl Into<String>,
     ) -> Result<buzz_signing_capability::OperationResult, ClientError> {
+        let expected_secret_key = secret_key.into();
         let request = buzz_signing_capability::SecretLeaseRequest {
-            secret_key: secret_key.into(),
+            secret_key: expected_secret_key.clone(),
             tool_name: tool_name.into(),
         };
-        let result = self.execute(Operation::SecretLease(request)).await?;
-        if !matches!(result, OperationResult::SecretLease { .. }) {
-            return Err(ClientError::UnexpectedResult);
-        }
+        let issued_at_unix_ms = unix_now_ms()?;
+        let request_id = Uuid::new_v4();
+        let (result, request_deadline_unix_ms) = self
+            .execute_at_with_deadline(
+                Operation::SecretLease(request),
+                issued_at_unix_ms,
+                request_id,
+            )
+            .await?;
+        let release_at_unix_ms = unix_now_ms()?;
+        // Validate through a borrow so every rejection leaves `result` as the
+        // sole secret owner; `OperationResult::drop` then wipes the value.
+        validate_secret_lease(
+            &result,
+            &expected_secret_key,
+            issued_at_unix_ms,
+            release_at_unix_ms,
+            request_deadline_unix_ms,
+            self.expires_at_unix_ms,
+        )?;
         Ok(result)
     }
 
@@ -536,10 +586,23 @@ impl CapabilityClient {
         now_unix_ms: i64,
         request_id: Uuid,
     ) -> Result<OperationResult, ClientError> {
-        let request = self.build_request(operation, now_unix_ms, request_id)?;
-        timeout(self.timeouts.total, self.exchange(request))
+        self.execute_at_with_deadline(operation, now_unix_ms, request_id)
             .await
-            .map_err(|_| ClientError::Timeout(TimeoutPhase::Total))?
+            .map(|(result, _)| result)
+    }
+
+    async fn execute_at_with_deadline(
+        &self,
+        operation: Operation,
+        now_unix_ms: i64,
+        request_id: Uuid,
+    ) -> Result<(OperationResult, i64), ClientError> {
+        let request = self.build_request(operation, now_unix_ms, request_id)?;
+        let request_deadline_unix_ms = request.deadline_unix_ms;
+        let result = timeout(self.timeouts.total, self.exchange(request))
+            .await
+            .map_err(|_| ClientError::Timeout(TimeoutPhase::Total))??;
+        Ok((result, request_deadline_unix_ms))
     }
 
     fn build_request(
@@ -572,19 +635,18 @@ impl CapabilityClient {
             return Err(ClientError::RequestTooLarge);
         }
 
-        let (ws_stream, _) = timeout(
-            self.timeouts.connect,
-            connect_async(self.endpoint.as_str()),
-        )
-        .await
-        .map_err(|_| ClientError::Timeout(TimeoutPhase::Connect))?
-        .map_err(|_| ClientError::Connect)?;
+        let (ws_stream, _) = timeout(self.timeouts.connect, connect_async(self.endpoint.as_str()))
+            .await
+            .map_err(|_| ClientError::Timeout(TimeoutPhase::Connect))?
+            .map_err(|_| ClientError::Connect)?;
 
         let (mut write, mut read) = ws_stream.split();
 
         timeout(
             self.timeouts.write,
-            write.send(tokio_tungstenite::tungstenite::Message::Binary(frame.into())),
+            write.send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            )),
         )
         .await
         .map_err(|_| ClientError::Timeout(TimeoutPhase::Write))?
@@ -593,9 +655,13 @@ impl CapabilityClient {
         let response = timeout(self.timeouts.read, async {
             while let Some(msg) = read.next().await {
                 match msg {
-                    Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => return Ok(data.to_vec()),
-                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => return Ok(text.as_bytes().to_vec()),
-                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => return Err(ClientError::Read),
+                    Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => return Ok(data),
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        return Ok(text.into());
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                        return Err(ClientError::Read)
+                    }
                     Ok(_) => continue,
                     Err(_) => return Err(ClientError::Read),
                 }
@@ -605,18 +671,48 @@ impl CapabilityClient {
         .await
         .map_err(|_| ClientError::Timeout(TimeoutPhase::Read))?
         .map_err(|_| ClientError::Read)?;
+        drop(read);
+        drop(write);
+        let response = SecureResponseFrame::try_new(response)?;
 
-        if response.len() > MAX_WIRE_FRAME_BYTES {
+        if response.as_ref().len() > MAX_WIRE_FRAME_BYTES {
             return Err(ClientError::ResponseTooLarge);
         }
 
-        parse_response(&response, request_id)
+        parse_response(response.as_ref(), request_id)
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn with_timeouts(mut self, timeouts: ClientTimeouts) -> Self {
         self.timeouts = timeouts;
         self
+    }
+}
+
+fn validate_secret_lease(
+    result: &OperationResult,
+    expected_secret_key: &str,
+    issued_at_unix_ms: i64,
+    release_at_unix_ms: i64,
+    request_deadline_unix_ms: i64,
+    capability_expires_at_unix_ms: i64,
+) -> Result<(), ClientError> {
+    match result {
+        OperationResult::SecretLease {
+            secret_key,
+            expires_at_unix_ms,
+            ..
+        } if secret_key == expected_secret_key
+            && *expires_at_unix_ms > issued_at_unix_ms
+            && *expires_at_unix_ms > release_at_unix_ms
+            && *expires_at_unix_ms <= request_deadline_unix_ms
+            && *expires_at_unix_ms <= capability_expires_at_unix_ms =>
+        {
+            Ok(())
+        }
+        OperationResult::SecretLease { .. } => Err(ClientError::InvalidSecretLease),
+        _ => Err(ClientError::UnexpectedResult),
     }
 }
 
@@ -670,42 +766,19 @@ fn parse_response(bytes: &[u8], request_id: Uuid) -> Result<OperationResult, Cli
         return Err(ClientError::InvalidFrame);
     }
 
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| ClientError::InvalidResponse)?;
-    validate_response_shape(&value)?;
     let response: ResponseEnvelope =
-        serde_json::from_value(value).map_err(|_| ClientError::InvalidResponse)?;
+        serde_json::from_slice(bytes).map_err(|_| ClientError::InvalidResponse)?;
     if response.version != PROTOCOL_VERSION {
         return Err(ClientError::UnsupportedVersion);
     }
     if response.request_id != request_id {
         return Err(ClientError::RequestIdMismatch);
     }
-    match (response.result().cloned(), response.error_kind()) {
-        (Some(result), None) => Ok(result),
-        (None, Some(kind)) => Err(ClientError::Broker(kind)),
-        _ => Err(ClientError::InvalidResponse),
+    match response.into_result_or_error() {
+        Ok(result) => Ok(result),
+        Err(Some(kind)) => Err(ClientError::Broker(kind)),
+        Err(None) => Err(ClientError::InvalidResponse),
     }
-}
-
-fn validate_response_shape(value: &serde_json::Value) -> Result<(), ClientError> {
-    let object = value.as_object().ok_or(ClientError::InvalidResponse)?;
-    let status = object
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(ClientError::InvalidResponse)?;
-    let expected: &[&str] = match status {
-        "ok" => &["request_id", "result", "status", "version"],
-        "error" => &["error_kind", "request_id", "status", "version"],
-        _ => return Err(ClientError::InvalidResponse),
-    };
-    if object.len() != expected.len()
-        || !expected.iter().all(|field| object.contains_key(*field))
-        || object.values().any(serde_json::Value::is_null)
-    {
-        return Err(ClientError::InvalidResponse);
-    }
-    Ok(())
 }
 
 fn contains_header_break(value: &str) -> bool {
@@ -719,4 +792,24 @@ fn valid_auth_tag_json(value: &str) -> bool {
 }
 
 #[cfg(test)]
+mod secure_response_frame_tests {
+    use super::*;
+
+    #[test]
+    fn shared_response_storage_is_rejected_instead_of_copied() {
+        let bytes = tokio_tungstenite::tungstenite::Bytes::from_static(b"secret response");
+        assert!(SecureResponseFrame::try_new(bytes).is_err());
+    }
+
+    #[test]
+    fn uniquely_owned_response_storage_can_be_wiped_in_place() {
+        let bytes = tokio_tungstenite::tungstenite::Bytes::from(b"secret response".to_vec());
+        let mut frame = SecureResponseFrame::try_new(bytes).expect("unique response storage");
+        frame.zeroize_now();
+        assert!(frame.as_ref().iter().all(|byte| *byte == 0));
+    }
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
 mod tests;

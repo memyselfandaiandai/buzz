@@ -118,6 +118,19 @@ fn wrong_identifier_and_token_are_rejected_without_secret_echo() {
 }
 
 #[test]
+fn authorized_operation_retains_the_request_deadline() {
+    let (registry, issued) = issue(event_scope(), budgets(), true);
+    let mut request = request(&issued, Uuid::new_v4(), Operation::IdentityMetadata);
+    request.deadline_unix_ms = NOW.unix_ms + 12_345;
+
+    let outcome = registry.authorize(request, NOW).expect("authorize request");
+    let AuthorizationOutcome::Fresh(permit) = outcome else {
+        panic!("new request must produce a fresh permit");
+    };
+    assert_eq!(permit.authorized().deadline_unix_ms(), NOW.unix_ms + 12_345);
+}
+
+#[test]
 fn inactive_revoked_and_both_expiry_clocks_fail_closed() {
     let (inactive_registry, inactive) = issue(event_scope(), budgets(), false);
     assert_eq!(
@@ -164,6 +177,357 @@ fn inactive_revoked_and_both_expiry_clocks_fail_closed() {
             mono_expired,
         )),
         StableErrorKind::Expired
+    );
+}
+
+#[test]
+fn secret_lease_scope_requires_both_constraint_sets() {
+    let no_constraints = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .build();
+    assert_eq!(
+        no_constraints.unwrap_err(),
+        ScopeBuildError::UnconstrainedSecretLease
+    );
+
+    let only_secret = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id")
+        .build();
+    assert_eq!(
+        only_secret.unwrap_err(),
+        ScopeBuildError::UnconstrainedSecretLease
+    );
+
+    ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id")
+        .allow_secret_tool("tool-id")
+        .build()
+        .expect("fully constrained secret scope");
+
+    for invalid_secret in ["", " ", "\t\r\n"] {
+        assert_eq!(
+            ScopeBuilder::new(relay())
+                .allow_operation(OperationKind::SecretLease)
+                .allow_secret(invalid_secret)
+                .allow_secret_tool("tool-id")
+                .build()
+                .unwrap_err(),
+            ScopeBuildError::UnconstrainedSecretLease
+        );
+    }
+    for invalid_tool in ["", " ", "\t\r\n"] {
+        assert_eq!(
+            ScopeBuilder::new(relay())
+                .allow_operation(OperationKind::SecretLease)
+                .allow_secret("secret-id")
+                .allow_secret_tool(invalid_tool)
+                .build()
+                .unwrap_err(),
+            ScopeBuildError::UnconstrainedSecretLease
+        );
+    }
+}
+
+#[test]
+fn secret_scope_identifiers_and_cardinality_are_bounded_in_the_core() {
+    for invalid in ["secret\nname".to_owned(), "x".repeat(257)] {
+        assert_eq!(
+            ScopeBuilder::new(relay())
+                .allow_operation(OperationKind::SecretLease)
+                .allow_secret(invalid)
+                .allow_secret_tool("tool-id")
+                .build(),
+            Err(ScopeBuildError::InvalidResource)
+        );
+    }
+    for invalid in ["tool\u{7f}name".to_owned(), "x".repeat(257)] {
+        assert_eq!(
+            ScopeBuilder::new(relay())
+                .allow_operation(OperationKind::SecretLease)
+                .allow_secret("secret-id")
+                .allow_secret_tool(invalid)
+                .build(),
+            Err(ScopeBuildError::InvalidResource)
+        );
+    }
+
+    let mut secrets = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret_tool("tool-id");
+    for index in 0..257 {
+        secrets = secrets.allow_secret(format!("secret-{index}"));
+    }
+    assert_eq!(secrets.build(), Err(ScopeBuildError::TooManyConstraints));
+
+    let mut tools = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id");
+    for index in 0..257 {
+        tools = tools.allow_secret_tool(format!("tool-{index}"));
+    }
+    assert_eq!(tools.build(), Err(ScopeBuildError::TooManyConstraints));
+}
+
+#[test]
+fn completion_revalidation_rejects_elapsed_request_and_capability_deadlines() {
+    let (request_registry, request_capability) = issue(event_scope(), budgets(), true);
+    let mut expiring_request = request(
+        &request_capability,
+        Uuid::new_v4(),
+        Operation::IdentityMetadata,
+    );
+    expiring_request.deadline_unix_ms = NOW.unix_ms + 5;
+    let AuthorizationOutcome::Fresh(request_permit) = request_registry
+        .authorize(expiring_request, NOW)
+        .expect("authorize short request")
+    else {
+        panic!("expected fresh permit")
+    };
+    assert_eq!(
+        request_permit
+            .revalidate(ClockReading {
+                unix_ms: NOW.unix_ms + 5,
+                monotonic_ms: NOW.monotonic_ms + 5,
+            })
+            .expect_err("elapsed request deadline")
+            .kind(),
+        StableErrorKind::DeadlineExpired
+    );
+
+    let (capability_registry, capability) = issue(event_scope(), budgets(), true);
+    let AuthorizationOutcome::Fresh(capability_permit) = capability_registry
+        .authorize(
+            request(&capability, Uuid::new_v4(), Operation::IdentityMetadata),
+            NOW,
+        )
+        .expect("authorize capability")
+    else {
+        panic!("expected fresh permit")
+    };
+    assert_eq!(
+        capability_permit
+            .revalidate(ClockReading {
+                unix_ms: NOW.unix_ms + 60_000,
+                monotonic_ms: NOW.monotonic_ms + 60_000,
+            })
+            .expect_err("elapsed capability deadline")
+            .kind(),
+        StableErrorKind::Expired
+    );
+}
+
+#[test]
+fn publication_revalidation_rejects_elapsed_or_revoked_completed_results() {
+    let (deadline_registry, deadline_capability) = issue(event_scope(), budgets(), true);
+    let request_id = Uuid::new_v4();
+    let deadline = NOW.unix_ms + 5;
+    let mut expiring_request = request(
+        &deadline_capability,
+        request_id,
+        Operation::IdentityMetadata,
+    );
+    expiring_request.deadline_unix_ms = deadline;
+    complete(
+        deadline_registry
+            .authorize(expiring_request, NOW)
+            .expect("authorize publication-bound result"),
+        request_id,
+    );
+    assert_eq!(
+        deadline_registry
+            .revalidate_publication(
+                deadline_capability.descriptor.capability_id,
+                request_id,
+                deadline,
+                ClockReading {
+                    unix_ms: deadline,
+                    monotonic_ms: NOW.monotonic_ms + 5,
+                },
+            )
+            .expect_err("publication cannot occur at the request deadline")
+            .kind(),
+        StableErrorKind::DeadlineExpired
+    );
+
+    let (revoked_registry, revoked_capability) = issue(event_scope(), budgets(), true);
+    let request_id = Uuid::new_v4();
+    complete(
+        revoked_registry
+            .authorize(
+                request(&revoked_capability, request_id, Operation::IdentityMetadata),
+                NOW,
+            )
+            .expect("authorize result before revocation"),
+        request_id,
+    );
+    revoked_registry
+        .revoke(revoked_capability.descriptor.capability_id)
+        .expect("revoke capability");
+    assert_eq!(
+        revoked_registry
+            .revalidate_publication(
+                revoked_capability.descriptor.capability_id,
+                request_id,
+                NOW.unix_ms + 30_000,
+                ClockReading {
+                    unix_ms: NOW.unix_ms + 1,
+                    monotonic_ms: NOW.monotonic_ms + 1,
+                },
+            )
+            .expect_err("revoked result cannot publish")
+            .kind(),
+        StableErrorKind::Revoked
+    );
+}
+
+#[test]
+fn secret_lease_requests_reject_blank_resource_names() {
+    let scope = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id")
+        .allow_secret_tool("tool-id")
+        .build()
+        .expect("secret scope");
+    let (registry, issued) = issue(scope, budgets(), true);
+
+    for (secret_key, tool_name) in [
+        ("", "tool-id"),
+        (" \t", "tool-id"),
+        ("secret-id", ""),
+        ("secret-id", "\r\n"),
+    ] {
+        assert_eq!(
+            error_kind(registry.authorize(
+                request(
+                    &issued,
+                    Uuid::new_v4(),
+                    Operation::SecretLease(SecretLeaseRequest {
+                        secret_key: secret_key.into(),
+                        tool_name: tool_name.into(),
+                    }),
+                ),
+                NOW,
+            )),
+            StableErrorKind::InvalidPayload
+        );
+    }
+}
+
+#[test]
+fn secret_bearing_responses_are_never_cached_for_replay() {
+    let scope = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id")
+        .allow_secret_tool("tool-id")
+        .build()
+        .expect("secret scope");
+    let (registry, issued) = issue(scope, budgets(), true);
+    let request_id = Uuid::new_v4();
+    let operation = Operation::SecretLease(SecretLeaseRequest {
+        secret_key: "secret-id".into(),
+        tool_name: "tool-id".into(),
+    });
+    let request = request(&issued, request_id, operation);
+    let permit = match registry.authorize(request.clone(), NOW).unwrap() {
+        AuthorizationOutcome::Fresh(permit) => permit,
+        AuthorizationOutcome::Replay(_) => panic!("expected fresh authorization"),
+    };
+    let response = permit
+        .complete(OperationResult::SecretLease {
+            secret_key: "secret-id".into(),
+            secret_value: "secret-fixture-value".into(),
+            expires_at_unix_ms: NOW.unix_ms + 1_000,
+        })
+        .unwrap();
+    assert!(serde_json::to_string(&response)
+        .unwrap()
+        .contains("secret-fixture-value"));
+    drop(response);
+
+    assert_eq!(
+        error_kind(registry.authorize(request, NOW)),
+        StableErrorKind::SensitiveReplayDenied
+    );
+}
+
+#[test]
+fn oversized_secret_completion_is_rejected_without_cacheable_replay() {
+    let scope = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id")
+        .allow_secret_tool("tool-id")
+        .build()
+        .expect("secret scope");
+    let (registry, issued) = issue(scope, budgets(), true);
+    let request_id = Uuid::new_v4();
+    let operation = Operation::SecretLease(SecretLeaseRequest {
+        secret_key: "secret-id".into(),
+        tool_name: "tool-id".into(),
+    });
+    let request = request(&issued, request_id, operation);
+    let permit = match registry.authorize(request.clone(), NOW).unwrap() {
+        AuthorizationOutcome::Fresh(permit) => permit,
+        AuthorizationOutcome::Replay(_) => panic!("expected fresh authorization"),
+    };
+
+    let response = permit
+        .complete(OperationResult::SecretLease {
+            secret_key: "secret-id".into(),
+            secret_value: "x".repeat(1024 * 1024),
+            expires_at_unix_ms: NOW.unix_ms + 1_000,
+        })
+        .expect("oversized completion returns a stable response");
+    assert_eq!(
+        response.error_kind(),
+        Some(StableErrorKind::PayloadTooLarge)
+    );
+    assert_eq!(
+        error_kind(registry.authorize(request, NOW)),
+        StableErrorKind::SensitiveReplayDenied
+    );
+}
+
+#[test]
+fn escaped_secret_completion_honors_serialized_limit_without_cacheable_replay() {
+    const RESPONSE_LIMIT: usize = 1024 * 1024;
+
+    let scope = ScopeBuilder::new(relay())
+        .allow_operation(OperationKind::SecretLease)
+        .allow_secret("secret-id")
+        .allow_secret_tool("tool-id")
+        .build()
+        .expect("secret scope");
+    let (registry, issued) = issue(scope, budgets(), true);
+    let request_id = Uuid::new_v4();
+    let operation = Operation::SecretLease(SecretLeaseRequest {
+        secret_key: "secret-id".into(),
+        tool_name: "tool-id".into(),
+    });
+    let request = request(&issued, request_id, operation);
+    let permit = match registry.authorize(request.clone(), NOW).unwrap() {
+        AuthorizationOutcome::Fresh(permit) => permit,
+        AuthorizationOutcome::Replay(_) => panic!("expected fresh authorization"),
+    };
+    let secret_value = "\"".repeat(600 * 1024);
+    assert!(secret_value.len() < RESPONSE_LIMIT);
+    assert!(secret_value.len() * 2 > RESPONSE_LIMIT);
+
+    let response = permit
+        .complete(OperationResult::SecretLease {
+            secret_key: "secret-id".into(),
+            secret_value,
+            expires_at_unix_ms: NOW.unix_ms + 1_000,
+        })
+        .expect("escaped oversized completion returns a stable response");
+    assert_eq!(
+        response.error_kind(),
+        Some(StableErrorKind::PayloadTooLarge)
+    );
+    assert_eq!(
+        error_kind(registry.authorize(request, NOW)),
+        StableErrorKind::SensitiveReplayDenied
     );
 }
 
@@ -722,4 +1086,50 @@ fn registry_capacity_pruning_and_poisoning_fail_closed() {
             .expect_err("poisoned issuance must fail explicitly"),
         IssueError::RegistryPoisoned
     );
+}
+
+#[test]
+fn registry_poison_fails_closed_during_authorize_and_post_execution_revalidation() {
+    let (authorize_registry, authorize_capability) = issue(event_scope(), budgets(), true);
+    authorize_registry.poison_for_test();
+    assert_eq!(
+        error_kind(authorize_registry.authorize(
+            request(
+                &authorize_capability,
+                Uuid::new_v4(),
+                Operation::IdentityMetadata,
+            ),
+            NOW,
+        )),
+        StableErrorKind::Internal
+    );
+    assert!(authorize_registry
+        .snapshot(authorize_capability.descriptor.capability_id)
+        .is_none());
+
+    let (completion_registry, completion_capability) = issue(event_scope(), budgets(), true);
+    let AuthorizationOutcome::Fresh(permit) = completion_registry
+        .authorize(
+            request(
+                &completion_capability,
+                Uuid::new_v4(),
+                Operation::IdentityMetadata,
+            ),
+            NOW,
+        )
+        .expect("authorize before poison")
+    else {
+        panic!("expected fresh permit")
+    };
+    completion_registry.poison_for_test();
+    assert_eq!(
+        permit
+            .revalidate(NOW)
+            .expect_err("post-execution poison must fail closed")
+            .kind(),
+        StableErrorKind::Internal
+    );
+    assert!(completion_registry
+        .snapshot(completion_capability.descriptor.capability_id)
+        .is_none());
 }

@@ -18,15 +18,17 @@
 
 use anyhow::{Context, Result};
 use buzz_capability_client::{
-    CapabilityClient, Nip98SignRequest, NostrEventSignRequest, RelayOrigin,
-    StructuredTag,
+    CapabilityClient, Nip98SignRequest, NostrEventSignRequest, RelayOrigin, StructuredTag,
 };
 use buzz_signing_capability::HttpMethod;
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "buzz-remote-signer", about = "Remote capability signer for the Buzz broker")]
+#[command(
+    name = "buzz-remote-signer",
+    about = "Remote capability signer for the Buzz broker"
+)]
 struct Cli {
     /// Capability broker WebSocket endpoint (ws://ip:port).
     #[arg(long, env = "BUZZ_CAPABILITY_ENDPOINT")]
@@ -102,8 +104,7 @@ enum Command {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "buzz_remote_signer=info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "buzz_remote_signer=info".to_string()),
         )
         .init();
 
@@ -112,21 +113,22 @@ async fn main() -> Result<()> {
     // Validate endpoint scheme without requiring url dep import.
     let endpoint = cli.endpoint.clone();
     if !endpoint.starts_with("ws://") {
-        anyhow::bail!(
-            "endpoint must use ws:// scheme, got scheme in {endpoint:?}"
-        );
+        anyhow::bail!("endpoint must use ws:// scheme, got scheme in {endpoint:?}");
     }
 
-    let _capability_id = Uuid::parse_str(&cli.capability_id)
-        .context("invalid capability ID")?;
-    let _relay = RelayOrigin::parse(&cli.relay)
-        .context("invalid relay")?;
-    let _expires_at = cli.expires_at.parse::<i64>()
-        .context("invalid expiry")?;
+    let _capability_id = Uuid::parse_str(&cli.capability_id).context("invalid capability ID")?;
+    let _relay = RelayOrigin::parse(&cli.relay).context("invalid relay")?;
+    let _expires_at = cli.expires_at.parse::<i64>().context("invalid expiry")?;
 
     let client = CapabilityClient::from_env_iter([
-        ("BUZZ_CAPABILITY_ENDPOINT".into(), cli.endpoint.clone().into()),
-        ("BUZZ_CAPABILITY_ID".into(), cli.capability_id.clone().into()),
+        (
+            "BUZZ_CAPABILITY_ENDPOINT".into(),
+            cli.endpoint.clone().into(),
+        ),
+        (
+            "BUZZ_CAPABILITY_ID".into(),
+            cli.capability_id.clone().into(),
+        ),
         ("BUZZ_CAPABILITY_TOKEN".into(), cli.token.into()),
         ("BUZZ_PUBLIC_KEY".into(), cli.public_key.into()),
         ("BUZZ_RELAY_URL".into(), cli.relay.clone().into()),
@@ -137,7 +139,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::IdentityMetadata => {
-            let meta = client.identity_metadata().await
+            let meta = client
+                .identity_metadata()
+                .await
                 .context("identity metadata request failed")?;
             println!("{}", serde_json::to_string_pretty(&meta)?);
         }
@@ -159,7 +163,9 @@ async fn main() -> Result<()> {
                 tags: vec![StructuredTag(vec!["h".into(), channel])],
                 requested_created_at: created_at,
             };
-            let event = client.sign_nostr_event(request).await
+            let event = client
+                .sign_nostr_event(request)
+                .await
                 .context("Nostr event signing failed")?;
             println!("{}", serde_json::to_string_pretty(&event)?);
         }
@@ -181,7 +187,9 @@ async fn main() -> Result<()> {
                 path,
                 payload_sha256,
             };
-            let auth = client.sign_nip98(request).await
+            let auth = client
+                .sign_nip98(request)
+                .await
                 .context("NIP-98 signing failed")?;
             println!("Authorization: {}", auth.authorization());
             if let Some(tag) = auth.auth_tag() {

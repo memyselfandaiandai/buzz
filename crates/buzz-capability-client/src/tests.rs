@@ -186,9 +186,9 @@ async fn fake_loopback_supports_all_three_typed_operations() {
         .expect("authorization");
     assert_eq!(authorization.authorization(), "Nostr signed-header");
     assert!(authorization.auth_tag().is_some());
-        let rendered = format!("{:?}", authorization);
-        assert!(!rendered.contains("signed-header"));
-        assert!(!rendered.contains("signature"));
+    let rendered = format!("{:?}", authorization);
+    assert!(!rendered.contains("signed-header"));
+    assert!(!rendered.contains("signature"));
 }
 
 #[test]
@@ -508,9 +508,7 @@ async fn oversized_response_is_rejected_before_json_parsing() {
         let (mut write, mut read) = ws.split();
         let _ = read.next().await;
         let bytes = vec![b'x'; MAX_WIRE_FRAME_BYTES + 1];
-        let _ = write
-            .send(tungstenite::Message::Binary(bytes.into()))
-            .await;
+        let _ = write.send(tungstenite::Message::Binary(bytes.into())).await;
     })
     .await;
     assert_eq!(
@@ -520,6 +518,232 @@ async fn oversized_response_is_rejected_before_json_parsing() {
             .expect_err("oversized response"),
         ClientError::ResponseTooLarge
     );
+}
+
+#[test]
+fn strict_response_parser_rejects_malformed_secret_payload() {
+    let request_id = Uuid::new_v4();
+    let response = format!(
+        r#"{{"version":{PROTOCOL_VERSION},"request_id":"{request_id}","status":"ok","result":{{"result":"secret_lease","payload":{{"secret_key":"id","secret_value":"canary-secret","expires_at_unix_ms":123,"unexpected":"field"}}}}}}"#
+    );
+
+    assert_eq!(
+        parse_response(response.as_bytes(), request_id).expect_err("unknown secret payload field"),
+        ClientError::InvalidResponse
+    );
+}
+
+#[test]
+fn strict_response_parser_rejects_null_and_conflicting_shapes() {
+    let request_id = Uuid::new_v4();
+    let null_result = format!(
+        r#"{{"version":{PROTOCOL_VERSION},"request_id":"{request_id}","status":"error","result":null,"error_kind":"unauthorized"}}"#
+    );
+    assert_eq!(
+        parse_response(null_result.as_bytes(), request_id).expect_err("null result field"),
+        ClientError::InvalidResponse
+    );
+
+    let conflicting = format!(
+        r#"{{"result":{{"result":"secret_lease","payload":{{"secret_key":"id","secret_value":"conflict-canary","expires_at_unix_ms":123}}}},"version":{PROTOCOL_VERSION},"request_id":"{request_id}","status":"error","error_kind":"unauthorized"}}"#
+    );
+    assert_eq!(
+        parse_response(conflicting.as_bytes(), request_id).expect_err("conflicting status fields"),
+        ClientError::InvalidResponse
+    );
+}
+
+#[test]
+fn strict_response_parser_preserves_version_and_request_id_rejections() {
+    let request_id = Uuid::new_v4();
+    let result = OperationResult::SecretLease {
+        secret_key: "secret-id".to_string(),
+        secret_value: "rejection-canary".to_string(),
+        expires_at_unix_ms: future_expiry(),
+    };
+
+    let mut wrong_version =
+        serde_json::to_value(ResponseEnvelope::success(request_id, result.clone()))
+            .expect("serialize response");
+    wrong_version["version"] = serde_json::json!(PROTOCOL_VERSION + 1);
+    assert_eq!(
+        parse_response(
+            &serde_json::to_vec(&wrong_version).expect("encode wrong version"),
+            request_id,
+        )
+        .expect_err("unsupported response version"),
+        ClientError::UnsupportedVersion
+    );
+
+    let wrong_id = ResponseEnvelope::success(Uuid::new_v4(), result);
+    assert_eq!(
+        parse_response(
+            &serde_json::to_vec(&wrong_id).expect("encode wrong request id"),
+            request_id,
+        )
+        .expect_err("mismatched request id"),
+        ClientError::RequestIdMismatch
+    );
+}
+
+#[tokio::test]
+async fn acquire_secret_rejects_a_lease_for_a_different_secret_key() {
+    let keys = Keys::generate();
+    let public_key = keys.public_key();
+    let expiry = future_expiry();
+    let endpoint = spawn_protocol_broker(2, move |index, request| match index {
+        0 => identity_response(request, &public_key, expiry),
+        1 => {
+            assert!(matches!(request.operation, Operation::SecretLease(_)));
+            ResponseEnvelope::success(
+                request.request_id,
+                OperationResult::SecretLease {
+                    secret_key: "different-secret".to_owned(),
+                    secret_value: "wrong-key-canary".to_owned(),
+                    expires_at_unix_ms: request.deadline_unix_ms,
+                },
+            )
+        }
+        _ => unreachable!(),
+    })
+    .await;
+    let client = CapabilityClient::from_env_iter(projection(&endpoint, &public_key, expiry))
+        .await
+        .expect("client");
+
+    assert_eq!(
+        client
+            .acquire_secret("requested-secret", "test-tool")
+            .await
+            .expect_err("wrong-key lease"),
+        ClientError::InvalidSecretLease
+    );
+}
+
+#[tokio::test]
+async fn acquire_secret_rejects_a_lease_past_the_projected_request_deadline() {
+    let keys = Keys::generate();
+    let public_key = keys.public_key();
+    let expiry = unix_now_ms().expect("clock") + 5_000;
+    let endpoint = spawn_protocol_broker(2, move |index, request| match index {
+        0 => identity_response(request, &public_key, expiry),
+        1 => {
+            let Operation::SecretLease(payload) = &request.operation else {
+                panic!("expected secret lease request")
+            };
+            assert_eq!(request.deadline_unix_ms, expiry);
+            ResponseEnvelope::success(
+                request.request_id,
+                OperationResult::SecretLease {
+                    secret_key: payload.secret_key.clone(),
+                    secret_value: "overlong-expiry-canary".to_owned(),
+                    expires_at_unix_ms: request.deadline_unix_ms + 1,
+                },
+            )
+        }
+        _ => unreachable!(),
+    })
+    .await;
+    let client = CapabilityClient::from_env_iter(projection(&endpoint, &public_key, expiry))
+        .await
+        .expect("client");
+
+    assert_eq!(
+        client
+            .acquire_secret("requested-secret", "test-tool")
+            .await
+            .expect_err("overlong lease"),
+        ClientError::InvalidSecretLease
+    );
+}
+
+#[tokio::test]
+async fn acquire_secret_releases_an_exact_current_bounded_lease() {
+    let keys = Keys::generate();
+    let public_key = keys.public_key();
+    let expiry = future_expiry();
+    let endpoint = spawn_protocol_broker(2, move |index, request| match index {
+        0 => identity_response(request, &public_key, expiry),
+        1 => {
+            let Operation::SecretLease(payload) = &request.operation else {
+                panic!("expected secret lease request")
+            };
+            ResponseEnvelope::success(
+                request.request_id,
+                OperationResult::SecretLease {
+                    secret_key: payload.secret_key.clone(),
+                    secret_value: "accepted-secret-value".to_owned(),
+                    expires_at_unix_ms: request.deadline_unix_ms,
+                },
+            )
+        }
+        _ => unreachable!(),
+    })
+    .await;
+    let client = CapabilityClient::from_env_iter(projection(&endpoint, &public_key, expiry))
+        .await
+        .expect("client");
+
+    let lease = client
+        .acquire_secret("requested-secret", "test-tool")
+        .await
+        .expect("valid lease");
+    let OperationResult::SecretLease {
+        secret_key,
+        secret_value,
+        expires_at_unix_ms,
+    } = &lease
+    else {
+        panic!("expected secret lease")
+    };
+    assert_eq!(secret_key, "requested-secret");
+    assert_eq!(secret_value, "accepted-secret-value");
+    assert!(*expires_at_unix_ms <= expiry);
+}
+
+#[tokio::test]
+async fn acquire_secret_rejects_expired_zero_and_negative_lease_expiries() {
+    let keys = Keys::generate();
+    let public_key = keys.public_key();
+    let expiry = future_expiry();
+    let endpoint = spawn_protocol_broker(4, move |index, request| match index {
+        0 => identity_response(request, &public_key, expiry),
+        1..=3 => {
+            let Operation::SecretLease(payload) = &request.operation else {
+                panic!("expected secret lease request")
+            };
+            let lease_expiry = match index {
+                1 => unix_now_ms().expect("clock") - 1,
+                2 => 0,
+                3 => -1,
+                _ => unreachable!(),
+            };
+            ResponseEnvelope::success(
+                request.request_id,
+                OperationResult::SecretLease {
+                    secret_key: payload.secret_key.clone(),
+                    secret_value: format!("invalid-expiry-canary-{index}"),
+                    expires_at_unix_ms: lease_expiry,
+                },
+            )
+        }
+        _ => unreachable!(),
+    })
+    .await;
+    let client = CapabilityClient::from_env_iter(projection(&endpoint, &public_key, expiry))
+        .await
+        .expect("client");
+
+    for description in ["expired", "zero", "negative"] {
+        assert_eq!(
+            client
+                .acquire_secret("requested-secret", "test-tool")
+                .await
+                .expect_err(description),
+            ClientError::InvalidSecretLease,
+            "{description} lease expiry"
+        );
+    }
 }
 
 #[tokio::test]

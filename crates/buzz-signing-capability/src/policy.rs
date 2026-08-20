@@ -23,6 +23,19 @@ const MAX_HTTP_RULES: usize = 64;
 const MAX_CHANNEL_IDS: usize = 256;
 const MAX_PEER_PUBKEYS: usize = 256;
 
+/// Maximum UTF-8 byte length of one secret or tool policy identifier.
+pub const MAX_POLICY_IDENTIFIER_BYTES: usize = 256;
+/// Maximum number of explicit secret identifiers in one capability scope.
+pub const MAX_SECRET_POLICY_ENTRIES: usize = 256;
+/// Maximum number of explicit secret-consuming tool identifiers in one scope.
+pub const MAX_SECRET_TOOL_POLICY_ENTRIES: usize = 256;
+
+fn valid_policy_identifier(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_POLICY_IDENTIFIER_BYTES
+        && !value.chars().any(char::is_control)
+}
+
 /// Exact or segment-prefix path constraint for relay-bound HTTP authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "match", content = "path", rename_all = "snake_case")]
@@ -92,14 +105,48 @@ impl CapabilityScope {
         self.operations.contains(&operation)
     }
 
+    /// Return the explicit secret identifiers authorized by this scope.
+    pub fn allowed_secrets(&self) -> impl Iterator<Item = &str> {
+        self.allowed_secrets.iter().map(String::as_str)
+    }
+
+    /// Return the explicit tool identifiers authorized to consume leases.
+    pub fn allowed_secret_tools(&self) -> impl Iterator<Item = &str> {
+        self.allowed_secret_tools.iter().map(String::as_str)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ScopeBuildError> {
         if self.operations.is_empty() {
             return Err(ScopeBuildError::NoOperations);
+        }
+        if self.operations.contains(&OperationKind::SecretLease)
+            && (self.allowed_secrets.is_empty()
+                || self.allowed_secret_tools.is_empty()
+                || self
+                    .allowed_secrets
+                    .iter()
+                    .any(|value| value.trim().is_empty())
+                || self
+                    .allowed_secret_tools
+                    .iter()
+                    .any(|value| value.trim().is_empty()))
+        {
+            return Err(ScopeBuildError::UnconstrainedSecretLease);
+        }
+        if self
+            .allowed_secrets
+            .iter()
+            .chain(self.allowed_secret_tools.iter())
+            .any(|value| !valid_policy_identifier(value))
+        {
+            return Err(ScopeBuildError::InvalidResource);
         }
         if self.event_kinds.len() > MAX_EVENT_KINDS
             || self.http_rules.len() > MAX_HTTP_RULES
             || self.channel_ids.len() > MAX_CHANNEL_IDS
             || self.peer_pubkeys.len() > MAX_PEER_PUBKEYS
+            || self.allowed_secrets.len() > MAX_SECRET_POLICY_ENTRIES
+            || self.allowed_secret_tools.len() > MAX_SECRET_TOOL_POLICY_ENTRIES
         {
             return Err(ScopeBuildError::TooManyConstraints);
         }
@@ -226,13 +273,14 @@ impl CapabilityScope {
                 Ok(())
             }
             Operation::SecretLease(request) => {
-                if request.secret_key.is_empty() || request.tool_name.is_empty() {
+                if !valid_policy_identifier(&request.secret_key)
+                    || !valid_policy_identifier(&request.tool_name)
+                {
                     return Err(ProtocolError::new(StableErrorKind::InvalidPayload));
                 }
-                if !self.allowed_secrets.is_empty() && !self.allowed_secrets.contains(&request.secret_key) {
-                    return Err(ProtocolError::new(StableErrorKind::ResourceNotAllowed));
-                }
-                if !self.allowed_secret_tools.is_empty() && !self.allowed_secret_tools.contains(&request.tool_name) {
+                if !self.allowed_secrets.contains(&request.secret_key)
+                    || !self.allowed_secret_tools.contains(&request.tool_name)
+                {
                     return Err(ProtocolError::new(StableErrorKind::ResourceNotAllowed));
                 }
                 Ok(())
@@ -370,6 +418,9 @@ pub enum ScopeBuildError {
     /// A capability must authorize at least one operation.
     #[error("capability scope must allow at least one operation")]
     NoOperations,
+    /// Secret leasing requires explicit non-empty secret and tool constraints.
+    #[error("secret lease scope must constrain both secrets and tools")]
+    UnconstrainedSecretLease,
     /// A scope contains more constraints than the protocol permits.
     #[error("capability scope contains too many constraints")]
     TooManyConstraints,

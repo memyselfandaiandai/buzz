@@ -17,7 +17,10 @@ use tokio::signal;
 use uuid::Uuid;
 
 use buzz_acp::capability_broker::{BrokerChildSpawner, CapabilityBroker};
-use buzz_acp::config::{CliArgs, Config, CredentialMode, DedupMode, MultipleEventHandling, PermissionMode, RespondTo, SubscribeMode};
+use buzz_acp::config::{
+    CliArgs, Config, CredentialMode, DedupMode, MultipleEventHandling, PermissionMode, RespondTo,
+    SubscribeMode,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,6 +48,24 @@ struct Args {
     /// Optional auth attestation tag JSON.
     #[arg(long, env = "BUZZ_AUTH_TAG")]
     auth_tag: Option<String>,
+
+    /// Secret identifiers explicitly allowed for SecretLease operations.
+    #[arg(
+        long = "broker-allowed-secret",
+        env = "BUZZ_ACP_BROKER_ALLOWED_SECRETS",
+        hide_env_values = true,
+        value_delimiter = ','
+    )]
+    broker_allowed_secrets: Option<Vec<String>>,
+
+    /// Tool identifiers explicitly allowed to consume SecretLease operations.
+    #[arg(
+        long = "broker-allowed-secret-tool",
+        env = "BUZZ_ACP_BROKER_ALLOWED_SECRET_TOOLS",
+        hide_env_values = true,
+        value_delimiter = ','
+    )]
+    broker_allowed_secret_tools: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -107,6 +128,8 @@ async fn main() -> Result<()> {
         lazy_pool: false,
         idle_pool_sleep: 0,
         broker_advertise_ip: args.broker_advertise_ip,
+        broker_allowed_secrets: args.broker_allowed_secrets,
+        broker_allowed_secret_tools: args.broker_allowed_secret_tools,
     };
 
     let config = Config::from_args_with_credential_mode(cli_args, CredentialMode::BrokerV1)
@@ -122,7 +145,9 @@ async fn main() -> Result<()> {
         .context("failed to construct broker child spawner")?;
 
     let mut lease = spawner.issue().context("failed to issue broker lease")?;
-    lease.activate().context("failed to activate broker lease")?;
+    lease
+        .activate()
+        .context("failed to activate broker lease")?;
 
     println!("============================================================");
     println!("BUZZ ACP STANDALONE CAPABILITY BROKER RUNNING");
@@ -141,15 +166,17 @@ async fn main() -> Result<()> {
     println!("============================================================");
     println!("Press Ctrl+C or send SIGINT/SIGTERM to stop broker...");
 
-    signal::ctrl_c().await.context("failed to listen for ctrl+c signal")?;
+    signal::ctrl_c()
+        .await
+        .context("failed to listen for ctrl+c signal")?;
 
     println!("\nShutdown signal received. Revoking leases and closing broker...");
-    let _ = lease.revoke();
-    
-    // Release arc reference
-    if let Ok(b) = Arc::try_unwrap(broker) {
-        let _ = b.shutdown().await;
-    }
+    lease.revoke().context("failed to revoke broker lease")?;
+    drop(lease);
+    drop(spawner);
+    let broker = Arc::try_unwrap(broker)
+        .map_err(|_| anyhow::anyhow!("broker still has live owners during shutdown"))?;
+    broker.shutdown().await.context("failed to stop broker")?;
 
     println!("Broker shutdown complete.");
     Ok(())

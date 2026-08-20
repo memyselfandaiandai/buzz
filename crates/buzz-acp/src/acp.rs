@@ -497,9 +497,8 @@ struct LoopbackCapabilityEndpoint {
 #[cfg_attr(not(feature = "signing-capability-broker"), allow(dead_code))]
 impl LoopbackCapabilityEndpoint {
     fn parse(value: &str) -> Result<Self, AcpError> {
-        let endpoint = url::Url::parse(value).map_err(|_| {
-            AcpError::Protocol("broker-v1 endpoint is not a valid URL".to_owned())
-        })?;
+        let endpoint = url::Url::parse(value)
+            .map_err(|_| AcpError::Protocol("broker-v1 endpoint is not a valid URL".to_owned()))?;
         if endpoint.scheme() != "ws"
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -511,9 +510,9 @@ impl LoopbackCapabilityEndpoint {
                 "broker-v1 endpoint must be a valid ws:// IPv4 socket address".to_owned(),
             ));
         }
-        let host_str = endpoint.host_str().ok_or_else(|| {
-            AcpError::Protocol("broker-v1 endpoint must have a host".to_owned())
-        })?;
+        let host_str = endpoint
+            .host_str()
+            .ok_or_else(|| AcpError::Protocol("broker-v1 endpoint must have a host".to_owned()))?;
         let ip: std::net::Ipv4Addr = host_str.parse().map_err(|_| {
             AcpError::Protocol("broker-v1 endpoint host must be an IPv4 address".to_owned())
         })?;
@@ -523,13 +522,12 @@ impl LoopbackCapabilityEndpoint {
         }
         if !ip.is_loopback() && !is_tailscale_ipv4(ip) {
             return Err(AcpError::Protocol(
-                "broker-v1 endpoint host must be loopback (127.0.0.1) or Tailscale (100.64.0.0/10)".to_owned(),
+                "broker-v1 endpoint host must be loopback (127.0.0.1) or Tailscale (100.64.0.0/10)"
+                    .to_owned(),
             ));
         }
         let port = endpoint.port().filter(|port| *port != 0).ok_or_else(|| {
-            AcpError::Protocol(
-                "broker-v1 endpoint must specify a nonzero port".to_owned(),
-            )
+            AcpError::Protocol("broker-v1 endpoint must specify a nonzero port".to_owned())
         })?;
         Ok(Self {
             address: std::net::SocketAddrV4::new(ip, port),
@@ -566,10 +564,28 @@ impl AcpChildCredentialProjection {
         relay_url: &str,
         expires_at: u64,
     ) -> Result<Self, AcpError> {
+        Self::broker_v1_zeroizing(
+            endpoint,
+            capability_id,
+            Zeroizing::new(token.into()),
+            public_key,
+            relay_url,
+            expires_at,
+        )
+    }
+
+    pub(crate) fn broker_v1_zeroizing(
+        endpoint: &str,
+        capability_id: uuid::Uuid,
+        token: Zeroizing<String>,
+        public_key: nostr::PublicKey,
+        relay_url: &str,
+        expires_at: u64,
+    ) -> Result<Self, AcpError> {
         let projection = Self {
             endpoint: LoopbackCapabilityEndpoint::parse(endpoint)?,
             capability_id,
-            token: Zeroizing::new(token.into()),
+            token,
             public_key,
             relay_url: Self::parse_relay_origin(relay_url)?,
             expires_at,
