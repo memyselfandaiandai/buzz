@@ -171,7 +171,6 @@ fn identity_from_env() -> Option<Keys> {
 /// the localhost `resolve`/pool config with the app-wide `http_client`.
 pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(1)
         .redirect(reqwest::redirect::Policy::none())
@@ -196,7 +195,6 @@ pub fn build_app_state() -> AppState {
         keys: Mutex::new(keys),
         identity_storage: AtomicU8::new(identity_storage as u8),
         http_client: reqwest::Client::builder()
-            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
             .pool_idle_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(1)
             .build()

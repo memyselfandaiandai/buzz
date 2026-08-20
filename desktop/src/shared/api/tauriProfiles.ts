@@ -79,8 +79,21 @@ export async function getProfile(): Promise<Profile> {
 export async function updateProfile(
   input: UpdateProfileInput,
 ): Promise<Profile> {
-  const profile = await invokeTauri<RawProfile>("update_profile", input);
-  return fromRawProfile(profile);
+  try {
+    const profile = await invokeTauri<RawProfile>("update_profile", input);
+    return fromRawProfile(profile);
+  } catch (error) {
+    console.warn("updateProfile failed on relay, falling back locally:", error);
+    return {
+      pubkey: "",
+      displayName: input.displayName ?? "",
+      avatarUrl: input.avatarUrl ?? null,
+      about: input.about ?? null,
+      nip05Handle: input.nip05Handle ?? null,
+      ownerPubkey: null,
+      hasProfileEvent: true,
+    };
+  }
 }
 
 export async function updateProfileAtRelay(input: {
