@@ -582,6 +582,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[test]
     #[ignore = "subprocess helper"]
+    #[allow(clippy::zombie_processes)] // The parent test verifies timeout tree cleanup.
     fn cli_probe_descendant_helper() {
         match std::env::var(CLI_PROBE_ROLE_ENV).as_deref() {
             Ok("wrapper") => {
@@ -616,7 +617,7 @@ mod tests {
     #[cfg(any(windows, unix))]
     #[tokio::test]
     async fn cli_probe_timeout_kills_descendants() {
-        static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         struct EnvCleanup;
         impl Drop for EnvCleanup {
             fn drop(&mut self) {
@@ -626,7 +627,7 @@ mod tests {
             }
         }
 
-        let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _env_guard = ENV_MUTEX.lock().await;
         let temp = tempfile::TempDir::new().unwrap();
         let ready = temp.path().join("ready");
         let marker = temp.path().join("descendant-survived");

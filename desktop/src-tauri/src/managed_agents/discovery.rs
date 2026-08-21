@@ -214,6 +214,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
 ];
 
 /// Skill discovery directories declared by known runtimes.
+#[cfg(unix)]
 pub(crate) fn known_skill_dirs() -> impl Iterator<Item = &'static str> {
     KNOWN_ACP_RUNTIMES.iter().filter_map(|p| p.skill_dir)
 }
@@ -843,7 +844,7 @@ fn fetch_login_shell_path_inner() -> Option<String> {
     // Windows PATH instead.
     #[cfg(windows)]
     {
-        return None;
+        None
     }
 
     #[cfg(not(windows))]
@@ -1287,7 +1288,7 @@ pub(crate) fn codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
 /// Returns `true` when the codex-acp binary at `path` is below
 /// [`MIN_CODEX_ACP_VERSION`] or cannot be probed using `augmented_path`. Thin wrapper
 /// around [`codex_adapter_is_outdated_with_path`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn codex_adapter_is_outdated(path: &Path) -> bool {
     codex_adapter_is_outdated_with_path(
         path,
@@ -1606,33 +1607,8 @@ pub fn discover_acp_runtimes_from(
     entries
 }
 
-/// Test-only seam: a callback invoked between discovery's directory scan and
-/// its registry publish, so tests can land a `save_and_warm`/`delete_and_warm`
-/// in exactly the window the stale-snapshot bug lived in — through the REAL
-/// `discover_acp_runtimes_from` call path, not a hand-called seam.
 #[cfg(test)]
-pub(crate) mod pre_publish_test_hook {
-    use std::sync::{Mutex, OnceLock};
-
-    type Hook = Box<dyn Fn() + Send>;
-
-    fn cell() -> &'static Mutex<Option<Hook>> {
-        static CELL: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
-        CELL.get_or_init(|| Mutex::new(None))
-    }
-
-    /// Install (or clear, with `None`) the hook. Callers must serialize via
-    /// `registry_test_lock` — the hook is process-global.
-    pub(crate) fn set(hook: Option<Hook>) {
-        *cell().lock().unwrap_or_else(|e| e.into_inner()) = hook;
-    }
-
-    pub(crate) fn run() {
-        if let Some(hook) = cell().lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            hook();
-        }
-    }
-}
+pub(crate) mod pre_publish_test_hook;
 
 pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
     let runtime = known_acp_runtime(command)?;

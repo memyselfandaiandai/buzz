@@ -1204,13 +1204,12 @@ mod tests {
         }
     }
 
-    // ── codex readiness version gate ───────────────────────────────────────
-
     /// Build a minimal `KnownAcpRuntime` for testing the codex version gate.
     /// `adapter_commands` are the exact strings passed to `find_command` — use
     /// `&["codex-acp"]` when the binary is on PATH, or `&[<absolute_path>]`
     /// when resolving via absolute path.  `underlying_cli` is a portable
     /// stand-in so the adapter is not misclassified as `CliMissing`.
+    #[cfg(unix)]
     fn make_codex_runtime(
         adapter_commands: &'static [&'static str],
         underlying_cli: Option<&'static str>,

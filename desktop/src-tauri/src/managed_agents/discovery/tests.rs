@@ -2,15 +2,21 @@ use std::path::PathBuf;
 
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
 use super::{
-    apply_agent_command_update, classify_runtime, codex_adapter_availability,
-    codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
-    effective_agent_command, find_nvm_default_bin, find_via_login_shell,
+    apply_agent_command_update, classify_runtime, create_time_agent_command_override,
+    default_agent_command, effective_agent_command, find_via_login_shell,
     is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
-    parse_semver_tag, probe_codex_acp_version, record_agent_command, refresh_login_shell_path,
-    try_record_agent_command, BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL,
-    GOOSE_AVATAR_URL,
+    parse_semver_tag, record_agent_command, refresh_login_shell_path, try_record_agent_command,
+    BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
+};
+#[cfg(unix)]
+use super::{
+    codex_adapter_availability, codex_adapter_is_outdated, find_nvm_default_bin,
+    probe_codex_acp_version,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
+
+#[cfg(windows)]
+mod path_order;
 
 #[test]
 fn resolves_known_avatar_for_bare_command() {
@@ -315,8 +321,6 @@ fn record_agent_command_bare_record_defaults() {
     let record = record_with(None, None, None);
     assert_eq!(record_agent_command(&record, &[]), default_agent_command());
 }
-
-// ── try_record_agent_command ─────────────────────────────────────────────────
 
 /// When the record carries a dangling (unknown) runtime id, `try_record_agent_command`
 /// must return `Err` containing "DANGLING_HARNESS_ID" — NEVER the buzz-agent default.
@@ -922,8 +926,6 @@ fn probe_codex_acp_version_returns_version_when_descendant_holds_pipe_open() {
     );
 }
 
-// ── parse_semver_tag ──────────────────────────────────────────────────────────
-
 #[test]
 fn parse_semver_tag_accepts_plain_version() {
     assert_eq!(parse_semver_tag("v20.11.1"), Some((20, 11, 1)));
@@ -1141,8 +1143,6 @@ fn find_nvm_default_bin_rejects_absolute_hop_tag() {
     assert_eq!(result, None, "absolute-path hop tag must be rejected");
 }
 
-// ── Phase C: command_basenames ──────────────────────────────────────────────
-
 /// On non-Windows, command_basenames returns only the executable_basename.
 #[cfg(not(windows))]
 #[test]
@@ -1327,31 +1327,6 @@ fn test_cmd_shim_resolves_from_path() {
         Some(shim.as_path()),
         "resolve_command_uncached must find a .cmd shim on PATH when no .exe exists"
     );
-}
-
-/// PATH directory order must win over extension preference. An npm `.cmd`
-/// shim in an earlier directory is the intended command even if a later
-/// directory contains an inaccessible or unrelated `.exe` with the same name.
-#[cfg(windows)]
-#[test]
-fn test_cmd_shim_in_earlier_path_dir_wins_over_later_exe() {
-    let _guard = crate::managed_agents::lock_path_mutex();
-
-    let earlier = tempfile::tempdir().expect("earlier tempdir");
-    let later = tempfile::tempdir().expect("later tempdir");
-    let shim = earlier.path().join("test-path-order.cmd");
-    let exe = later.path().join("test-path-order.exe");
-    std::fs::write(&shim, "@echo off\r\n").expect("write shim");
-    std::fs::write(&exe, b"not a real executable").expect("write exe placeholder");
-
-    let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let joined = std::env::join_paths([earlier.path(), later.path()]).expect("join PATH");
-    std::env::set_var("PATH", &joined);
-
-    let result = super::resolve_command_uncached("test-path-order");
-
-    std::env::set_var("PATH", &old_path);
-    assert_eq!(result.as_deref(), Some(shim.as_path()));
 }
 
 // ── Phase A: no-shell-resolved error on Windows ────────────────────────────

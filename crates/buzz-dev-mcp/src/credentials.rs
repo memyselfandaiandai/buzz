@@ -528,7 +528,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn broker_child_environment_exposes_exactly_the_fixed_six_projection_and_no_long_lived_leak() {
         let credentials = ChildCredentials::broker_for_tests("wss://relay.example.com");
         let mut command = tokio::process::Command::new("not-spawned");
@@ -621,6 +620,7 @@ mod tests {
         assert!(get("BUZZ_CAPABILITY_TOKEN").len() >= 32);
     }
 
+    #[test]
     fn legacy_mode_does_not_rewrite_child_environment() {
         let credentials = ChildCredentials::LegacyEnv;
         let mut command = tokio::process::Command::new("not-spawned");

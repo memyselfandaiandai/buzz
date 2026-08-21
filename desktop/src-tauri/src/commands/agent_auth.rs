@@ -440,6 +440,7 @@ fn launch_visible_terminal(_argv: &[String]) -> Result<(), String> {
     Err("opening a terminal is not supported on this platform".to_string())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| shell_escape(arg))
@@ -447,6 +448,7 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_escape(arg: &str) -> String {
     if !arg.is_empty()
         && arg
@@ -462,9 +464,10 @@ fn shell_escape(arg: &str) -> String {
 mod tests {
     use super::{
         adapter_terminal_argv, append_inherited_path, is_claude_subscription_login,
-        run_buzz_acp_auth_command_with_paths, shell_escape, shell_join, uses_terminal_auth,
-        windows_terminal_args, AcpAuthMethod,
+        uses_terminal_auth, windows_terminal_args, AcpAuthMethod,
     };
+    #[cfg(not(target_os = "windows"))]
+    use super::{run_buzz_acp_auth_command_with_paths, shell_escape, shell_join};
 
     /// Windows regression: the augmented PATH there holds only Buzz-managed
     /// dirs and the exe parent (no login-shell PATH, no managed Node), so the
@@ -558,6 +561,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn shell_join_escapes_spaces_and_quotes() {
         assert_eq!(
@@ -566,6 +570,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn shell_escape_leaves_simple_args_unquoted() {
         assert_eq!(shell_escape("--claudeai"), "--claudeai");

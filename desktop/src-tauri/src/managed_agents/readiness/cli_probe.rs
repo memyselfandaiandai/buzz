@@ -275,11 +275,7 @@ mod tests {
         fs::write(&shim_path, "@echo off\r\nexit /b 0\r\n").expect("write batch shim");
 
         assert_eq!(
-            super::login_probe(
-                &shim_path,
-                &["fake-codex", "login", "status"],
-                None,
-            ),
+            super::login_probe(&shim_path, &["fake-codex", "login", "status"], None,),
             ProbeOutcome::LoggedIn,
         );
     }

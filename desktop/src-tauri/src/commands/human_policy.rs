@@ -1,11 +1,10 @@
-use serde::{Deserialize, Serialize};
-use tauri::State;
 use crate::app_state::AppState;
 use buzz_lifecycle::{
-    CardAnswer, CardChoice, CardKind, CaptureManifest, DryRunRequest, DryRunResult,
-    HumanCard, ManifestFile, PreflightCheck, PreflightFrame, SkillCurator, SkillVersion,
-    SpendGuardConfig, AutomationDefinition, AutomationRun, AutomationWake,
+    AutomationDefinition, AutomationRun, AutomationWake, CaptureManifest, CardChoice, CardKind,
+    DryRunRequest, DryRunResult, HumanCard, PreflightFrame, SkillVersion, SpendGuardConfig,
 };
+use serde::{Deserialize, Serialize};
+use tauri::State;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HumanCardWire {
@@ -89,11 +88,13 @@ pub struct SpendGuardStatusWire {
 }
 
 #[tauri::command]
-pub async fn list_human_cards(
-    state: State<'_, AppState>,
-) -> Result<Vec<HumanCardWire>, String> {
+pub async fn list_human_cards(state: State<'_, AppState>) -> Result<Vec<HumanCardWire>, String> {
     let broker = state.human_card_broker.lock().map_err(|e| e.to_string())?;
-    Ok(broker.all_cards().into_iter().map(HumanCardWire::from).collect())
+    Ok(broker
+        .all_cards()
+        .into_iter()
+        .map(HumanCardWire::from)
+        .collect())
 }
 
 #[tauri::command]
@@ -206,9 +207,7 @@ pub async fn toggle_spend_guard_pause(
 }
 
 #[tauri::command]
-pub async fn list_curated_skills(
-    state: State<'_, AppState>,
-) -> Result<Vec<SkillVersion>, String> {
+pub async fn list_curated_skills(state: State<'_, AppState>) -> Result<Vec<SkillVersion>, String> {
     let curator = state.skill_curator.lock().map_err(|e| e.to_string())?;
     Ok(curator.all_skills())
 }
@@ -244,7 +243,10 @@ pub async fn get_workspace_observer(
     workspace_id: String,
     state: State<'_, AppState>,
 ) -> Result<buzz_workspace_controller::WorkspaceObserverContract, String> {
-    let mut registry = state.workspace_observers.lock().map_err(|e| e.to_string())?;
+    let mut registry = state
+        .workspace_observers
+        .lock()
+        .map_err(|e| e.to_string())?;
     Ok(registry.get_or_create(&workspace_id).clone())
 }
 
@@ -255,7 +257,10 @@ pub async fn set_workspace_observer_presence(
     active_view: String,
     state: State<'_, AppState>,
 ) -> Result<buzz_workspace_controller::WorkspaceObserverContract, String> {
-    let mut registry = state.workspace_observers.lock().map_err(|e| e.to_string())?;
+    let mut registry = state
+        .workspace_observers
+        .lock()
+        .map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
     let obs = registry.get_or_create(&workspace_id);
     obs.update_presence(viewer_id, active_view, now);
@@ -268,7 +273,10 @@ pub async fn toggle_workspace_recording(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<buzz_workspace_controller::WorkspaceObserverContract, String> {
-    let mut registry = state.workspace_observers.lock().map_err(|e| e.to_string())?;
+    let mut registry = state
+        .workspace_observers
+        .lock()
+        .map_err(|e| e.to_string())?;
     let obs = registry.get_or_create(&workspace_id);
     obs.set_recording(enabled);
     Ok(obs.clone())
@@ -302,7 +310,9 @@ pub async fn create_automation_definition(
         updated_at_ms: now,
         config_json,
     };
-    broker.create_definition(def).map_err(|e| format!("{:?}", e))
+    broker
+        .create_definition(def)
+        .map_err(|e| format!("{:?}", e))
 }
 
 #[tauri::command]
@@ -313,7 +323,9 @@ pub async fn toggle_automation_enabled(
 ) -> Result<AutomationDefinition, String> {
     let mut broker = state.automation_broker.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
-    broker.set_enabled(&definition_id, enabled, now).map_err(|e| format!("{:?}", e))
+    broker
+        .set_enabled(&definition_id, enabled, now)
+        .map_err(|e| format!("{:?}", e))
 }
 
 #[tauri::command]

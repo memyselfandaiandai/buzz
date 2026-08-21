@@ -529,7 +529,7 @@ struct LocalCredentials {
 
 enum CredentialBackend {
     Local(Box<LocalCredentials>),
-    Capability(CapabilityClient),
+    Capability(Box<CapabilityClient>),
 }
 
 fn count_auth_tags(event: &nostr::Event) -> usize {
@@ -614,7 +614,7 @@ impl BuzzClient {
         Ok(Self {
             http,
             relay_url,
-            credentials: CredentialBackend::Capability(capability),
+            credentials: CredentialBackend::Capability(Box::new(capability)),
         })
     }
 
@@ -1462,11 +1462,10 @@ mod capability_tests {
         IdentityMetadata, Operation, OperationResult, RelayOrigin, RequestEnvelope,
         ResponseEnvelope,
     };
+    use futures_util::{SinkExt, StreamExt};
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-    };
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
     use uuid::Uuid;
 
     use super::*;
@@ -1542,18 +1541,22 @@ mod capability_tests {
         format!("http://{address}")
     }
 
-    async fn read_request(stream: &mut TcpStream) -> RequestEnvelope {
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes).await.expect("read request");
-        assert_eq!(bytes.pop(), Some(b'\n'));
-        serde_json::from_slice(&bytes).expect("request envelope")
+    async fn read_request(stream: &mut WebSocketStream<TcpStream>) -> RequestEnvelope {
+        let message = stream
+            .next()
+            .await
+            .expect("request frame")
+            .expect("valid request frame");
+        serde_json::from_slice(&message.into_data()).expect("request envelope")
     }
 
-    async fn write_response(stream: &mut TcpStream, response: &ResponseEnvelope) {
-        let mut bytes = serde_json::to_vec(response).expect("response JSON");
-        bytes.push(b'\n');
-        stream.write_all(&bytes).await.expect("write response");
-        stream.shutdown().await.expect("shutdown response");
+    async fn write_response(stream: &mut WebSocketStream<TcpStream>, response: &ResponseEnvelope) {
+        let bytes = serde_json::to_vec(response).expect("response JSON");
+        stream
+            .send(Message::Binary(bytes.into()))
+            .await
+            .expect("write response");
+        stream.close(None).await.expect("close response");
     }
 
     async fn spawn_broker(
@@ -1566,7 +1569,8 @@ mod capability_tests {
         let address = listener.local_addr().expect("broker address");
         tokio::spawn(async move {
             for _ in 0..connections {
-                let (mut stream, _) = listener.accept().await.expect("accept broker request");
+                let (stream, _) = listener.accept().await.expect("accept broker request");
+                let mut stream = accept_async(stream).await.expect("accept broker websocket");
                 let request = read_request(&mut stream).await;
                 let result = match &request.operation {
                     Operation::IdentityMetadata => {
@@ -1612,7 +1616,7 @@ mod capability_tests {
                 .await;
             }
         });
-        format!("tcp://{address}")
+        format!("ws://{address}/")
     }
 
     fn auth_tag_fields() -> Vec<String> {

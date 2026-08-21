@@ -15,6 +15,8 @@ import { classifyTool } from "./agentSessionToolClassifier";
 import { asRecord, asString, titleCase } from "./agentSessionUtils";
 import {
   describeTurnStarted,
+  describePermissionOutcome,
+  describePermissionRequest,
   describeSessionResolved,
   extractBlockText,
   extractContentText,
@@ -24,8 +26,10 @@ import {
   extractToolArgs,
   extractToolIdentity,
   extractToolResult,
+  isSemanticTranscriptEvent,
   parsePromptText,
   parseSystemPromptSections,
+  writeSemanticTranscriptEvent,
 } from "./agentSessionTranscriptHelpers";
 import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
 
@@ -169,85 +173,6 @@ function stringifyPayload(value: unknown) {
   } catch {
     return String(value);
   }
-}
-
-function describePermissionRequest(payload: Record<string, unknown>) {
-  const params = asRecord(payload.params);
-  const title =
-    asString(params.title) ??
-    asString(params.message) ??
-    asString(params.reason) ??
-    "Permission requested";
-  const toolCallId =
-    asString(params.toolCallId) ?? asString(params.tool_call_id);
-  const options = Array.isArray(params.options)
-    ? params.options
-        .map((option) => {
-          const record = asRecord(option);
-          return (
-            asString(record.name) ??
-            asString(record.kind) ??
-            asString(record.optionId)
-          );
-        })
-        .filter((option): option is string => Boolean(option))
-    : [];
-  const detail: string[] = [];
-  if (title !== "Permission requested") detail.push(title);
-  if (toolCallId) detail.push(`Tool call: ${toolCallId}`);
-  if (options.length > 0) detail.push(`Options: ${options.join(", ")}`);
-
-  // Build optionId → kind map for outcome labeling on the response.
-  const optionNames = new Map<string, string>();
-  if (Array.isArray(params.options)) {
-    for (const option of params.options) {
-      const record = asRecord(option);
-      const optionId = asString(record.optionId);
-      const kind = asString(record.kind);
-      if (optionId && kind) {
-        optionNames.set(optionId, kind);
-      }
-    }
-  }
-
-  return {
-    title,
-    text: detail.join("\n"),
-    optionNames,
-    descriptor: {
-      renderClass: "permission" as const,
-      label: "Permission requested",
-      preview: title,
-      action: { verb: "Requested", object: title },
-      tone: "admin" as const,
-      operation: "session/request_permission",
-      object: title,
-      source: "acp" as const,
-      groupKey: "permission:request",
-    },
-  };
-}
-
-/**
- * Format a human-readable outcome label from a permission response.
- * kind values from ACP: allow_once, allow_always, reject_once, reject_always.
- * "reject_*" kinds are denials; anything else that is selected is an approval.
- */
-function describePermissionOutcome(
-  outcome: string,
-  optionId: string | null,
-  optionNames: Map<string, string>,
-): string {
-  if (outcome === "cancelled") {
-    return "Cancelled";
-  }
-  if (outcome === "selected" && optionId) {
-    const kind = optionNames.get(optionId) ?? optionId;
-    const isDenial = kind.startsWith("reject");
-    const verb = isDenial ? "Denied" : "Approved";
-    return `${verb} (${kind})`;
-  }
-  return outcome;
 }
 
 /**
@@ -786,240 +711,19 @@ export function processTranscriptEvent(
       ctx,
       event.kind,
     );
-  } else if (event.kind === "transcript_prompt") {
-    // Display-authorized prompt content has an explicit semantic observer
-    // contract. Raw acp_write events are structural projections and must not
-    // be treated as a source of prompt text (their full wire payload may also
-    // contain credentials, MCP environment, cwd, and session identifiers).
-    const payload = asRecord(event.payload);
-    const source = asString(payload.source);
-    const blocks = Array.isArray(payload.blocks)
-      ? payload.blocks.filter(
-          (block): block is string => typeof block === "string",
-        )
-      : [];
-    const supportedSource =
-      source === "session/prompt" || source === "session/steer";
-    if (payload.schemaVersion === 1 && supportedSource && blocks.length > 0) {
-      const parsedPrompt = parsePromptText(blocks.join("\n\n"));
-      const isSteer = source === "session/steer";
-      if (parsedPrompt.userText) {
-        upsertMessage(
-          d,
-          `${isSteer ? "steer" : "prompt"}:${ch}:${event.turnId ?? event.seq}`,
-          "user",
-          parsedPrompt.userTitle,
-          parsedPrompt.userText,
-          event.timestamp,
-          ctx,
-          parsedPrompt.userPubkey,
-          isSteer ? "session/steer:user" : "session/prompt:user",
-          parsedPrompt.userEventId ??
-            (isSteer
-              ? null
-              : getSingleTriggeringEventId(d, ch, event.turnId ?? event.seq)),
-        );
-      }
-      if (parsedPrompt.sections.length > 0) {
-        upsertMetadata(
-          d,
-          `${isSteer ? "steer" : "prompt"}-context:${ch}:${event.turnId ?? event.seq}`,
-          "Prompt context",
-          parsedPrompt.sections,
-          event.timestamp,
-          ctx,
-          isSteer ? "session/steer:context" : "session/prompt:context",
-        );
-      }
-    }
-  } else if (event.kind === "transcript_system_context") {
-    // This event contains only the logical text already authorized for the
-    // local transcript observer; it deliberately excludes the surrounding
-    // session/new request and its MCP/cwd/credential-bearing fields.
-    const payload = asRecord(event.payload);
-    const source = asString(payload.source);
-    const text = asString(payload.text);
-    if (payload.schemaVersion === 1 && source === "session/new" && text) {
-      const sections = parseSystemPromptSections(text);
-      if (sections.length > 0) {
-        upsertMetadata(
-          d,
-          `system-prompt:${ch}:${event.seq}:${event.timestamp}`,
-          "System prompt",
-          sections,
-          event.timestamp,
-          { ...ctx, turnId: null },
-          "session/new",
-        );
-      }
-    }
-  } else if (event.kind === "transcript_session_update") {
-    const payload = asRecord(event.payload);
-    const updateType = asString(payload.updateType);
-    const turnKey = event.turnId ?? event.sessionId ?? "unknown";
-    if (payload.schemaVersion === 1 && updateType === "agent_message_chunk") {
-      const text = asString(payload.text);
-      if (text) {
-        const messageKey = asString(payload.messageKey) ?? turnKey;
-        upsertMessage(
-          d,
-          `assistant:${ch}:${messageKey}`,
-          "assistant",
-          "Assistant",
-          text,
-          event.timestamp,
-          ctx,
-          null,
-          updateType,
-        );
-      }
-    } else if (
-      payload.schemaVersion === 1 &&
-      updateType === "agent_thought_chunk" &&
-      payload.contentHidden === true
-    ) {
-      const messageKey = asString(payload.messageKey) ?? turnKey;
-      const itemId = `thinking:${ch}:${messageKey}`;
-      if (!d.itemsById.has(itemId)) {
-        upsertTextItem(
-          d,
-          itemId,
-          "thought",
-          "Thinking",
-          "Reasoning activity (content hidden)",
-          event.timestamp,
-          ctx,
-          updateType,
-        );
-      }
-    } else if (
-      payload.schemaVersion === 1 &&
-      (updateType === "tool_call" || updateType === "tool_call_update")
-    ) {
-      const toolKey = asString(payload.toolKey) ?? `tool:${event.seq}`;
-      const status = normalizeToolStatus(
-        asString(payload.status) ??
-          (updateType === "tool_call" ? "executing" : "completed"),
-      );
-      upsertTool(
-        d,
-        `tool:${ch}:${toolKey}`,
-        "Tool activity",
-        "tool_activity",
-        null,
-        status,
-        {},
-        "",
-        status === "failed",
-        event.timestamp,
-        ctx,
-        updateType,
-      );
-    } else if (payload.schemaVersion === 1 && updateType === "plan") {
-      const entryCount =
-        typeof payload.entryCount === "number" ? payload.entryCount : 0;
-      const completedCount =
-        typeof payload.completedCount === "number"
-          ? payload.completedCount
-          : 0;
-      upsertPlan(
-        d,
-        `plan:${ch}:${turnKey}`,
-        "Plan",
-        `Plan updated: ${completedCount}/${entryCount} steps complete (details hidden)`,
-        event.timestamp,
-        ctx,
-        updateType,
-        `plan-update:${ch}:${turnKey}:${event.seq}`,
-      );
-    } else if (
-      payload.schemaVersion === 1 &&
-      updateType === "current_mode_update"
-    ) {
-      upsertLifecycleItem(
-        d,
-        `mode:${ch}:${turnKey}`,
-        "status",
-        "Mode",
-        "Mode updated (details hidden)",
-        event.timestamp,
-        ctx,
-        updateType,
-      );
-    } else if (payload.schemaVersion === 1 && updateType === "usage_update") {
-      const used = typeof payload.used === "number" ? payload.used : null;
-      const size = typeof payload.size === "number" ? payload.size : null;
-      if (used !== null && size !== null) {
-        replaceLifecycleItem(
-          d,
-          `usage:${ch}:${turnKey}`,
-          "status",
-          "Usage",
-          `Tokens: ${used}/${size}`,
-          event.timestamp,
-          ctx,
-          updateType,
-        );
-      }
-    } else if (
-      payload.schemaVersion === 1 &&
-      updateType === "available_commands_update"
-    ) {
-      const count =
-        typeof payload.commandCount === "number" ? payload.commandCount : 0;
-      upsertLifecycleItem(
-        d,
-        `commands:${ch}:${turnKey}`,
-        "status",
-        "Commands",
-        `Commands available: ${count}`,
-        event.timestamp,
-        ctx,
-        updateType,
-      );
-    } else if (
-      payload.schemaVersion === 1 &&
-      updateType === "config_option_update"
-    ) {
-      const count =
-        typeof payload.optionCount === "number" ? payload.optionCount : 0;
-      upsertLifecycleItem(
-        d,
-        `config:${ch}:${turnKey}`,
-        "status",
-        "Config",
-        `Configuration updated: ${count} options (details hidden)`,
-        event.timestamp,
-        ctx,
-        updateType,
-      );
-    }
-  } else if (event.kind === "transcript_permission") {
-    const payload = asRecord(event.payload);
-    const outcome = asString(payload.outcome);
-    if (
-      payload.schemaVersion === 1 &&
-      (outcome === "approved" ||
-        outcome === "denied" ||
-        outcome === "cancelled")
-    ) {
-      const outcomeText =
-        outcome === "approved"
-          ? "Approved"
-          : outcome === "denied"
-            ? "Denied"
-            : "Cancelled";
-      upsertLifecycleItem(
-        d,
-        `permission:${ch}:semantic:${event.seq}`,
-        "permission",
-        "Permission resolved",
-        outcomeText,
-        event.timestamp,
-        ctx,
-        "permission_result",
-      );
-    }
+  } else if (isSemanticTranscriptEvent(event)) {
+    writeSemanticTranscriptEvent(event, ch, ctx, {
+      hasItem: (id) => d.itemsById.has(id),
+      getSingleTriggeringEventId: (channelKey, turnKey) =>
+        getSingleTriggeringEventId(d, channelKey, turnKey),
+      upsertMessage: (...args) => upsertMessage(d, ...args),
+      upsertTextItem: (...args) => upsertTextItem(d, ...args),
+      upsertLifecycleItem: (...args) => upsertLifecycleItem(d, ...args),
+      replaceLifecycleItem: (...args) => replaceLifecycleItem(d, ...args),
+      upsertPlan: (...args) => upsertPlan(d, ...args),
+      upsertMetadata: (...args) => upsertMetadata(d, ...args),
+      upsertTool: (...args) => upsertTool(d, ...args),
+    });
   } else if (event.kind === "acp_read" || event.kind === "acp_write") {
     const payload = asRecord(event.payload);
     const method = asString(payload.method);

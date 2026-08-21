@@ -34,7 +34,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     >
       <div className="flex items-center justify-between">
         <p className="text-sm font-medium">Approval Required</p>
-        <span className="text-[10px] text-muted-foreground font-mono">
+        <span className="text-2xs text-muted-foreground font-mono">
           {approval.stepId}
         </span>
       </div>
@@ -44,7 +44,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
       <p className="text-xs text-muted-foreground">
         Expires: {new Date(approval.expiresAt).toLocaleString()}
       </p>
-      
+
       {answeredChoice ? (
         <p className="text-xs text-green-400 font-medium pt-1">
           ✓ Resolved as {answeredChoice.toUpperCase()} — execution resumed.
@@ -52,6 +52,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
       ) : (
         <div className="pt-2 flex gap-2">
           <button
+            type="button"
             disabled={submitting}
             onClick={() => handleAction("approve")}
             className="px-3 py-1 bg-green-600/80 hover:bg-green-600 text-white text-xs font-medium rounded transition"
@@ -59,6 +60,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
             Approve
           </button>
           <button
+            type="button"
             disabled={submitting}
             onClick={() => handleAction("deny")}
             className="px-3 py-1 bg-red-600/80 hover:bg-red-600 text-white text-xs font-medium rounded transition"

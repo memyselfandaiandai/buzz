@@ -55,14 +55,15 @@ export function HumanCardComponent({ card, onAnswered }: HumanCardProps) {
           return (
             <button
               key={c.choice_id}
+              type="button"
               disabled={isAnswered || submitting}
               onClick={() => handleChoice(c.choice_id)}
               className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
                 isSelected
                   ? "bg-amber-600 text-white font-bold ring-2 ring-amber-400"
                   : isAnswered
-                  ? "bg-muted text-muted-foreground opacity-50 cursor-not-allowed"
-                  : "bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30"
+                    ? "bg-muted text-muted-foreground opacity-50 cursor-not-allowed"
+                    : "bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30"
               }`}
             >
               {c.label} {isSelected && "✓"}
@@ -72,15 +73,13 @@ export function HumanCardComponent({ card, onAnswered }: HumanCardProps) {
       </div>
 
       {isAnswered && (
-        <p className="text-[11px] text-green-400/90 font-medium pt-1">
+        <p className="text-2xs text-green-400/90 font-medium pt-1">
           ✓ Resolved (Choice: {chosenId}) — Turn execution resumed.
         </p>
       )}
 
       {error && (
-        <p className="text-[11px] text-red-400 font-medium pt-1">
-          Error: {error}
-        </p>
+        <p className="text-2xs text-red-400 font-medium pt-1">Error: {error}</p>
       )}
     </div>
   );

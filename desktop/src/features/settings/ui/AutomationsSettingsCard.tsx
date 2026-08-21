@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   listAutomationDefinitions,
   toggleAutomationEnabled,
@@ -15,7 +15,7 @@ export function AutomationsSettingsCard() {
   const [newName, setNewName] = useState("");
   const [newId, setNewId] = useState("");
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const [defs, r] = await Promise.all([
         listAutomationDefinitions(),
@@ -26,13 +26,13 @@ export function AutomationsSettingsCard() {
     } catch (err) {
       console.error("Failed to load automations:", err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadData();
     const timer = setInterval(loadData, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [loadData]);
 
   const handleToggle = async (def: AutomationDefinition) => {
     try {
@@ -78,7 +78,8 @@ export function AutomationsSettingsCard() {
             Automations & Scheduled Triggers
           </h3>
           <p className="text-sm text-muted-foreground">
-            Inactive-by-default scheduled jobs with immutable revision fences and wake/run accounting.
+            Inactive-by-default scheduled jobs with immutable revision fences
+            and wake/run accounting.
           </p>
         </div>
         <button
@@ -122,7 +123,8 @@ export function AutomationsSettingsCard() {
         </h4>
         {definitions.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-            No automations configured. New jobs are created inactive by default to protect against unvetted runs.
+            No automations configured. New jobs are created inactive by default
+            to protect against unvetted runs.
           </div>
         ) : (
           <div className="space-y-2">
@@ -133,7 +135,9 @@ export function AutomationsSettingsCard() {
               >
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="font-semibold text-foreground">{def.name}</span>
+                    <span className="font-semibold text-foreground">
+                      {def.name}
+                    </span>
                     <span className="text-xs font-mono text-muted-foreground">
                       ({def.definition_id})
                     </span>
@@ -188,21 +192,23 @@ export function AutomationsSettingsCard() {
               >
                 <div className="flex items-center gap-2 font-mono">
                   <span className="text-foreground">{r.definition_id}</span>
-                  <span className="text-muted-foreground">[{r.run_id.slice(0, 8)}]</span>
+                  <span className="text-muted-foreground">
+                    [{r.run_id.slice(0, 8)}]
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">
                     {new Date(r.created_at_ms).toLocaleTimeString()}
                   </span>
                   <span
-                    className={`font-semibold uppercase text-[10px] px-1.5 py-0.5 rounded ${
+                    className={`font-semibold uppercase text-2xs px-1.5 py-0.5 rounded ${
                       r.state === "acked"
                         ? "bg-emerald-500/10 text-emerald-600"
                         : r.state === "delivered"
-                        ? "bg-blue-500/10 text-blue-600"
-                        : r.state === "failed"
-                        ? "bg-red-500/10 text-red-600"
-                        : "bg-muted text-muted-foreground"
+                          ? "bg-blue-500/10 text-blue-600"
+                          : r.state === "failed"
+                            ? "bg-red-500/10 text-red-600"
+                            : "bg-muted text-muted-foreground"
                     }`}
                   >
                     {r.state}

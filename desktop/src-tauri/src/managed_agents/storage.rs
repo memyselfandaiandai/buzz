@@ -781,6 +781,7 @@ pub fn remove_agent_pid_file(app: &AppHandle, pubkey: &str) {
 }
 
 /// Read all PID files from `agent-pids/`, returning `(pubkey, pid)` pairs.
+#[cfg(unix)]
 pub fn read_all_agent_pid_files(app: &AppHandle) -> Vec<(String, u32)> {
     let Ok(dir) = agent_pids_dir(app) else {
         return Vec::new();

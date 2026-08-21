@@ -17,6 +17,11 @@ pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, Resolve
 use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 
+#[path = "app_state_startup.rs"]
+mod startup;
+pub use startup::build_media_fetch_client;
+use startup::identity_from_env;
+
 pub struct AppState {
     pub keys: Mutex<Keys>,
     /// Durable backend holding `keys`. Updated after the key write and before
@@ -139,48 +144,6 @@ pub struct AppState {
     /// bounded and letting a later leave correctly flip the channel back to
     /// `is_member=false`.
     pub pending_owned_channels: Mutex<std::collections::HashSet<(String, String)>>,
-}
-
-/// Parse the `BUZZ_PRIVATE_KEY` env var into identity keys. `Some` means the
-/// env var was present and valid and MUST win over any persisted/keyring key
-/// (the dev/CI/harness override). `None` means absent or malformed — callers
-/// fall through to persisted resolution. A malformed value is logged and
-/// treated as absent rather than left on an ephemeral identity.
-fn identity_from_env() -> Option<Keys> {
-    match std::env::var("BUZZ_PRIVATE_KEY") {
-        Ok(nsec) => match Keys::parse(nsec.trim()) {
-            Ok(keys) => Some(keys),
-            Err(error) => {
-                eprintln!("buzz-desktop: invalid BUZZ_PRIVATE_KEY: {error}");
-                None
-            }
-        },
-        Err(std::env::VarError::NotUnicode(_)) => {
-            eprintln!("buzz-desktop: BUZZ_PRIVATE_KEY contains invalid UTF-8");
-            None
-        }
-        Err(std::env::VarError::NotPresent) => None,
-    }
-}
-
-/// Build the no-redirect HTTP client used for authenticated relay media
-/// fetches (download / copy).
-///
-/// This client is a security boundary, not a convenience: it carries a minted
-/// media `Authorization` header, so it MUST NOT follow redirects. A relay 3xx
-/// to an off-origin or private host would otherwise forward that header across
-/// origins (a redirect-hop SSRF). `redirect::Policy::none()` returns the 3xx
-/// verbatim so the caller can reject it.
-///
-/// Returned as a `Result` so the fail-closed invariant is testable — callers
-/// must never substitute a redirect-following client on build failure. Shares
-/// the localhost `resolve`/pool config with the app-wide `http_client`.
-pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
 }
 
 pub fn build_app_state() -> AppState {
@@ -1111,30 +1074,5 @@ pub(crate) fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), S
 mod tests;
 
 #[cfg(test)]
-mod secret_audit_startup_tests {
-    use super::*;
-
-    #[test]
-    fn available_secret_audit_constructs_broker_and_signing_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let audit = buzz_secrets::SecretAuditStore::open(temp.path().join("secret-audit.sqlite"));
-
-        let state = build_app_state_with_secret_audit(audit);
-
-        assert!(state.secret_access_broker.is_some());
-        assert!(state.signing_keys().is_ok());
-    }
-
-    #[test]
-    fn unavailable_secret_audit_keeps_signing_state_available() {
-        let state = build_app_state_with_secret_audit(Err(buzz_secrets::SecretError::Audit(
-            "C:\\sensitive\\audit.sqlite: database disk image is malformed".to_string(),
-        )));
-
-        assert!(state.secret_access_broker.is_none());
-        assert!(
-            state.signing_keys().is_ok(),
-            "optional secret audit failure must not block unrelated signing state"
-        );
-    }
-}
+#[path = "app_state_secret_audit_tests.rs"]
+mod secret_audit_startup_tests;

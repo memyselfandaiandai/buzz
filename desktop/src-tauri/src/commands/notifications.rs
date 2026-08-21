@@ -13,6 +13,7 @@
 //! action, which we forward to the frontend so it can focus the window and
 //! route to the notification target.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const NATIVE_NOTIFICATION_ACTIVATED_EVENT: &str = "native-notification-activated";
 
 /// Show a desktop notification natively.

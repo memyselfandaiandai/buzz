@@ -25,6 +25,11 @@ name = "buzz-acp-broker"
 path = "src/bin/broker_standalone.rs"
 required-features = ["signing-capability-broker"]
 
+[[test]]
+name = "broker_standalone"
+path = "tests/broker_standalone.rs"
+required-features = ["signing-capability-broker"]
+
 [dependencies]
 # Internal
 buzz-core = { workspace = true }

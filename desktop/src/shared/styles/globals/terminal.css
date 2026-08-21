@@ -273,6 +273,7 @@
   }
 
   .buzz-terminal-substrate[data-terminal-visible="false"] {
+    /* biome-ignore lint/complexity/noImportantStyles: visibility must override the persisted terminal height */
     height: 0 !important;
     min-height: 0;
     pointer-events: none;

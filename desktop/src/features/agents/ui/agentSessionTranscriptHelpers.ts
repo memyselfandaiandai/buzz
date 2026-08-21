@@ -1,7 +1,13 @@
-import type { ObserverEvent, PromptSection } from "./agentSessionTypes";
+import type {
+  AgentActivityDescriptor,
+  ObserverEvent,
+  PromptSection,
+  ToolStatus,
+} from "./agentSessionTypes";
 import {
   findBuzzToolName,
   isGenericToolTitle,
+  normalizeToolStatus,
   normalizeToolName,
 } from "./agentSessionToolCatalog";
 import { asRecord, asString, titleCase } from "./agentSessionUtils";
@@ -460,4 +466,393 @@ export function describeRawEvent(event: ObserverEvent): string {
     return asString(update.sessionUpdate) ?? method;
   }
   return method ?? event.kind;
+}
+
+export function describePermissionRequest(payload: Record<string, unknown>): {
+  title: string;
+  text: string;
+  optionNames: Map<string, string>;
+  descriptor: AgentActivityDescriptor;
+} {
+  const params = asRecord(payload.params);
+  const title =
+    asString(params.title) ??
+    asString(params.message) ??
+    asString(params.reason) ??
+    "Permission requested";
+  const toolCallId =
+    asString(params.toolCallId) ?? asString(params.tool_call_id);
+  const options = Array.isArray(params.options)
+    ? params.options
+        .map((option) => {
+          const record = asRecord(option);
+          return (
+            asString(record.name) ??
+            asString(record.kind) ??
+            asString(record.optionId)
+          );
+        })
+        .filter((option): option is string => Boolean(option))
+    : [];
+  const detail: string[] = [];
+  if (title !== "Permission requested") detail.push(title);
+  if (toolCallId) detail.push(`Tool call: ${toolCallId}`);
+  if (options.length > 0) detail.push(`Options: ${options.join(", ")}`);
+
+  const optionNames = new Map<string, string>();
+  if (Array.isArray(params.options)) {
+    for (const option of params.options) {
+      const record = asRecord(option);
+      const optionId = asString(record.optionId);
+      const kind = asString(record.kind);
+      if (optionId && kind) optionNames.set(optionId, kind);
+    }
+  }
+
+  return {
+    title,
+    text: detail.join("\n"),
+    optionNames,
+    descriptor: {
+      renderClass: "permission",
+      label: "Permission requested",
+      preview: title,
+      action: { verb: "Requested", object: title },
+      tone: "admin",
+      operation: "session/request_permission",
+      object: title,
+      source: "acp",
+      groupKey: "permission:request",
+    },
+  };
+}
+
+export function describePermissionOutcome(
+  outcome: string,
+  optionId: string | null,
+  optionNames: Map<string, string>,
+): string {
+  if (outcome === "cancelled") return "Cancelled";
+  if (outcome === "selected" && optionId) {
+    const kind = optionNames.get(optionId) ?? optionId;
+    return `${kind.startsWith("reject") ? "Denied" : "Approved"} (${kind})`;
+  }
+  return outcome;
+}
+
+export type SemanticTranscriptContext = {
+  channelId: string | null;
+  turnId: string | null;
+  sessionId: string | null;
+};
+
+type SemanticTranscriptWriter = {
+  hasItem: (id: string) => boolean;
+  getSingleTriggeringEventId: (
+    channelKey: string,
+    turnKey: string | number | null,
+  ) => string | null;
+  upsertMessage: (
+    id: string,
+    role: "assistant" | "user",
+    title: string,
+    text: string,
+    timestamp: string,
+    ctx: SemanticTranscriptContext,
+    authorPubkey?: string | null,
+    acpSource?: string,
+    messageId?: string | null,
+  ) => void;
+  upsertTextItem: (
+    id: string,
+    type: "thought" | "lifecycle",
+    title: string,
+    text: string,
+    timestamp: string,
+    ctx: SemanticTranscriptContext,
+    acpSource?: string,
+  ) => void;
+  upsertLifecycleItem: (
+    id: string,
+    renderClass: "status" | "permission" | "error",
+    title: string,
+    text: string,
+    timestamp: string,
+    ctx: SemanticTranscriptContext,
+    acpSource?: string,
+  ) => void;
+  replaceLifecycleItem: SemanticTranscriptWriter["upsertLifecycleItem"];
+  upsertPlan: (
+    id: string,
+    title: string,
+    text: string,
+    timestamp: string,
+    ctx: SemanticTranscriptContext,
+    acpSource?: string,
+    updateMarkerId?: string,
+  ) => void;
+  upsertMetadata: (
+    id: string,
+    title: string,
+    sections: PromptSection[],
+    timestamp: string,
+    ctx: SemanticTranscriptContext,
+    acpSource?: string,
+  ) => void;
+  upsertTool: (
+    id: string,
+    title: string,
+    toolName: string,
+    buzzToolName: string | null,
+    status: ToolStatus,
+    args: Record<string, unknown>,
+    result: string,
+    isError: boolean,
+    timestamp: string,
+    ctx: SemanticTranscriptContext,
+    acpSource?: string,
+  ) => void;
+};
+
+export function isSemanticTranscriptEvent(event: ObserverEvent): boolean {
+  return (
+    event.kind === "transcript_prompt" ||
+    event.kind === "transcript_system_context" ||
+    event.kind === "transcript_session_update" ||
+    event.kind === "transcript_permission"
+  );
+}
+
+export function writeSemanticTranscriptEvent(
+  event: ObserverEvent,
+  channelKey: string,
+  ctx: SemanticTranscriptContext,
+  writer: SemanticTranscriptWriter,
+): void {
+  if (event.kind === "transcript_prompt") {
+    const payload = asRecord(event.payload);
+    const source = asString(payload.source);
+    const blocks = Array.isArray(payload.blocks)
+      ? payload.blocks.filter(
+          (block): block is string => typeof block === "string",
+        )
+      : [];
+    const supportedSource =
+      source === "session/prompt" || source === "session/steer";
+    if (payload.schemaVersion === 1 && supportedSource && blocks.length > 0) {
+      const parsedPrompt = parsePromptText(blocks.join("\n\n"));
+      const isSteer = source === "session/steer";
+      if (parsedPrompt.userText) {
+        writer.upsertMessage(
+          `${isSteer ? "steer" : "prompt"}:${channelKey}:${event.turnId ?? event.seq}`,
+          "user",
+          parsedPrompt.userTitle,
+          parsedPrompt.userText,
+          event.timestamp,
+          ctx,
+          parsedPrompt.userPubkey,
+          isSteer ? "session/steer:user" : "session/prompt:user",
+          parsedPrompt.userEventId ??
+            (isSteer
+              ? null
+              : writer.getSingleTriggeringEventId(
+                  channelKey,
+                  event.turnId ?? event.seq,
+                )),
+        );
+      }
+      if (parsedPrompt.sections.length > 0) {
+        writer.upsertMetadata(
+          `${isSteer ? "steer" : "prompt"}-context:${channelKey}:${event.turnId ?? event.seq}`,
+          "Prompt context",
+          parsedPrompt.sections,
+          event.timestamp,
+          ctx,
+          isSteer ? "session/steer:context" : "session/prompt:context",
+        );
+      }
+    }
+  } else if (event.kind === "transcript_system_context") {
+    const payload = asRecord(event.payload);
+    const source = asString(payload.source);
+    const text = asString(payload.text);
+    if (payload.schemaVersion === 1 && source === "session/new" && text) {
+      const sections = parseSystemPromptSections(text);
+      if (sections.length > 0) {
+        writer.upsertMetadata(
+          `system-prompt:${channelKey}:${event.seq}:${event.timestamp}`,
+          "System prompt",
+          sections,
+          event.timestamp,
+          { ...ctx, turnId: null },
+          "session/new",
+        );
+      }
+    }
+  } else if (event.kind === "transcript_session_update") {
+    writeSemanticSessionUpdate(event, channelKey, ctx, writer);
+  } else if (event.kind === "transcript_permission") {
+    const payload = asRecord(event.payload);
+    const outcome = asString(payload.outcome);
+    if (
+      payload.schemaVersion === 1 &&
+      (outcome === "approved" ||
+        outcome === "denied" ||
+        outcome === "cancelled")
+    ) {
+      const outcomeText =
+        outcome === "approved"
+          ? "Approved"
+          : outcome === "denied"
+            ? "Denied"
+            : "Cancelled";
+      writer.upsertLifecycleItem(
+        `permission:${channelKey}:semantic:${event.seq}`,
+        "permission",
+        "Permission resolved",
+        outcomeText,
+        event.timestamp,
+        ctx,
+        "permission_result",
+      );
+    }
+  }
+}
+
+function writeSemanticSessionUpdate(
+  event: ObserverEvent,
+  channelKey: string,
+  ctx: SemanticTranscriptContext,
+  writer: SemanticTranscriptWriter,
+): void {
+  const payload = asRecord(event.payload);
+  const updateType = asString(payload.updateType);
+  const turnKey = event.turnId ?? event.sessionId ?? "unknown";
+  if (payload.schemaVersion === 1 && updateType === "agent_message_chunk") {
+    const text = asString(payload.text);
+    if (text) {
+      const messageKey = asString(payload.messageKey) ?? turnKey;
+      writer.upsertMessage(
+        `assistant:${channelKey}:${messageKey}`,
+        "assistant",
+        "Assistant",
+        text,
+        event.timestamp,
+        ctx,
+        null,
+        updateType,
+      );
+    }
+  } else if (
+    payload.schemaVersion === 1 &&
+    updateType === "agent_thought_chunk" &&
+    payload.contentHidden === true
+  ) {
+    const messageKey = asString(payload.messageKey) ?? turnKey;
+    const itemId = `thinking:${channelKey}:${messageKey}`;
+    if (!writer.hasItem(itemId)) {
+      writer.upsertTextItem(
+        itemId,
+        "thought",
+        "Thinking",
+        "Reasoning activity (content hidden)",
+        event.timestamp,
+        ctx,
+        updateType,
+      );
+    }
+  } else if (
+    payload.schemaVersion === 1 &&
+    (updateType === "tool_call" || updateType === "tool_call_update")
+  ) {
+    const toolKey = asString(payload.toolKey) ?? `tool:${event.seq}`;
+    const status = normalizeToolStatus(
+      asString(payload.status) ??
+        (updateType === "tool_call" ? "executing" : "completed"),
+    );
+    writer.upsertTool(
+      `tool:${channelKey}:${toolKey}`,
+      "Tool activity",
+      "tool_activity",
+      null,
+      status,
+      {},
+      "",
+      status === "failed",
+      event.timestamp,
+      ctx,
+      updateType,
+    );
+  } else if (payload.schemaVersion === 1 && updateType === "plan") {
+    const entryCount =
+      typeof payload.entryCount === "number" ? payload.entryCount : 0;
+    const completedCount =
+      typeof payload.completedCount === "number" ? payload.completedCount : 0;
+    writer.upsertPlan(
+      `plan:${channelKey}:${turnKey}`,
+      "Plan",
+      `Plan updated: ${completedCount}/${entryCount} steps complete (details hidden)`,
+      event.timestamp,
+      ctx,
+      updateType,
+      `plan-update:${channelKey}:${turnKey}:${event.seq}`,
+    );
+  } else if (
+    payload.schemaVersion === 1 &&
+    updateType === "current_mode_update"
+  ) {
+    writer.upsertLifecycleItem(
+      `mode:${channelKey}:${turnKey}`,
+      "status",
+      "Mode",
+      "Mode updated (details hidden)",
+      event.timestamp,
+      ctx,
+      updateType,
+    );
+  } else if (payload.schemaVersion === 1 && updateType === "usage_update") {
+    const used = typeof payload.used === "number" ? payload.used : null;
+    const size = typeof payload.size === "number" ? payload.size : null;
+    if (used !== null && size !== null) {
+      writer.replaceLifecycleItem(
+        `usage:${channelKey}:${turnKey}`,
+        "status",
+        "Usage",
+        `Tokens: ${used}/${size}`,
+        event.timestamp,
+        ctx,
+        updateType,
+      );
+    }
+  } else if (
+    payload.schemaVersion === 1 &&
+    updateType === "available_commands_update"
+  ) {
+    const count =
+      typeof payload.commandCount === "number" ? payload.commandCount : 0;
+    writer.upsertLifecycleItem(
+      `commands:${channelKey}:${turnKey}`,
+      "status",
+      "Commands",
+      `Commands available: ${count}`,
+      event.timestamp,
+      ctx,
+      updateType,
+    );
+  } else if (
+    payload.schemaVersion === 1 &&
+    updateType === "config_option_update"
+  ) {
+    const count =
+      typeof payload.optionCount === "number" ? payload.optionCount : 0;
+    writer.upsertLifecycleItem(
+      `config:${channelKey}:${turnKey}`,
+      "status",
+      "Config",
+      `Configuration updated: ${count} options (details hidden)`,
+      event.timestamp,
+      ctx,
+      updateType,
+    );
+  }
 }

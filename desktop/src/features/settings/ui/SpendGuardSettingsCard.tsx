@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   getSpendGuardStatus,
   updateSpendGuardConfig,
@@ -13,11 +13,7 @@ export function SpendGuardSettingsCard() {
   const [maxWakes, setMaxWakes] = useState("20");
   const [maxRuns, setMaxRuns] = useState("20");
 
-  useEffect(() => {
-    loadStatus();
-  }, []);
-
-  const loadStatus = async () => {
+  const loadStatus = useCallback(async () => {
     try {
       const s = await getSpendGuardStatus();
       setStatus(s);
@@ -27,7 +23,11 @@ export function SpendGuardSettingsCard() {
     } catch (e) {
       console.error("Failed to load spend guard status:", e);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadStatus();
+  }, [loadStatus]);
 
   const handleSave = async () => {
     setLoading(true);
@@ -61,18 +61,23 @@ export function SpendGuardSettingsCard() {
   };
 
   return (
-    <div className="rounded-xl border bg-card p-6 shadow-sm space-y-6" data-testid="spend-guard-settings">
+    <div
+      className="rounded-xl border bg-card p-6 shadow-sm space-y-6"
+      data-testid="spend-guard-settings"
+    >
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-base font-semibold text-card-foreground">
             Automation Spend Guard & Rate Fences
           </h3>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Hard budget fences preventing runaway agent wake loops and API spend.
+            Hard budget fences preventing runaway agent wake loops and API
+            spend.
           </p>
         </div>
         {status && (
           <button
+            type="button"
             onClick={handleTogglePause}
             disabled={loading}
             className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition ${
@@ -89,23 +94,31 @@ export function SpendGuardSettingsCard() {
       {status && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 bg-muted/30 p-3 rounded-lg border text-xs">
           <div>
-            <span className="text-muted-foreground block text-[11px]">Wakes (Window)</span>
+            <span className="text-muted-foreground block text-2xs">
+              Wakes (Window)
+            </span>
             <span className="font-semibold text-foreground">
               {status.wakes_in_window} / {status.max_wakes_per_window}
             </span>
           </div>
           <div>
-            <span className="text-muted-foreground block text-[11px]">Runs (Window)</span>
+            <span className="text-muted-foreground block text-2xs">
+              Runs (Window)
+            </span>
             <span className="font-semibold text-foreground">
               {status.runs_in_window} / {status.max_runs_per_window}
             </span>
           </div>
           <div>
-            <span className="text-muted-foreground block text-[11px]">Window Duration</span>
-            <span className="font-semibold text-foreground">{status.window_ms / 1000}s</span>
+            <span className="text-muted-foreground block text-2xs">
+              Window Duration
+            </span>
+            <span className="font-semibold text-foreground">
+              {status.window_ms / 1000}s
+            </span>
           </div>
           <div>
-            <span className="text-muted-foreground block text-[11px]">Status</span>
+            <span className="text-muted-foreground block text-2xs">Status</span>
             <span
               className={`font-semibold ${
                 status.paused ? "text-amber-400" : "text-green-400"
@@ -119,10 +132,14 @@ export function SpendGuardSettingsCard() {
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div>
-          <label className="block text-xs font-medium text-foreground mb-1">
+          <label
+            htmlFor="spend-guard-window-secs"
+            className="block text-xs font-medium text-foreground mb-1"
+          >
             Window Length (seconds)
           </label>
           <input
+            id="spend-guard-window-secs"
             type="number"
             value={windowSecs}
             onChange={(e) => setWindowSecs(e.target.value)}
@@ -130,10 +147,14 @@ export function SpendGuardSettingsCard() {
           />
         </div>
         <div>
-          <label className="block text-xs font-medium text-foreground mb-1">
+          <label
+            htmlFor="spend-guard-max-wakes"
+            className="block text-xs font-medium text-foreground mb-1"
+          >
             Max Wakes per Window
           </label>
           <input
+            id="spend-guard-max-wakes"
             type="number"
             value={maxWakes}
             onChange={(e) => setMaxWakes(e.target.value)}
@@ -141,10 +162,14 @@ export function SpendGuardSettingsCard() {
           />
         </div>
         <div>
-          <label className="block text-xs font-medium text-foreground mb-1">
+          <label
+            htmlFor="spend-guard-max-runs"
+            className="block text-xs font-medium text-foreground mb-1"
+          >
             Max Runs per Window
           </label>
           <input
+            id="spend-guard-max-runs"
             type="number"
             value={maxRuns}
             onChange={(e) => setMaxRuns(e.target.value)}
@@ -155,6 +180,7 @@ export function SpendGuardSettingsCard() {
 
       <div className="flex justify-end">
         <button
+          type="button"
           onClick={handleSave}
           disabled={loading}
           className="px-4 py-2 bg-primary text-primary-foreground text-xs font-medium rounded-lg hover:opacity-90 transition disabled:opacity-50"

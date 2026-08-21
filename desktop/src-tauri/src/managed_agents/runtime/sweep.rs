@@ -8,6 +8,7 @@
 //! procargs, parent/PGID lookups, and live-descendant classification helpers
 //! collected here are also called directly by the periodic orphan sweeps.
 
+#[cfg(any(unix, test))]
 use std::path::{Path, PathBuf};
 
 // Re-declare the macOS process-info FFI so sweep.rs can call it independently.
@@ -233,6 +234,7 @@ pub(super) fn is_live_descendant_linux(pid: u32, skip_pids: &[u32]) -> bool {
 /// the fields needed to decide whether a process is an untracked same-bundle
 /// harness — no live process handles, no system calls.
 #[derive(Debug, Clone)]
+#[cfg(any(unix, test))]
 pub struct ProcessSnapshot {
     /// PID of the process.
     pub pid: u32,
@@ -270,6 +272,7 @@ pub(super) fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
 /// Children of tracked parents die when their parent's process group is
 /// signalled — this function deliberately targets only harness-level processes
 /// so we never directly kill a child of a live tracked parent.
+#[cfg(any(unix, test))]
 pub fn select_untracked_bundle_harnesses(
     snapshots: &[ProcessSnapshot],
     harness_exe: &Path,
@@ -460,6 +463,7 @@ fn collect_process_snapshots(harness_name: &str) -> Vec<ProcessSnapshot> {
 /// the same app (different bundle path, e.g. a prior DMG) will not match
 /// this path — that class is handled by `sweep_system_agent_processes`, which
 /// scopes by `BUZZ_MANAGED_AGENT` instance ID rather than exe path.
+#[cfg(unix)]
 pub fn expected_harness_exe_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -470,6 +474,7 @@ pub fn expected_harness_exe_path() -> Option<PathBuf> {
 
 /// The basename of the harness binary — used for the cheap name pre-filter in
 /// `collect_process_snapshots` before the expensive exe-path lookup.
+#[cfg(unix)]
 const HARNESS_BINARY_NAME: &str = "buzz-acp";
 
 // ── sweep_untracked_bundle_harnesses ─────────────────────────────────────

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   getWorkspaceObserver,
   toggleWorkspaceRecording,
@@ -6,24 +6,26 @@ import {
 } from "@/shared/api/humanPolicy";
 
 export function WorkspaceObserverCard() {
-  const [observer, setObserver] = useState<WorkspaceObserverContract | null>(null);
+  const [observer, setObserver] = useState<WorkspaceObserverContract | null>(
+    null,
+  );
   const [workspaceId] = useState("local-default");
   const [loading, setLoading] = useState(false);
 
-  const loadObserver = async (id: string) => {
+  const loadObserver = useCallback(async (id: string) => {
     try {
       const obs = await getWorkspaceObserver(id);
       setObserver(obs);
     } catch (e) {
       console.error("Failed to load workspace observer:", e);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadObserver(workspaceId);
     const interval = setInterval(() => loadObserver(workspaceId), 3000);
     return () => clearInterval(interval);
-  }, [workspaceId]);
+  }, [loadObserver, workspaceId]);
 
   const handleToggleRecording = async () => {
     if (!observer) return;
@@ -49,10 +51,12 @@ export function WorkspaceObserverCard() {
             <span>🖥️</span> Workspace Observer & Live Telemetry
           </h3>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Normalized contract for viewer presence, streaming frames, lifecycle states, and scheduled turns.
+            Normalized contract for viewer presence, streaming frames, lifecycle
+            states, and scheduled turns.
           </p>
         </div>
         <button
+          type="button"
           onClick={handleToggleRecording}
           disabled={loading || !observer}
           className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
@@ -61,31 +65,41 @@ export function WorkspaceObserverCard() {
               : "bg-muted text-muted-foreground border-border hover:bg-accent"
           }`}
         >
-          {observer?.recording_enabled ? "⏺ Recording Active" : "⭘ Recording Off (Default)"}
+          {observer?.recording_enabled
+            ? "⏺ Recording Active"
+            : "⭘ Recording Off (Default)"}
         </button>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-muted/40 p-3 rounded-lg border border-border/50 text-xs">
         <div>
-          <span className="text-muted-foreground block text-[11px]">Lifecycle</span>
+          <span className="text-muted-foreground block text-2xs">
+            Lifecycle
+          </span>
           <span className="font-semibold text-foreground capitalize">
             {observer?.lifecycle || "Prepared"}
           </span>
         </div>
         <div>
-          <span className="text-muted-foreground block text-[11px]">Active Viewers</span>
+          <span className="text-muted-foreground block text-2xs">
+            Active Viewers
+          </span>
           <span className="font-semibold text-foreground">
             {observer?.viewers.length || 0} Connected
           </span>
         </div>
         <div>
-          <span className="text-muted-foreground block text-[11px]">Frame Updates</span>
+          <span className="text-muted-foreground block text-2xs">
+            Frame Updates
+          </span>
           <span className="font-semibold text-foreground">
             {observer?.frame_updates.length || 0} Frames
           </span>
         </div>
         <div>
-          <span className="text-muted-foreground block text-[11px]">Scheduled Input</span>
+          <span className="text-muted-foreground block text-2xs">
+            Scheduled Input
+          </span>
           <span className="font-semibold text-foreground">
             {observer?.scheduled_input_json ? "Bound ✓" : "None"}
           </span>

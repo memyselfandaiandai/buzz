@@ -517,12 +517,9 @@ pub fn spawn_agent_child(
         nvm_bin,
     );
 
-    // Custom ACP harnesses may themselves be Windows `.cmd`/`.bat` wrappers
-    // (for example, a BWS-injected launcher). Use the same native command
-    // construction as readiness probes so those wrappers are executable.
-    let mut command = crate::managed_agents::readiness::cli_probe::command_for_binary(
-        &resolved_acp_command,
-    );
+    // Use native command construction so Windows wrapper harnesses are executable.
+    let mut command =
+        crate::managed_agents::readiness::cli_probe::command_for_binary(&resolved_acp_command);
     if let Some(home) = super::default_agent_workdir() {
         command.current_dir(home);
     }

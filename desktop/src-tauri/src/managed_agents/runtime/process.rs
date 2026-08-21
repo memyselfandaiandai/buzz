@@ -5,6 +5,7 @@ use super::*;
 /// identify processes we should clean up. Both hyphenated and underscored
 /// variants are listed because macOS `proc_name()` and Linux `/proc/comm`
 /// may report either form depending on how the binary was built.
+#[cfg(any(unix, test))]
 pub(crate) const KNOWN_AGENT_BINARIES: &[&str] = &[
     "buzz-acp",
     "buzz_acp",
@@ -28,11 +29,13 @@ pub(crate) const KNOWN_AGENT_BINARIES: &[&str] = &[
 /// A process whose name matches here is NOT immediately claimed — it must also
 /// carry `BUZZ_MANAGED_AGENT` in its environment (checked by the caller via
 /// `process_has_buzz_marker()`). This avoids sweeping unrelated node processes.
+#[cfg(any(unix, test))]
 pub(crate) const KNOWN_SCRIPT_INTERPRETERS: &[&str] = &["node"];
 
 /// Check if a process name matches any of our known agent binaries.
 /// Uses exact match or prefix-with-separator to avoid false positives
 /// (e.g. `"goose"` must not match `"mongoose"`).
+#[cfg(any(unix, test))]
 pub(super) fn name_matches_known_binary(name: &str) -> bool {
     KNOWN_AGENT_BINARIES.iter().any(|&binary| {
         name == binary || {
@@ -47,6 +50,7 @@ pub(super) fn name_matches_known_binary(name: &str) -> bool {
 /// Check if a process name is a known script interpreter that may be hosting
 /// a managed agent wrapper (e.g. `node` running an npm shim for `codex-acp`).
 /// Callers must additionally verify `BUZZ_MANAGED_AGENT` ownership.
+#[cfg(any(unix, test))]
 pub(super) fn name_matches_interpreter(name: &str) -> bool {
     KNOWN_SCRIPT_INTERPRETERS.contains(&name)
 }
@@ -138,6 +142,7 @@ pub(crate) fn current_instance_id(app: &AppHandle) -> String {
 /// Build the full `BUZZ_MANAGED_AGENT=<instance-id>` env entry we match
 /// against when scanning processes. Kept here so the spawn stamp and the sweep
 /// matcher can never drift apart.
+#[cfg(any(unix, test))]
 pub(super) fn buzz_marker_entry(instance_id: &str) -> Vec<u8> {
     format!("BUZZ_MANAGED_AGENT={instance_id}").into_bytes()
 }

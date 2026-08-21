@@ -377,11 +377,3 @@ pub(crate) fn collect_same_instance_orphans(
     }
     orphans
 }
-
-#[cfg(not(unix))]
-pub(crate) fn collect_same_instance_orphans(
-    _instance_id: &str,
-    _skip_pids: &[u32],
-) -> std::collections::HashSet<u32> {
-    std::collections::HashSet::new()
-}

@@ -58,23 +58,34 @@ export async function listHumanCards(): Promise<HumanCard[]> {
   return invokeTauri<HumanCard[]>("list_human_cards");
 }
 
-export async function createHumanCard(input: CreateHumanCardInput): Promise<HumanCard> {
+export async function createHumanCard(
+  input: CreateHumanCardInput,
+): Promise<HumanCard> {
   return invokeTauri<HumanCard>("create_human_card", { input });
 }
 
-export async function answerHumanCard(card_id: string, choice_id: string): Promise<HumanCard> {
-  return invokeTauri<HumanCard>("answer_human_card", { input: { card_id, choice_id } });
+export async function answerHumanCard(
+  card_id: string,
+  choice_id: string,
+): Promise<HumanCard> {
+  return invokeTauri<HumanCard>("answer_human_card", {
+    input: { card_id, choice_id },
+  });
 }
 
 export async function getSpendGuardStatus(): Promise<SpendGuardStatus> {
   return invokeTauri<SpendGuardStatus>("get_spend_guard_status");
 }
 
-export async function updateSpendGuardConfig(config: SpendGuardConfig): Promise<SpendGuardStatus> {
+export async function updateSpendGuardConfig(
+  config: SpendGuardConfig,
+): Promise<SpendGuardStatus> {
   return invokeTauri<SpendGuardStatus>("update_spend_guard_config", { config });
 }
 
-export async function toggleSpendGuardPause(paused: boolean): Promise<SpendGuardStatus> {
+export async function toggleSpendGuardPause(
+  paused: boolean,
+): Promise<SpendGuardStatus> {
   return invokeTauri<SpendGuardStatus>("toggle_spend_guard_pause", { paused });
 }
 
@@ -137,7 +148,9 @@ export async function preflightSkillCapture(params: {
   return invokeTauri<SkillVersion>("preflight_skill_capture", params);
 }
 
-export async function dryRunSkillCapability(req: DryRunRequest): Promise<DryRunResult> {
+export async function dryRunSkillCapability(
+  req: DryRunRequest,
+): Promise<DryRunResult> {
   return invokeTauri<DryRunResult>("dry_run_skill_capability", { req });
 }
 
@@ -170,8 +183,12 @@ export interface WorkspaceObserverContract {
   scheduled_input_json?: string | null;
 }
 
-export async function getWorkspaceObserver(workspaceId: string): Promise<WorkspaceObserverContract> {
-  return invokeTauri<WorkspaceObserverContract>("get_workspace_observer", { workspaceId });
+export async function getWorkspaceObserver(
+  workspaceId: string,
+): Promise<WorkspaceObserverContract> {
+  return invokeTauri<WorkspaceObserverContract>("get_workspace_observer", {
+    workspaceId,
+  });
 }
 
 export async function setWorkspaceObserverPresence(params: {
@@ -179,14 +196,20 @@ export async function setWorkspaceObserverPresence(params: {
   viewerId: string;
   activeView: string;
 }): Promise<WorkspaceObserverContract> {
-  return invokeTauri<WorkspaceObserverContract>("set_workspace_observer_presence", params);
+  return invokeTauri<WorkspaceObserverContract>(
+    "set_workspace_observer_presence",
+    params,
+  );
 }
 
 export async function toggleWorkspaceRecording(params: {
   workspaceId: string;
   enabled: boolean;
 }): Promise<WorkspaceObserverContract> {
-  return invokeTauri<WorkspaceObserverContract>("toggle_workspace_recording", params);
+  return invokeTauri<WorkspaceObserverContract>(
+    "toggle_workspace_recording",
+    params,
+  );
 }
 
 export interface AutomationDefinition {
@@ -223,7 +246,9 @@ export interface AutomationWake {
   created_at_ms: number;
 }
 
-export async function listAutomationDefinitions(): Promise<AutomationDefinition[]> {
+export async function listAutomationDefinitions(): Promise<
+  AutomationDefinition[]
+> {
   return invokeTauri<AutomationDefinition[]>("list_automation_definitions");
 }
 
@@ -233,7 +258,10 @@ export async function createAutomationDefinition(params: {
   ownerId: string;
   configJson: unknown;
 }): Promise<AutomationDefinition> {
-  return invokeTauri<AutomationDefinition>("create_automation_definition", params);
+  return invokeTauri<AutomationDefinition>(
+    "create_automation_definition",
+    params,
+  );
 }
 
 export async function toggleAutomationEnabled(params: {
@@ -256,4 +284,3 @@ export async function triggerAutomationWake(params: {
 }): Promise<AutomationWake> {
   return invokeTauri<AutomationWake>("trigger_automation_wake", params);
 }
-

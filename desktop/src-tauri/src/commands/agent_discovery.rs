@@ -1563,23 +1563,29 @@ mod tests {
         );
     }
 
-    /// On Windows, `install_shell_command` must set PATH to a value that
-    /// includes the inherited process PATH, so node/npm are visible inside
-    /// the install shell even when no managed Node runtime is present.
+    /// The install shell retains the inherited Windows PATH.
     #[cfg(windows)]
     #[test]
     fn test_install_shell_command_includes_process_path_on_windows() {
         let _guard = crate::managed_agents::lock_path_mutex();
         let previous = std::env::var_os("PATH");
-        // Plant a sentinel in the process PATH that the test can detect.
+        let previous_git_bash = std::env::var_os("GIT_BASH");
+        let fixture = tempfile::tempdir().expect("Git Bash fixture directory");
+        let fixture_bash = fixture.path().join("bash.exe");
+        std::fs::write(&fixture_bash, b"fixture").expect("Git Bash fixture");
         let sentinel = r"C:\TestSentinel\bin";
         std::env::set_var("PATH", sentinel);
+        std::env::set_var("GIT_BASH", &fixture_bash);
 
         let result = super::install_shell_command("echo test");
 
         match previous {
             Some(p) => std::env::set_var("PATH", p),
             None => std::env::remove_var("PATH"),
+        }
+        match previous_git_bash {
+            Some(path) => std::env::set_var("GIT_BASH", path),
+            None => std::env::remove_var("GIT_BASH"),
         }
 
         let cmd = result.expect("install_shell_command must succeed on Windows with Git");
@@ -1590,19 +1596,15 @@ mod tests {
             .map(|v| v.to_string_lossy().into_owned())
             .expect("install_shell_command must always set a PATH env var on Windows");
 
-        // The sentinel (inherited process PATH) must appear in the composed PATH.
         assert!(
             path_value.contains(sentinel),
             "install_shell_command PATH must include the inherited process PATH; got: {path_value}"
         );
-        // The sentinel must appear LAST — managed Buzz dirs must have precedence.
         assert!(
             path_value.ends_with(sentinel),
             "inherited process PATH must be appended LAST so managed dirs keep precedence; got: {path_value}"
         );
     }
-
-    // ── Phase B: per-OS install commands ──────────────────────────────────────
 
     /// On non-Windows, cli_install_commands_for_os returns the default commands.
     #[cfg(not(windows))]
@@ -1626,10 +1628,7 @@ mod tests {
         );
     }
 
-    // ── PowerShell routing ────────────────────────────────────────────────────
-
-    /// Commands beginning with `powershell.exe` (any casing) must be identified
-    /// as PowerShell commands; all others must not.
+    /// Detect PowerShell commands case-insensitively.
     #[cfg(windows)]
     #[test]
     fn test_is_powershell_command_detects_powershell_commands() {

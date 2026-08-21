@@ -13,6 +13,7 @@ pub fn request(nonce: &str, digest: &str) -> AdmissionRequest {
     }
 }
 
+#[allow(dead_code)]
 pub fn request_at(nonce: &str, digest: &str, at: i64) -> AdmissionRequest {
     let mut r = request(nonce, digest);
     r.received_at_ms = at;
