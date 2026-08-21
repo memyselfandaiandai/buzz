@@ -1,4 +1,4 @@
-//! End-to-end integration test for the standalone capability broker and client.
+//! End-to-end integration tests for the standalone capability broker and client.
 //!
 //! Tests:
 //! 1. Broker starts up, binds port, discovers/advertises IP.
@@ -8,6 +8,7 @@
 //!    - `sign_nostr_event`
 //!    - `sign_nip98`
 //! 4. Expired/revoked capability handling.
+//! 5. Synthetic provider-backed secret leasing, scope denial, and revocation.
 
 use anyhow::Result;
 use buzz_acp::capability_broker::{BrokerChildSpawner, CapabilityBroker};
@@ -19,6 +20,8 @@ use buzz_capability_client::{
     CapabilityClient, ClientError, HttpMethod, Nip98SignRequest, NostrEventSignRequest,
     RelayOrigin, StableErrorKind, StructuredTag,
 };
+use buzz_secrets::{InMemorySecretVault, SecretVaultProvider};
+use buzz_signing_capability::OperationResult;
 use nostr::Keys;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -149,6 +152,147 @@ async fn test_broker_standalone_end_to_end() -> Result<()> {
     };
     let res = client.sign_nostr_event(fail_req).await;
     assert!(res.is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_secret_capability_provider_broker_client_end_to_end() -> Result<()> {
+    const SECRET_KEY: &str = "SYNTHETIC_API_KEY";
+    const TOOL_NAME: &str = "synthetic_inference";
+    const SECRET_VALUE: &str = "synthetic-fixture-value";
+
+    let keys = Keys::generate();
+    let relay_url = "wss://relay.example.com".to_string();
+    let channel_id = Uuid::new_v4();
+    let vault = Arc::new(InMemorySecretVault::new());
+    vault.set_secret(SECRET_KEY, SECRET_VALUE, None).await?;
+
+    let cli_args = CliArgs {
+        relay_url: relay_url.clone(),
+        private_key: keys.secret_key().to_secret_hex(),
+        agent_owner: None,
+        agent_command: "standalone-secret-broker-test".to_string(),
+        agent_args: vec![],
+        mcp_command: "".to_string(),
+        idle_timeout: None,
+        max_turn_duration: 7200,
+        turn_timeout: None,
+        system_prompt: None,
+        system_prompt_file: None,
+        agents: 1,
+        heartbeat_interval: 0,
+        turn_liveness_secs: 10,
+        heartbeat_prompt: None,
+        heartbeat_prompt_file: None,
+        initial_message: None,
+        subscribe: SubscribeMode::Mentions,
+        kinds: None,
+        channels: Some(vec![channel_id.to_string()]),
+        no_mention_filter: false,
+        config: std::path::PathBuf::from("./buzz-acp.toml"),
+        dedup: DedupMode::Queue,
+        multiple_event_handling: MultipleEventHandling::Steer,
+        no_ignore_self: false,
+        context_message_limit: 12,
+        max_turns_per_session: 0,
+        no_presence: true,
+        no_typing: true,
+        memory: false,
+        no_memory: true,
+        no_base_prompt: false,
+        base_prompt_file: None,
+        capture_visible_final: false,
+        model: None,
+        session_title: None,
+        permission_mode: PermissionMode::BypassPermissions,
+        respond_to: RespondTo::OwnerOnly,
+        respond_to_allowlist: None,
+        allowed_respond_to: None,
+        team_instructions: None,
+        relay_observer: false,
+        exit_after_inactivity: 0,
+        lazy_pool: false,
+        idle_pool_sleep: 0,
+        broker_advertise_ip: Some(std::net::Ipv4Addr::LOCALHOST),
+        broker_allowed_secrets: Some(vec![SECRET_KEY.to_string()]),
+        broker_allowed_secret_tools: Some(vec![TOOL_NAME.to_string()]),
+    };
+
+    let config = Config::from_args_with_credential_mode(cli_args, CredentialMode::BrokerV1)?;
+    let relay = RelayOrigin::parse(&relay_url)?;
+    let broker = Arc::new(
+        CapabilityBroker::start_with_vault(
+            keys,
+            relay,
+            None,
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            Some(vault),
+        )
+        .await?,
+    );
+    let spawner = BrokerChildSpawner::for_channels(Arc::clone(&broker), &config, [channel_id])?;
+
+    let mut lease = spawner.issue()?;
+    lease.activate()?;
+    let mcp_env = lease.mcp_env();
+    let capability_expires_at = mcp_env
+        .iter()
+        .find(|value| value.name == "BUZZ_CAPABILITY_EXPIRES_AT")
+        .ok_or_else(|| anyhow::anyhow!("capability expiry is absent from the child projection"))?
+        .value
+        .parse::<i64>()?;
+    let env_vars = mcp_env
+        .into_iter()
+        .map(|value| (value.name.into(), value.value.into()));
+    let client = CapabilityClient::from_env_iter(env_vars).await?;
+
+    let result = client.acquire_secret(SECRET_KEY, TOOL_NAME).await?;
+    let OperationResult::SecretLease {
+        secret_key,
+        secret_value,
+        expires_at_unix_ms,
+    } = &result
+    else {
+        anyhow::bail!("broker returned a non-secret result for a secret lease request");
+    };
+    assert_eq!(secret_key, SECRET_KEY);
+    assert_eq!(secret_value, SECRET_VALUE);
+    assert!(*expires_at_unix_ms <= capability_expires_at);
+    drop(result);
+
+    let wrong_secret = client
+        .acquire_secret("UNSCOPED_SECRET", TOOL_NAME)
+        .await
+        .expect_err("an unscoped secret must be denied");
+    assert_eq!(
+        wrong_secret,
+        ClientError::Broker(StableErrorKind::ResourceNotAllowed)
+    );
+
+    let wrong_tool = client
+        .acquire_secret(SECRET_KEY, "unscoped_tool")
+        .await
+        .expect_err("an unscoped tool must be denied");
+    assert_eq!(
+        wrong_tool,
+        ClientError::Broker(StableErrorKind::ResourceNotAllowed)
+    );
+
+    lease.revoke()?;
+    let after_revoke = client
+        .acquire_secret(SECRET_KEY, TOOL_NAME)
+        .await
+        .expect_err("revocation must close secret authority");
+    assert_eq!(after_revoke, ClientError::Broker(StableErrorKind::Revoked));
+
+    drop(client);
+    drop(lease);
+    drop(spawner);
+    Arc::try_unwrap(broker)
+        .map_err(|_| anyhow::anyhow!("standalone secret broker still has an unexpected owner"))?
+        .shutdown()
+        .await?;
 
     Ok(())
 }

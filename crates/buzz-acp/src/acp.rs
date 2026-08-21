@@ -4426,7 +4426,7 @@ mod tests {
 
     fn test_credential_projection() -> AcpChildCredentialProjection {
         AcpChildCredentialProjection::broker_v1(
-            "tcp://127.0.0.1:8791",
+            "ws://127.0.0.1:8791",
             uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
                 .expect("valid test capability id"),
             "CAPABILITY_TOKEN_CANARY_2d159f_32bytes",
@@ -4463,7 +4463,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_projection_requires_exact_loopback_tcp_endpoint_and_canonical_relay() {
+    fn broker_projection_requires_exact_loopback_ws_endpoint_and_canonical_relay() {
         let capability_id =
             uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("valid id");
         let public_key = nostr::PublicKey::from_hex(
@@ -4481,17 +4481,18 @@ mod tests {
             )
         };
 
-        assert!(build("tcp://127.0.0.1:8791", "wss://RELAY.EXAMPLE/").is_ok());
+        assert!(build("ws://127.0.0.1:8791", "wss://RELAY.EXAMPLE/").is_ok());
         for endpoint in [
             "http://127.0.0.1:8791",
-            "tcp://10.0.0.1:8791",
-            "tcp://[::1]:8791",
-            "tcp://127.0.0.1",
-            "tcp://127.0.0.1:0",
-            "tcp://user@127.0.0.1:8791",
-            "tcp://127.0.0.1:8791/path",
-            "tcp://127.0.0.1:8791?query=1",
-            "tcp://127.0.0.1:8791#fragment",
+            "tcp://127.0.0.1:8791",
+            "ws://10.0.0.1:8791",
+            "ws://[::1]:8791",
+            "ws://127.0.0.1",
+            "ws://127.0.0.1:0",
+            "ws://user@127.0.0.1:8791",
+            "ws://127.0.0.1:8791/path",
+            "ws://127.0.0.1:8791?query=1",
+            "ws://127.0.0.1:8791#fragment",
         ] {
             assert!(
                 build(endpoint, "wss://relay.example").is_err(),
@@ -4505,7 +4506,7 @@ mod tests {
             "wss://relay.example#fragment",
         ] {
             assert!(
-                build("tcp://127.0.0.1:8791", relay).is_err(),
+                build("ws://127.0.0.1:8791", relay).is_err(),
                 "noncanonical relay must fail: {relay}"
             );
         }
@@ -4623,7 +4624,7 @@ mod tests {
             assert_eq!(probe[field], false, "{field} leaked into broker child");
         }
         assert_eq!(probe["mode"], "broker-v1");
-        assert_eq!(probe["endpoint"], "tcp://127.0.0.1:8791");
+        assert_eq!(probe["endpoint"], "ws://127.0.0.1:8791");
         assert_eq!(
             probe["capabilityId"],
             "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -4712,7 +4713,7 @@ printf 'expires=%s\n' "${BUZZ_CAPABILITY_EXPIRES_AT:-<unset>}"
             "mixed_unknown=",
             "mixed_legacy=",
             "mode=broker-v1",
-            "endpoint=tcp://127.0.0.1:8791",
+            "endpoint=ws://127.0.0.1:8791",
             "id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "token=set",
             "public=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
